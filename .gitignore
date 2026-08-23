@@ -1,0 +1,9 @@
+/target/
+.env
+.DS_Store
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+

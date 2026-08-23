@@ -1,0 +1,24 @@
+name: raft-kv-service
+
+services:
+  service:
+    build:
+      context: .
+      target: development
+    command: cargo run
+    init: true
+    environment:
+      RAFT_KV__SERVER__HOST: 0.0.0.0
+      RAFT_KV__TELEMETRY__LOG_FORMAT: pretty
+      RUST_BACKTRACE: "1"
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/workspace/target
+
+volumes:
+  cargo-registry:
+  target:
+
