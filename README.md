@@ -1,6 +1,13 @@
 # raft-kv-service
 
-A production-shaped Rust microservice foundation. This stage intentionally provides HTTP lifecycle, configuration, observability, tests, containers, and CI only; storage and Raft consensus belong in later design stages.
+A production-shaped Rust microservice foundation. The current implementation
+provides HTTP lifecycle, configuration, observability, tests, containers, and
+CI; storage and Raft consensus will arrive through verified vertical
+milestones.
+
+The normative project goals, correctness claims, protocol scope, verification
+strategy, and milestone gates are defined in
+[`docs/specification.md`](docs/specification.md).
 
 ## Prerequisites
 
@@ -48,4 +55,3 @@ Use `pretty` logs for development and `json` in deployed environments. Every HTT
 - `src/main.rs`: composition root
 
 No datastore, consensus library, RPC protocol, metrics backend, or deployment platform is assumed yet. Those choices should follow workload, consistency, recovery, and operating-environment requirements rather than boilerplate convention.
-
