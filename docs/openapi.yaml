@@ -9,6 +9,42 @@ info:
 servers:
   - url: http://localhost:8080
 paths:
+  /operational/v1/membership:
+    get:
+      operationId: getCommittedMembership
+      summary: Read the committed cluster configuration through the leader
+      security: [{ OperationalBearer: [] }]
+      responses:
+        '200':
+          description: Committed membership
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Membership' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    put:
+      operationId: changeMembership
+      summary: Commit an exact target configuration using joint consensus
+      description: >-
+        The operation ID and exact target are idempotent. Reusing an operation
+        ID with another target is a conflict. Success is returned only after
+        the final stable configuration commits and is durably applied.
+      security: [{ OperationalBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MembershipRequest' }
+      responses:
+        '200':
+          description: Stable membership committed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Membership' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/MembershipConflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /v1/keys/{key}:
     parameters:
       - $ref: '#/components/parameters/Key'
@@ -87,6 +123,10 @@ paths:
         '428': { $ref: '#/components/responses/PreconditionRequired' }
         '503': { $ref: '#/components/responses/Unavailable' }
 components:
+  securitySchemes:
+    OperationalBearer:
+      type: http
+      scheme: bearer
   parameters:
     Key:
       name: key
@@ -128,6 +168,31 @@ components:
     CacheControl:
       schema: { type: string, const: no-store }
   schemas:
+    Member:
+      type: object
+      additionalProperties: false
+      required: [node_id, peer_endpoint]
+      properties:
+        node_id: { type: integer, format: uint64, minimum: 1 }
+        peer_endpoint: { type: string, format: uri, maxLength: 2048 }
+    MembershipRequest:
+      type: object
+      additionalProperties: false
+      required: [operation_id, members]
+      properties:
+        operation_id: { type: string, format: uuid }
+        members:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Member' }
+    Membership:
+      allOf:
+        - $ref: '#/components/schemas/MembershipRequest'
+        - type: object
+          required: [commit_index]
+          properties:
+            commit_index: { type: integer, format: uint64, minimum: 1 }
     Problem:
       type: object
       additionalProperties: false
@@ -139,6 +204,12 @@ components:
         detail: { type: string }
         request_id: { type: string }
   responses:
+    Unauthorized:
+      description: Missing or invalid operational bearer token
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    MembershipConflict:
+      description: Operation ID conflict or another change is in progress
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     InvalidRequest:
       description: Invalid syntax, key, identity, sequence, or conditional headers
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }

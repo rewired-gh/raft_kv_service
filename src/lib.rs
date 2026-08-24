@@ -21,6 +21,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    if config.server.operational_token.len() < 16 {
+        anyhow::bail!("server.operational_token must contain at least 16 bytes");
+    }
     let cluster_uuid =
         uuid::Uuid::parse_str(&config.raft.cluster_id).context("raft.cluster_id must be a UUID")?;
     let endpoints = config
@@ -47,6 +50,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         snapshot_threshold_entries: config.raft.snapshot_threshold_entries,
         peer_endpoints: endpoints,
         local_peer_endpoint: config.peer.advertised_url.clone(),
+        staging: config.raft.staging,
     })
     .map_err(anyhow::Error::msg)
     .context("failed to start the static Raft node")?;
@@ -56,10 +60,25 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind HTTP listener to {address}"))?;
-    let state = AppState::new(config.service.name).with_executor(move |command| {
-        let node = node.clone();
-        async move { node.execute(command).await }
-    });
+    let kv_node = node.clone();
+    let membership_node = node.clone();
+    let membership_reader = node;
+    let state = AppState::new(config.service.name)
+        .with_executor(move |command| {
+            let node = kv_node.clone();
+            async move { node.execute(command).await }
+        })
+        .with_membership(
+            config.server.operational_token.clone(),
+            move |operation_id, target| {
+                let node = membership_node.clone();
+                async move { node.change_membership(operation_id, target).await }
+            },
+            move || {
+                let node = membership_reader.clone();
+                async move { node.membership().await }
+            },
+        );
     let app = http::router(state.clone(), config.server.request_timeout());
 
     state.set_ready(true);

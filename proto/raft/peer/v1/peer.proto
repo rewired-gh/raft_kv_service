@@ -6,7 +6,29 @@ service RaftPeer {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc ForwardCommand(ForwardCommandRequest) returns (ForwardCommandResponse);
+  rpc ForwardMembership(ForwardMembershipRequest) returns (ForwardMembershipResponse);
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message Member {
+  uint64 node_id = 1;
+  string peer_endpoint = 2;
+}
+
+message ForwardMembershipRequest {
+  RpcIdentity identity = 1;
+  bytes operation_id = 2;
+  repeated Member members = 3;
+  uint32 hop_count = 4;
+  bool query = 5;
+}
+
+message ForwardMembershipResponse {
+  RpcIdentity identity = 1;
+  bytes operation_id = 2;
+  repeated Member members = 3;
+  uint64 commit_index = 4;
+  uint32 error_code = 5;
 }
 
 message RpcIdentity {

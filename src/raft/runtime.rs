@@ -91,6 +91,23 @@ impl<S: RaftStorage> DurableRaft<S> {
         Ok((index, self.execute(effects)?))
     }
 
+    pub fn propose_membership(
+        &mut self,
+        membership: super::MembershipEntry,
+    ) -> Result<(u64, Vec<Effect>), RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let (index, effects) = self
+            .core
+            .propose_membership(membership)
+            .map_err(RuntimeError::Core)?;
+        Ok((index, self.execute(effects)?))
+    }
+
+    pub fn stage_peer(&mut self, peer: NodeId) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        self.core.stage_peer(peer).map_err(RuntimeError::Core)
+    }
+
     pub fn heartbeat(&mut self) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
         self.ensure_active()?;
         let effects = self.core.heartbeat().map_err(RuntimeError::Core)?;
@@ -286,6 +303,7 @@ impl<S: SnapshotStorage> DurableRaft<S> {
     pub fn recover_with_snapshot_membership(
         id: NodeId,
         initial_membership: super::MembershipEntry,
+        allow_non_voter: bool,
         storage: S,
     ) -> Result<Self, RuntimeError<S::Error>> {
         let hard_state = storage.load_hard_state().map_err(RuntimeError::Storage)?;
@@ -304,7 +322,12 @@ impl<S: SnapshotStorage> DurableRaft<S> {
             .entries_from(start, usize::MAX)
             .map_err(RuntimeError::Storage)?;
         let last_applied = storage.last_applied().map_err(RuntimeError::Storage)?;
-        let core = RaftCore::recover_compacted_with_membership(
+        let recover = if allow_non_voter {
+            RaftCore::recover_compacted_learner
+        } else {
+            RaftCore::recover_compacted_with_membership
+        };
+        let core = recover(
             id,
             base_membership,
             hard_state,
@@ -499,6 +522,13 @@ mod tests {
         }
 
         fn value(&self, _: &str) -> Result<Option<crate::kv::ValueRecord>, Self::Error> {
+            Ok(None)
+        }
+
+        fn membership_operation(
+            &self,
+            _: [u8; 16],
+        ) -> Result<Option<crate::raft::MembershipEntry>, Self::Error> {
             Ok(None)
         }
     }

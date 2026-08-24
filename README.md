@@ -2,12 +2,13 @@
 
 A production-shaped Rust microservice foundation. The current implementation
 provides HTTP lifecycle, configuration, observability, tests, containers, and
-CI. The completed M1 through M4 milestones provide a deterministic Raft election
+CI. The completed M1 through M5 milestones provide a deterministic Raft election
 and static-cluster replication core, explicit persistence and ordered-
 application barriers, transactional SQLite storage, a crash/partition-aware
 simulator, versioned protocol traces, bounded TLA+ models, transactional CRUD,
 deduplicated retries, follower forwarding, external linearizability checks,
-and atomic logical snapshots with resumable lagging-follower installation.
+atomic logical snapshots with resumable lagging-follower installation, and
+dynamic membership through staged joint consensus.
 
 The normative project goals, correctness claims, protocol scope, verification
 strategy, and milestone gates are defined in
@@ -45,6 +46,10 @@ curl --fail-with-body -X PUT \
   --data-binary 'hello' \
   http://localhost:8080/v1/keys/greeting
 curl --fail-with-body http://localhost:8080/v1/keys/greeting
+
+curl --fail-with-body \
+  -H 'Authorization: Bearer local-development-only' \
+  http://localhost:8080/operational/v1/membership
 ```
 
 Run all quality gates, including the fast formal model, with `make check`.
@@ -62,6 +67,13 @@ a retryable `503`.
 For a single local process, `make run` uses the one-node defaults on
 `localhost:8080` and persists state in `data/node-1.sqlite3`.
 
+Membership changes use `PUT /operational/v1/membership` with a stable UUID and
+the complete target member list. A joining process starts with
+`raft.staging = true`, the current voters/endpoints, a fresh node ID and empty
+data directory. The leader admits it only after zero-lag catch-up. Retrying the
+same operation ID and target is safe; reusing an ID for another target returns
+`409`. See the OpenAPI document for the exact body and response.
+
 Build the production image with `make image`. Its runtime process is non-root and exposes a container health check.
 
 ## Configuration
@@ -76,7 +88,7 @@ Use `pretty` logs for development and `json` in deployed environments. Every HTT
 - `src/http.rs`: HTTP routes, middleware, and health state
 - `src/history.rs`: bounded exact linearizability checker
 - `src/kv/`: deterministic CRUD and deduplication state machine
-- `src/cluster.rs`: static-cluster actor, gRPC dispatch, and client forwarding
+- `src/cluster.rs`: cluster actor, gRPC dispatch, forwarding, and membership control
 - `src/raft/`: deterministic protocol core and simulator
 - `src/storage/`: transactional Raft persistence contract and SQLite backend
 - `src/telemetry.rs`: structured logging initialization
@@ -85,6 +97,6 @@ Use `pretty` logs for development and `json` in deployed environments. Every HTT
 - `formal/`: TLA+ models, finite configurations, and abstraction maps
 - `verification/`: machine-readable requirement, property, and evidence maps
 
-No consensus library is used. Remaining RPC, metrics-backend, and deployment
+No consensus library is used. Remaining metrics-backend and deployment
 choices follow the specification and accepted ADRs rather than boilerplate
 convention.

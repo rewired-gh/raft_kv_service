@@ -30,6 +30,7 @@ formal: ## Model-check the fast formal suite
 	./scripts/tlc.sh check formal/Raft.cfg
 	./scripts/tlc.sh check formal/KvStateMachine.cfg
 	./scripts/tlc.sh check formal/RaftSnapshot.cfg
+	./scripts/tlc.sh check formal/RaftMembership.cfg
 
 docker-dev: ## Start the development service with Compose
 	docker compose up --build

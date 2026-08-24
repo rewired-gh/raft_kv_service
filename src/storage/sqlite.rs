@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
 
@@ -131,6 +131,11 @@ impl SqliteStorage {
                 result BLOB
             ) STRICT;
 
+            CREATE TABLE IF NOT EXISTS membership_operations (
+                operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+                configuration BLOB NOT NULL
+            ) STRICT;
+
             CREATE TABLE IF NOT EXISTS raft_snapshot (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 format_version INTEGER NOT NULL,
@@ -156,6 +161,7 @@ impl SqliteStorage {
         match user_version {
             0 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
             1..=3 => migrate_configuration_entries(&connection)?,
+            4 => {}
             SCHEMA_VERSION => {}
             found => {
                 return Err(StorageError::UnsupportedSchemaVersion {
@@ -164,6 +170,7 @@ impl SqliteStorage {
                 });
             }
         }
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
         let storage = Self { connection };
         storage.validate()?;
@@ -410,7 +417,29 @@ impl StateMachineStorage for SqliteStorage {
                         max_clients,
                     )?)
                 }
-                EntryPayload::Configuration(_) => None,
+                EntryPayload::Configuration(configuration) => {
+                    if configuration.phase == ConfigurationPhase::Stable {
+                        let encoded = encode_membership(configuration)
+                            .map_err(|_| StorageError::InvalidConfiguration)?;
+                        let existing = transaction
+                            .query_row(
+                                "SELECT configuration FROM membership_operations
+                                 WHERE operation_id = ?1",
+                                params![configuration.operation_id.as_slice()],
+                                |row| row.get::<_, Vec<u8>>(0),
+                            )
+                            .optional()?;
+                        if existing.as_deref().is_some_and(|value| value != encoded) {
+                            return Err(StorageError::MembershipOperationConflict);
+                        }
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO membership_operations(operation_id, configuration)
+                             VALUES (?1, ?2)",
+                            params![configuration.operation_id.as_slice(), encoded],
+                        )?;
+                    }
+                    None
+                }
             };
             let encoded_result = result
                 .as_ref()
@@ -437,6 +466,21 @@ impl StateMachineStorage for SqliteStorage {
 
     fn value(&self, key: &str) -> Result<Option<ValueRecord>, Self::Error> {
         load_value(&self.connection, key)
+    }
+
+    fn membership_operation(
+        &self,
+        operation_id: [u8; 16],
+    ) -> Result<Option<MembershipEntry>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT configuration FROM membership_operations WHERE operation_id = ?1",
+                params![operation_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|bytes| decode_membership(&bytes).map_err(|_| StorageError::InvalidConfiguration))
+            .transpose()
     }
 }
 
@@ -543,6 +587,7 @@ impl SnapshotStorage for SqliteStorage {
         }
         transaction.execute("DELETE FROM kv_state", [])?;
         transaction.execute("DELETE FROM client_sessions", [])?;
+        transaction.execute("DELETE FROM membership_operations", [])?;
         transaction.execute("DELETE FROM applied_results", [])?;
         for row in decoded.keys {
             transaction.execute(
@@ -560,6 +605,14 @@ impl SnapshotStorage for SqliteStorage {
                     row.fingerprint.as_slice(),
                     row.result,
                 ],
+            )?;
+        }
+        for operation in decoded.membership_operations {
+            let encoded =
+                encode_membership(&operation).map_err(|_| StorageError::InvalidConfiguration)?;
+            transaction.execute(
+                "INSERT INTO membership_operations(operation_id, configuration) VALUES (?1, ?2)",
+                params![operation.operation_id.as_slice(), encoded],
             )?;
         }
         transaction.execute(
@@ -592,6 +645,7 @@ struct DecodedSnapshot {
     max_clients: u64,
     keys: Vec<SnapshotKey>,
     clients: Vec<SnapshotClient>,
+    membership_operations: Vec<MembershipEntry>,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RKVSNP01";
@@ -675,6 +729,25 @@ fn encode_snapshot_payload(
         put_u64(&mut output, decode_u64("snapshot sequence", &sequence)?);
         output.extend_from_slice(&fingerprint);
         put_bytes(&mut output, &result)?;
+    }
+    let mut statement = connection.prepare(
+        "SELECT operation_id, configuration FROM membership_operations ORDER BY operation_id ASC",
+    )?;
+    let operations = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    put_u64(
+        &mut output,
+        u64::try_from(operations.len()).map_err(|_| StorageError::SnapshotEncoding)?,
+    );
+    for (operation_id, configuration) in operations {
+        if operation_id.len() != 16 {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        output.extend_from_slice(&operation_id);
+        put_bytes(&mut output, &configuration)?;
     }
     Ok(output)
 }
@@ -766,6 +839,25 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
             result,
         });
     }
+    let operation_count = input.count()?;
+    let mut membership_operations = Vec::new();
+    let mut previous_operation = None;
+    for _ in 0..operation_count {
+        let operation_id: [u8; 16] = input
+            .take(16)?
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let operation =
+            decode_membership(&input.bytes()?).map_err(|_| StorageError::InvalidConfiguration)?;
+        if operation.operation_id != operation_id
+            || operation.phase != ConfigurationPhase::Stable
+            || previous_operation.is_some_and(|previous| previous >= operation_id)
+        {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        previous_operation = Some(operation_id);
+        membership_operations.push(operation);
+    }
     if !input.is_empty() || u64::try_from(clients.len()).unwrap_or(u64::MAX) > max_clients {
         return Err(StorageError::SnapshotEncoding);
     }
@@ -773,6 +865,7 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
         max_clients,
         keys,
         clients,
+        membership_operations,
     })
 }
 
@@ -1412,6 +1505,7 @@ pub enum StorageError {
     SnapshotConflict(u64),
     SnapshotEncoding,
     InvalidConfiguration,
+    MembershipOperationConflict,
     Command(CommandError),
     HardStateRegression { current: HardState, next: HardState },
     InvalidLogEntry { index: u64, term: Term },
@@ -1481,6 +1575,9 @@ impl Display for StorageError {
             }
             Self::SnapshotEncoding => formatter.write_str("invalid snapshot encoding"),
             Self::InvalidConfiguration => formatter.write_str("invalid membership configuration"),
+            Self::MembershipOperationConflict => {
+                formatter.write_str("membership operation ID conflicts with committed target")
+            }
             Self::Command(error) => Display::fmt(error, formatter),
             Self::HardStateRegression { current, next } => {
                 write!(

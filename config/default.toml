@@ -5,6 +5,7 @@ name = "raft-kv-service"
 host = "0.0.0.0"
 port = 8080
 request_timeout_seconds = 30
+operational_token = "local-development-only"
 
 [telemetry]
 log_filter = "raft_kv_service=debug,tower_http=info"
@@ -24,6 +25,7 @@ heartbeat_interval_ms = 100
 rpc_timeout_ms = 250
 max_clients = 10000
 snapshot_threshold_entries = 10000
+staging = false
 
 [peer]
 host = "0.0.0.0"

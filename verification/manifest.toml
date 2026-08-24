@@ -104,8 +104,12 @@ id = "configuration-safety"
 spec_section = "12.1.7"
 model = "formal/RaftMembership.tla"
 invariant = "ConfigurationSafety"
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "formal/RaftMembership.cfg",
+  "verification/evidence/m5-fast-tlc.toml",
+  "verification/evidence/m5-runtime.toml",
+]
 
 [[property]]
 id = "snapshot-safety"

@@ -82,8 +82,20 @@ evidence = [
 [[requirement]]
 id = "M5"
 spec_sections = ["10.5", "19.M5"]
-status = "planned"
-evidence = []
+status = "verified"
+evidence = [
+  "docs/adr/0005-joint-membership.md",
+  "src/raft/election.rs",
+  "src/raft/log.rs",
+  "src/raft/runtime.rs",
+  "src/cluster.rs",
+  "src/storage/sqlite.rs",
+  "src/http.rs",
+  "docs/openapi.yaml",
+  "formal/RaftMembership.tla",
+  "verification/evidence/m5-fast-tlc.toml",
+  "verification/evidence/m5-runtime.toml",
+]
 
 [[requirement]]
 id = "M6"

@@ -1,0 +1,27 @@
+schema_version = 1
+property_set = "m5-joint-membership"
+recorded_at = "2026-08-24T12:29:42+08:00"
+tool = "TLC"
+tool_version = "2.19 (TLA+ tools 1.7.4)"
+command = "./scripts/tlc.sh check formal/RaftMembership.cfg"
+model = "formal/RaftMembership.tla"
+model_sha256 = "160996064cfb95c7bf88c2b42563f616c5cc282851e8a933c93bc6a3a032391b"
+configuration = "formal/RaftMembership.cfg"
+configuration_sha256 = "50200738b6b10dd8679aea342773a372b56f55a6eb04f3107195f032c64a3b0a"
+generated_states = 68488
+distinct_states = 5082
+search_depth = 44
+result = "pass"
+
+[parameters]
+nodes = 3
+initial_voters = 2
+operations = 1
+
+invariants = [
+  "TypeOK",
+  "ConfigurationSafety",
+  "JointWitnessesUseBothQuorums",
+  "OperationIdsAreFunctional",
+  "LeaderIsAuthorized",
+]

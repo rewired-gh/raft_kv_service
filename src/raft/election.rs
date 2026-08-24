@@ -478,11 +478,50 @@ impl RaftCore {
         log: Vec<LogEntry>,
         last_applied: u64,
     ) -> Result<Self, CoreError> {
+        Self::recover_compacted_member(
+            id,
+            base_membership,
+            hard_state,
+            snapshot_position,
+            log,
+            last_applied,
+            false,
+        )
+    }
+
+    pub fn recover_compacted_learner(
+        id: NodeId,
+        base_membership: MembershipEntry,
+        hard_state: HardState,
+        snapshot_position: LogPosition,
+        log: Vec<LogEntry>,
+        last_applied: u64,
+    ) -> Result<Self, CoreError> {
+        Self::recover_compacted_member(
+            id,
+            base_membership,
+            hard_state,
+            snapshot_position,
+            log,
+            last_applied,
+            true,
+        )
+    }
+
+    fn recover_compacted_member(
+        id: NodeId,
+        base_membership: MembershipEntry,
+        hard_state: HardState,
+        snapshot_position: LogPosition,
+        log: Vec<LogEntry>,
+        last_applied: u64,
+        allow_non_voter: bool,
+    ) -> Result<Self, CoreError> {
         base_membership
             .validate()
             .map_err(|_| CoreError::InvalidConfiguration)?;
         let base_voters = active_voters_for(&base_membership)?;
-        if !base_voters.contains(id) {
+        if !allow_non_voter && !base_voters.contains(id) {
             return Err(CoreError::LocalNodeIsNotVoter(id));
         }
         if let Some(voted_for) = hard_state.voted_for

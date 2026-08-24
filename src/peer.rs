@@ -6,18 +6,20 @@ use std::{
 };
 
 use crate::{
+    cluster::{MembershipError, MembershipView},
     kv::{
         Command, CommandResult, decode_command, decode_command_result, encode_command,
         encode_command_result,
     },
     raft::{
-        EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term, decode_membership,
-        encode_membership,
+        ClusterConfiguration, EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term,
+        decode_membership, encode_membership,
     },
     storage::{SNAPSHOT_FORMAT_VERSION, Snapshot},
 };
 
-pub const PEER_PROTOCOL_VERSION: u32 = 1;
+pub const PEER_PROTOCOL_VERSION: u32 = 2;
+pub type ForwardMembershipOperation = Option<([u8; 16], ClusterConfiguration)>;
 
 pub mod proto {
     tonic::include_proto!("raft.peer.v1");
@@ -54,6 +56,80 @@ pub struct PeerContext {
 }
 
 impl PeerContext {
+    pub fn decode_forward_membership(
+        &self,
+        request: proto::ForwardMembershipRequest,
+    ) -> Result<(NodeId, ForwardMembershipOperation), PeerError> {
+        let identity = self.validate_identity(request.identity)?;
+        if request.hop_count > 1 {
+            return Err(PeerError::ForwardingLoop);
+        }
+        if request.query {
+            if !request.operation_id.is_empty() || !request.members.is_empty() {
+                return Err(PeerError::InvalidConfiguration);
+            }
+            return Ok((identity.sender, None));
+        }
+        let operation_id: [u8; 16] = request
+            .operation_id
+            .try_into()
+            .map_err(|_| PeerError::InvalidConfiguration)?;
+        if operation_id == [0; 16] {
+            return Err(PeerError::InvalidConfiguration);
+        }
+        let target = ClusterConfiguration::new(
+            request
+                .members
+                .into_iter()
+                .map(|member| (member.node_id, member.peer_endpoint)),
+        )
+        .map_err(|_| PeerError::InvalidConfiguration)?;
+        if target.members().any(|(_, endpoint)| {
+            !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+        }) {
+            return Err(PeerError::InvalidConfiguration);
+        }
+        Ok((identity.sender, Some((operation_id, target))))
+    }
+
+    pub fn decode_forward_membership_response(
+        &self,
+        response: proto::ForwardMembershipResponse,
+    ) -> Result<Result<MembershipView, MembershipError>, PeerError> {
+        let _ = self.validate_identity(response.identity)?;
+        if response.error_code != 0 {
+            let error = match response.error_code {
+                1 => MembershipError::Unavailable,
+                2 => MembershipError::Overloaded,
+                3 => MembershipError::Invalid,
+                4 => MembershipError::Conflict,
+                5 => MembershipError::ChangeInProgress,
+                6 => MembershipError::Internal,
+                _ => return Err(PeerError::InvalidConfiguration),
+            };
+            return Ok(Err(error));
+        }
+        let operation_id = response
+            .operation_id
+            .try_into()
+            .map_err(|_| PeerError::InvalidConfiguration)?;
+        let configuration = ClusterConfiguration::new(
+            response
+                .members
+                .into_iter()
+                .map(|member| (member.node_id, member.peer_endpoint)),
+        )
+        .map_err(|_| PeerError::InvalidConfiguration)?;
+        Ok(Ok(MembershipView {
+            operation_id,
+            members: configuration
+                .members()
+                .map(|(node, endpoint)| (NodeId(node), endpoint.to_owned()))
+                .collect(),
+            commit_index: response.commit_index,
+        }))
+    }
+
     pub fn decode_snapshot_response(
         &self,
         response: proto::InstallSnapshotResponse,
@@ -284,6 +360,79 @@ impl PeerContext {
             term: Term(identity.term),
         })
     }
+}
+
+pub fn encode_forward_membership(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    operation: Option<([u8; 16], &ClusterConfiguration)>,
+) -> Result<proto::ForwardMembershipRequest, PeerError> {
+    let (operation_id, members, query) = match operation {
+        Some((operation_id, target)) => (
+            operation_id.to_vec(),
+            target
+                .members()
+                .map(|(node_id, peer_endpoint)| proto::Member {
+                    node_id,
+                    peer_endpoint: peer_endpoint.to_owned(),
+                })
+                .collect(),
+            false,
+        ),
+        None => (Vec::new(), Vec::new(), true),
+    };
+    Ok(proto::ForwardMembershipRequest {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        operation_id,
+        members,
+        hop_count: 1,
+        query,
+    })
+}
+
+pub fn encode_forward_membership_response(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    result: Result<MembershipView, MembershipError>,
+) -> Result<proto::ForwardMembershipResponse, PeerError> {
+    let (operation_id, members, commit_index, error_code) = match result {
+        Ok(view) => (
+            view.operation_id.to_vec(),
+            view.members
+                .into_iter()
+                .map(|(node, peer_endpoint)| proto::Member {
+                    node_id: node.0,
+                    peer_endpoint,
+                })
+                .collect(),
+            view.commit_index,
+            0,
+        ),
+        Err(error) => (
+            Vec::new(),
+            Vec::new(),
+            0,
+            match error {
+                MembershipError::Unavailable => 1,
+                MembershipError::Overloaded => 2,
+                MembershipError::Invalid => 3,
+                MembershipError::Conflict => 4,
+                MembershipError::ChangeInProgress => 5,
+                MembershipError::Internal => 6,
+            },
+        ),
+    };
+    Ok(proto::ForwardMembershipResponse {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        operation_id,
+        members,
+        commit_index,
+        error_code,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,6 +833,26 @@ mod tests {
                 .decode_forward_response(response)
                 .expect("decode response"),
             result
+        );
+
+        let target = ClusterConfiguration::new([
+            (1, "http://node-1:9080".to_owned()),
+            (2, "http://node-2:9080".to_owned()),
+        ])
+        .expect("target");
+        let membership = encode_forward_membership(
+            ClusterId([4; 16]),
+            NodeId(1),
+            NodeId(2),
+            Term(3),
+            Some(([5; 16], &target)),
+        )
+        .expect("encode membership");
+        assert_eq!(
+            context()
+                .decode_forward_membership(membership)
+                .expect("decode membership"),
+            (NodeId(1), Some(([5; 16], target)))
         );
     }
 

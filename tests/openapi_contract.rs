@@ -98,3 +98,25 @@ fn generated_operation_matrix_matches_the_v1_http_contract() {
         Some("no-store")
     );
 }
+
+#[test]
+fn operational_membership_contract_is_versioned_and_authenticated() {
+    let document = document();
+    let path = document
+        .pointer("/paths/~1operational~1v1~1membership")
+        .and_then(Value::as_object)
+        .expect("operational membership path");
+    for method in ["get", "put"] {
+        let operation = path[method].as_object().expect("operation");
+        assert!(
+            operation.get("security").is_some(),
+            "{method} requires auth"
+        );
+    }
+    assert_eq!(
+        document
+            .pointer("/components/securitySchemes/OperationalBearer/scheme")
+            .and_then(Value::as_str),
+        Some("bearer")
+    );
+}

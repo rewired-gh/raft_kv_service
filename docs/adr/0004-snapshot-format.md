@@ -7,8 +7,9 @@
 
 Persist a versioned canonical logical snapshot inside the same SQLite database
 as Raft and application state. The payload contains the cluster identity,
-included index and term, ordered voter IDs, configured client-session bound,
-ordered KV rows, and ordered deduplication records. SHA-256 binds the complete
+included index and term, effective stable or joint membership with endpoints,
+configured client-session bound, ordered KV rows, ordered deduplication
+records, and completed membership operation IDs. SHA-256 binds the complete
 payload; the digest is also its transfer identity.
 
 Snapshot publication, state restoration, virtual-prefix metadata, and covered
@@ -31,4 +32,6 @@ digest and format validation.
 - The logical format is independent of SQLite page layout and carries an
   explicit format version, but schema evolution requires a tested decoder and
   migration policy.
+- Format v2 replaces the M4 voter-ID-only header with canonical membership
+  entries and membership-operation records.
 - SHA-256 and SQLite durability remain in the trusted computing base.

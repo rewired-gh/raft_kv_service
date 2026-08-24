@@ -12,8 +12,10 @@ use axum::{
     },
 };
 use raft_kv_service::{
+    cluster::MembershipView,
     http::{AppState, ServiceError, router},
     kv::{Command, KvStateMachine},
+    raft::NodeId,
 };
 use tower::ServiceExt;
 
@@ -119,5 +121,49 @@ async fn unavailable_executor_returns_retryable_problem() -> Result<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()["cache-control"], "no-store");
+    Ok(())
+}
+
+#[tokio::test]
+async fn operational_membership_requires_authentication_and_validates_contract() -> Result<()> {
+    let state = AppState::new("test-service").with_membership(
+        "secret",
+        |operation_id, target| async move {
+            Ok(MembershipView {
+                operation_id,
+                members: target
+                    .members()
+                    .map(|(node, endpoint)| (NodeId(node), endpoint.to_owned()))
+                    .collect(),
+                commit_index: 9,
+            })
+        },
+        || async {
+            Ok(MembershipView {
+                operation_id: [1; 16],
+                members: vec![(NodeId(1), "http://node-1:9080".to_owned())],
+                commit_index: 8,
+            })
+        },
+    );
+    let app = router(state, Duration::from_secs(1));
+    let unauthorized = app
+        .clone()
+        .oneshot(Request::get("/operational/v1/membership").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let request = Request::put("/operational/v1/membership")
+        .header("authorization", "Bearer secret")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"operation_id":"018f3f5e-7b4a-7c15-9e37-79b97f4a7c15","members":[{"node_id":1,"peer_endpoint":"http://node-1:9080"}]}"#,
+        ))?;
+    let response = app.oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["commit_index"], 9);
+    assert_eq!(body["members"][0]["node_id"], 1);
     Ok(())
 }

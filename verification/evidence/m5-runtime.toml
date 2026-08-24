@@ -1,0 +1,19 @@
+schema_version = 1
+property_set = "m5-runtime-membership"
+recorded_at = "2026-08-24T12:29:42+08:00"
+command = "cargo test --all-targets --all-features"
+result = "pass"
+rust_tests = 76
+
+evidence = [
+  "configuration entries use canonical identities and endpoints",
+  "joint elections and commit require separate old/new majorities",
+  "new voters replicate at zero lag without voting during staging",
+  "stable configuration cannot be proposed before joint commit",
+  "removed leader steps down at stable commit before another proposal",
+  "membership and operation IDs survive SQLite restart and snapshot v2",
+  "operation retries are idempotent and conflicting targets are rejected",
+  "authenticated operational HTTP contract and one-hop leader forwarding",
+  "real four-process voter addition and current-leader removal",
+  "bounded exhaustive TLC membership model",
+]

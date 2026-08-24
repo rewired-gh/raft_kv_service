@@ -56,6 +56,10 @@ pub trait StateMachineStorage: RaftStorage {
     fn last_applied(&self) -> Result<u64, Self::Error>;
     fn apply_committed(&mut self, entries: &[LogEntry]) -> Result<Vec<AppliedEntry>, Self::Error>;
     fn value(&self, key: &str) -> Result<Option<ValueRecord>, Self::Error>;
+    fn membership_operation(
+        &self,
+        operation_id: [u8; 16],
+    ) -> Result<Option<MembershipEntry>, Self::Error>;
 }
 
 pub trait SnapshotStorage: StateMachineStorage {

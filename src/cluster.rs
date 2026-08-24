@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
@@ -22,13 +22,47 @@ use crate::{
     kv::{Command, CommandResult, encode_command},
     peer::{
         ClusterId, PeerContext, PeerLimits, SnapshotChunk, encode_append_entries,
-        encode_append_entries_response, encode_forward_command, encode_forward_response,
-        encode_request_vote, encode_request_vote_response, encode_snapshot_chunk,
-        encode_snapshot_response, proto,
+        encode_append_entries_response, encode_forward_command, encode_forward_membership,
+        encode_forward_membership_response, encode_forward_response, encode_request_vote,
+        encode_request_vote_response, encode_snapshot_chunk, encode_snapshot_response, proto,
     },
-    raft::{DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, Term},
-    storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage},
+    raft::{
+        ClusterConfiguration, ConfigurationPhase, DurableRaft, Effect, EntryPayload, Envelope,
+        Event, LogEntry, MembershipEntry, Message, NodeId, Role, Term,
+    },
+    storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage, StateMachineStorage},
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipView {
+    pub operation_id: [u8; 16],
+    pub members: Vec<(NodeId, String)>,
+    pub commit_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipError {
+    Unavailable,
+    Overloaded,
+    Invalid,
+    Conflict,
+    ChangeInProgress,
+    Internal,
+}
+
+struct PendingMembership {
+    operation_id: [u8; 16],
+    target: ClusterConfiguration,
+    phase: MembershipPhase,
+    responders: Vec<oneshot::Sender<Result<MembershipView, MembershipError>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipPhase {
+    Staging,
+    Joint(u64),
+    Stable(u64),
+}
 
 #[derive(Clone, Debug)]
 pub struct StaticNodeConfig {
@@ -46,13 +80,14 @@ pub struct StaticNodeConfig {
     pub snapshot_threshold_entries: u64,
     pub peer_endpoints: BTreeMap<NodeId, String>,
     pub local_peer_endpoint: String,
+    pub staging: bool,
 }
 
 pub struct RunningNode {
     pub handle: StaticNodeHandle,
     pub peer_service: PeerRpcService,
     outbound: tokio_mpsc::Receiver<Outbound>,
-    endpoints: BTreeMap<NodeId, String>,
+    endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
 }
 
@@ -66,7 +101,12 @@ impl RunningNode {
                     Outbound::Raft(envelope) => envelope.to,
                     Outbound::Snapshot { to, .. } => *to,
                 };
-                let Some(endpoint) = self.endpoints.get(&to).cloned() else {
+                let Some(endpoint) = self
+                    .endpoints
+                    .read()
+                    .ok()
+                    .and_then(|endpoints| endpoints.get(&to).cloned())
+                else {
                     warn!(peer = to.0, "missing peer endpoint; dropping Raft RPC");
                     continue;
                 };
@@ -116,7 +156,7 @@ pub struct StaticNodeHandle {
     sender: SyncSender<NodeRequest>,
     cluster_id: ClusterId,
     node_id: NodeId,
-    endpoints: Arc<BTreeMap<NodeId, String>>,
+    endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
 }
 
@@ -139,6 +179,112 @@ impl StaticNodeHandle {
         response.await.map_err(|_| ServiceError::Unavailable)?
     }
 
+    pub async fn change_membership(
+        &self,
+        operation_id: [u8; 16],
+        target: ClusterConfiguration,
+    ) -> Result<MembershipView, MembershipError> {
+        match self
+            .change_membership_local(operation_id, target.clone())
+            .await
+        {
+            Err(MembershipError::Unavailable) => {
+                self.forward_membership(Some((operation_id, &target))).await
+            }
+            result => result,
+        }
+    }
+
+    async fn change_membership_local(
+        &self,
+        operation_id: [u8; 16],
+        target: ClusterConfiguration,
+    ) -> Result<MembershipView, MembershipError> {
+        let (respond, response) = oneshot::channel();
+        self.sender
+            .try_send(NodeRequest::MembershipChange {
+                operation_id,
+                target,
+                respond,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => MembershipError::Overloaded,
+                mpsc::TrySendError::Disconnected(_) => MembershipError::Unavailable,
+            })?;
+        response.await.map_err(|_| MembershipError::Unavailable)?
+    }
+
+    pub async fn membership(&self) -> Result<MembershipView, MembershipError> {
+        match self.membership_local().await {
+            Err(MembershipError::Unavailable) => self.forward_membership(None).await,
+            result => result,
+        }
+    }
+
+    async fn membership_local(&self) -> Result<MembershipView, MembershipError> {
+        let (respond, response) = oneshot::channel();
+        self.sender
+            .try_send(NodeRequest::MembershipQuery { respond })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => MembershipError::Overloaded,
+                mpsc::TrySendError::Disconnected(_) => MembershipError::Unavailable,
+            })?;
+        response.await.map_err(|_| MembershipError::Unavailable)?
+    }
+
+    async fn forward_membership(
+        &self,
+        operation: Option<([u8; 16], &ClusterConfiguration)>,
+    ) -> Result<MembershipView, MembershipError> {
+        let (leader, term) = self
+            .status()
+            .await
+            .map_err(|_| MembershipError::Unavailable)?;
+        let leader = leader
+            .filter(|leader| *leader != self.node_id)
+            .ok_or(MembershipError::Unavailable)?;
+        let endpoint = self
+            .endpoints
+            .read()
+            .map_err(|_| MembershipError::Internal)?
+            .get(&leader)
+            .cloned()
+            .ok_or(MembershipError::Unavailable)?;
+        let channel = tokio::time::timeout(
+            self.rpc_timeout,
+            Channel::from_shared(endpoint)
+                .map_err(|_| MembershipError::Internal)?
+                .connect(),
+        )
+        .await
+        .map_err(|_| MembershipError::Unavailable)?
+        .map_err(|_| MembershipError::Unavailable)?;
+        let request =
+            encode_forward_membership(self.cluster_id, self.node_id, leader, term, operation)
+                .map_err(|_| MembershipError::Internal)?;
+        let response = tokio::time::timeout(
+            self.rpc_timeout,
+            proto::raft_peer_client::RaftPeerClient::new(channel).forward_membership(request),
+        )
+        .await
+        .map_err(|_| MembershipError::Unavailable)?
+        .map_err(|status| match status.code() {
+            tonic::Code::ResourceExhausted => MembershipError::Overloaded,
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+                MembershipError::Unavailable
+            }
+            _ => MembershipError::Internal,
+        })?
+        .into_inner();
+        PeerContext {
+            cluster_id: self.cluster_id,
+            local_id: self.node_id,
+            limits: PeerLimits::default(),
+        }
+        .decode_forward_membership_response(response)
+        .map_err(|_| MembershipError::Internal)?
+    }
+
     async fn status(&self) -> Result<(Option<NodeId>, Term), ServiceError> {
         let (respond, response) = oneshot::channel();
         self.sender
@@ -157,11 +303,14 @@ impl StaticNodeHandle {
             .ok_or(ServiceError::Unavailable)?;
         let endpoint = self
             .endpoints
+            .read()
+            .map_err(|_| ServiceError::Internal)?
             .get(&leader)
+            .cloned()
             .ok_or(ServiceError::Unavailable)?;
         let channel = tokio::time::timeout(
             self.rpc_timeout,
-            Channel::from_shared(endpoint.clone())
+            Channel::from_shared(endpoint)
                 .map_err(|_| ServiceError::Internal)?
                 .connect(),
         )
@@ -237,16 +386,29 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     let membership = crate::raft::MembershipEntry::initial(
         crate::raft::ClusterConfiguration::new(members).map_err(|error| error.to_string())?,
     );
-    let raft = DurableRaft::recover_with_snapshot_membership(config.node_id, membership, storage)
-        .map_err(|error| error.to_string())?;
+    let raft = DurableRaft::recover_with_snapshot_membership(
+        config.node_id,
+        membership,
+        config.staging,
+        storage,
+    )
+    .map_err(|error| error.to_string())?;
+    let endpoints = Arc::new(RwLock::new(config.peer_endpoints.clone()));
     let (sender, receiver) = mpsc::sync_channel(config.request_queue_capacity);
     let (outbound_sender, outbound) = tokio_mpsc::channel(config.outbound_queue_capacity);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let worker_config = config.clone();
+    let worker_endpoints = endpoints.clone();
     thread::Builder::new()
         .name(format!("raft-node-{}", config.node_id.0))
         .spawn(move || {
-            let mut worker = NodeWorker::new(raft, receiver, outbound_sender, worker_config);
+            let mut worker = NodeWorker::new(
+                raft,
+                receiver,
+                outbound_sender,
+                worker_config,
+                worker_endpoints,
+            );
             let started = worker.bootstrap();
             let can_run = started.is_ok();
             let _ = started_sender.send(started);
@@ -263,7 +425,7 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
         sender,
         cluster_id: config.cluster_id,
         node_id: config.node_id,
-        endpoints: Arc::new(config.peer_endpoints.clone()),
+        endpoints: endpoints.clone(),
         rpc_timeout: config.rpc_timeout,
     };
     Ok(RunningNode {
@@ -277,7 +439,7 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
         },
         handle,
         outbound,
-        endpoints: config.peer_endpoints,
+        endpoints,
         rpc_timeout: config.rpc_timeout,
     })
 }
@@ -296,7 +458,7 @@ fn validate_config(config: &StaticNodeConfig) -> Result<(), String> {
     {
         return Err("invalid static Raft runtime configuration".to_owned());
     }
-    if !config.voters.contains(&config.node_id) {
+    if !config.staging && !config.voters.contains(&config.node_id) {
         return Err("local node is not in the static voter set".to_owned());
     }
     for voter in &config.voters {
@@ -324,6 +486,14 @@ enum NodeRequest {
         chunk: SnapshotChunk,
         respond: oneshot::Sender<Result<SnapshotProgress, Status>>,
     },
+    MembershipChange {
+        operation_id: [u8; 16],
+        target: ClusterConfiguration,
+        respond: oneshot::Sender<Result<MembershipView, MembershipError>>,
+    },
+    MembershipQuery {
+        respond: oneshot::Sender<Result<MembershipView, MembershipError>>,
+    },
 }
 
 struct SnapshotProgress {
@@ -342,6 +512,8 @@ struct NodeWorker {
     election_deadline: Instant,
     heartbeat_deadline: Instant,
     incoming_snapshot: Option<IncomingSnapshot>,
+    endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
+    pending_membership: Option<PendingMembership>,
 }
 
 struct IncomingSnapshot {
@@ -362,6 +534,7 @@ impl NodeWorker {
         receiver: Receiver<NodeRequest>,
         outbound: tokio_mpsc::Sender<Outbound>,
         config: StaticNodeConfig,
+        endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -372,6 +545,8 @@ impl NodeWorker {
             heartbeat_deadline: now + config.heartbeat_interval,
             pending_clients: HashMap::new(),
             incoming_snapshot: None,
+            endpoints,
+            pending_membership: None,
             config,
         }
     }
@@ -439,6 +614,7 @@ impl NodeWorker {
                     .handle(Event::Receive(envelope))
                     .map_err(|error| error.to_string())?;
                 self.process(effects, None)?;
+                self.maybe_start_joint()?;
                 self.fail_pending_after_stepdown(was_leader);
                 Ok(())
             }
@@ -454,6 +630,16 @@ impl NodeWorker {
                 let result = self.accept_snapshot_chunk(chunk);
                 let _ = respond.send(result);
                 self.fail_pending_after_stepdown(was_leader);
+                Ok(())
+            }
+            NodeRequest::MembershipChange {
+                operation_id,
+                target,
+                respond,
+            } => self.handle_membership_change(operation_id, target, respond),
+            NodeRequest::MembershipQuery { respond } => {
+                let result = self.membership_view();
+                let _ = respond.send(result);
                 Ok(())
             }
         }
@@ -475,6 +661,225 @@ impl NodeWorker {
             .map_err(|error| error.to_string())?;
         self.pending_clients.insert(index, respond);
         self.process(effects, None)?;
+        Ok(())
+    }
+
+    fn membership_view(&self) -> Result<MembershipView, MembershipError> {
+        if !self.raft.core().leader_ready() {
+            return Err(MembershipError::Unavailable);
+        }
+        let membership = self
+            .raft
+            .core()
+            .committed_membership()
+            .map_err(|_| MembershipError::Internal)?;
+        Ok(MembershipView {
+            operation_id: membership.operation_id,
+            members: membership
+                .new
+                .members()
+                .map(|(node, endpoint)| (NodeId(node), endpoint.to_owned()))
+                .collect(),
+            commit_index: self.raft.core().last_applied(),
+        })
+    }
+
+    fn handle_membership_change(
+        &mut self,
+        operation_id: [u8; 16],
+        target: ClusterConfiguration,
+        respond: oneshot::Sender<Result<MembershipView, MembershipError>>,
+    ) -> Result<(), String> {
+        if operation_id == [0; 16] {
+            let _ = respond.send(Err(MembershipError::Invalid));
+            return Ok(());
+        }
+        if !self.raft.core().leader_ready() {
+            let _ = respond.send(Err(MembershipError::Unavailable));
+            return Ok(());
+        }
+        if let Some(committed) = self
+            .raft
+            .storage()
+            .membership_operation(operation_id)
+            .map_err(|error| error.to_string())?
+        {
+            let result = if committed.new == target {
+                self.membership_view()
+            } else {
+                Err(MembershipError::Conflict)
+            };
+            let _ = respond.send(result);
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_membership.as_mut() {
+            if pending.operation_id == operation_id && pending.target == target {
+                pending.responders.push(respond);
+            } else {
+                let error = if pending.operation_id == operation_id {
+                    MembershipError::Conflict
+                } else {
+                    MembershipError::ChangeInProgress
+                };
+                let _ = respond.send(Err(error));
+            }
+            return Ok(());
+        }
+        if self.raft.core().membership_is_joint() {
+            let _ = respond.send(Err(MembershipError::ChangeInProgress));
+            return Ok(());
+        }
+
+        {
+            let mut endpoints = self
+                .endpoints
+                .write()
+                .map_err(|_| "peer endpoint lock is poisoned".to_owned())?;
+            for (node, endpoint) in target.members() {
+                if NodeId(node) != self.config.node_id {
+                    endpoints.insert(NodeId(node), endpoint.to_owned());
+                }
+            }
+        }
+        self.pending_membership = Some(PendingMembership {
+            operation_id,
+            target,
+            phase: MembershipPhase::Staging,
+            responders: vec![respond],
+        });
+
+        let committed = self
+            .raft
+            .core()
+            .committed_membership()
+            .map_err(|error| error.to_string())?;
+        let current = committed
+            .new
+            .node_ids()
+            .map(NodeId)
+            .collect::<std::collections::BTreeSet<_>>();
+        let prospective = self
+            .pending_membership
+            .as_ref()
+            .expect("pending membership was installed")
+            .target
+            .node_ids()
+            .map(NodeId)
+            .filter(|node| !current.contains(node))
+            .collect::<Vec<_>>();
+        for peer in prospective {
+            let effects = self
+                .raft
+                .stage_peer(peer)
+                .map_err(|error| error.to_string())?;
+            self.process(effects, None)?;
+        }
+        self.maybe_start_joint()
+    }
+
+    fn maybe_start_joint(&mut self) -> Result<(), String> {
+        let Some(pending) = self.pending_membership.as_ref() else {
+            return Ok(());
+        };
+        if pending.phase != MembershipPhase::Staging || !self.raft.core().leader_ready() {
+            return Ok(());
+        }
+        let committed = self
+            .raft
+            .core()
+            .committed_membership()
+            .map_err(|error| error.to_string())?;
+        let current = committed
+            .new
+            .node_ids()
+            .map(NodeId)
+            .collect::<std::collections::BTreeSet<_>>();
+        let last_index = self.raft.core().last_log_position().index;
+        let caught_up = pending
+            .target
+            .node_ids()
+            .map(NodeId)
+            .filter(|node| !current.contains(node))
+            .all(|node| {
+                self.raft
+                    .core()
+                    .replication_progress(node)
+                    .is_some_and(|progress| progress.match_index >= last_index)
+            });
+        if !caught_up {
+            return Ok(());
+        }
+        let operation_id = pending.operation_id;
+        let target = pending.target.clone();
+        let (index, effects) = self
+            .raft
+            .propose_membership(MembershipEntry {
+                operation_id,
+                phase: ConfigurationPhase::Joint,
+                old: committed.new,
+                new: target,
+            })
+            .map_err(|error| error.to_string())?;
+        self.pending_membership
+            .as_mut()
+            .expect("membership remains pending")
+            .phase = MembershipPhase::Joint(index);
+        self.process(effects, None).map(|_| ())
+    }
+
+    fn membership_entries_applied(&mut self, entries: &[LogEntry]) -> Result<(), String> {
+        for entry in entries {
+            let EntryPayload::Configuration(configuration) = &entry.payload else {
+                continue;
+            };
+            let Some(pending) = self.pending_membership.as_ref() else {
+                continue;
+            };
+            if pending.operation_id != configuration.operation_id {
+                continue;
+            }
+            match (pending.phase, configuration.phase) {
+                (MembershipPhase::Joint(index), ConfigurationPhase::Joint)
+                    if index == entry.index =>
+                {
+                    let target = pending.target.clone();
+                    let operation_id = pending.operation_id;
+                    let (stable_index, effects) = self
+                        .raft
+                        .propose_membership(MembershipEntry {
+                            operation_id,
+                            phase: ConfigurationPhase::Stable,
+                            old: target.clone(),
+                            new: target,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    self.pending_membership
+                        .as_mut()
+                        .expect("membership remains pending")
+                        .phase = MembershipPhase::Stable(stable_index);
+                    self.process(effects, None)?;
+                }
+                (MembershipPhase::Stable(index), ConfigurationPhase::Stable)
+                    if index == entry.index =>
+                {
+                    let view = Ok(MembershipView {
+                        operation_id: configuration.operation_id,
+                        members: configuration
+                            .new
+                            .members()
+                            .map(|(node, endpoint)| (NodeId(node), endpoint.to_owned()))
+                            .collect(),
+                        commit_index: entry.index,
+                    });
+                    if let Some(pending) = self.pending_membership.take() {
+                        for respond in pending.responders {
+                            let _ = respond.send(view.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -502,12 +907,14 @@ impl NodeWorker {
         while let Some(effect) = pending.pop_front() {
             match effect {
                 Effect::ApplyCommitted(entries) => {
+                    let membership_entries = entries.clone();
                     let batch = self
                         .raft
                         .apply_committed(&entries)
                         .map_err(|error| error.to_string())?;
                     self.complete_clients(batch.entries);
                     pending.extend(batch.effects);
+                    self.membership_entries_applied(&membership_entries)?;
                     let compacted = self.raft.core().snapshot_position().index;
                     let applied = self.raft.core().last_applied();
                     if applied.saturating_sub(compacted) >= self.config.snapshot_threshold_entries {
@@ -567,6 +974,11 @@ impl NodeWorker {
         if was_leader && self.raft.core().role() != Role::Leader {
             for (_, respond) in self.pending_clients.drain() {
                 let _ = respond.send(Err(ServiceError::Unavailable));
+            }
+            if let Some(pending) = self.pending_membership.take() {
+                for respond in pending.responders {
+                    let _ = respond.send(Err(MembershipError::Unavailable));
+                }
             }
         }
     }
@@ -716,6 +1128,38 @@ pub struct PeerRpcService {
 
 #[tonic::async_trait]
 impl proto::raft_peer_server::RaftPeer for PeerRpcService {
+    async fn forward_membership(
+        &self,
+        request: Request<proto::ForwardMembershipRequest>,
+    ) -> Result<Response<proto::ForwardMembershipResponse>, Status> {
+        let (sender, operation) = self
+            .context
+            .decode_forward_membership(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let result = match operation {
+            Some((operation_id, target)) => {
+                self.handle
+                    .change_membership_local(operation_id, target)
+                    .await
+            }
+            None => self.handle.membership_local().await,
+        };
+        let (_, term) = self
+            .handle
+            .status()
+            .await
+            .map_err(|_| Status::unavailable("Raft worker stopped"))?;
+        encode_forward_membership_response(
+            self.context.cluster_id,
+            self.context.local_id,
+            sender,
+            term,
+            result,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     async fn install_snapshot(
         &self,
         request: Request<proto::InstallSnapshotRequest>,
@@ -971,6 +1415,200 @@ mod tests {
         listener.local_addr().expect("local address")
     }
 
+    #[tokio::test]
+    async fn membership_operation_is_committed_idempotent_and_durable() {
+        let directory = temp_directory();
+        let database = directory.join("membership.sqlite3");
+        let config = StaticNodeConfig {
+            cluster_id: ClusterId([6; 16]),
+            node_id: NodeId(1),
+            voters: vec![NodeId(1)],
+            data_file: database.clone(),
+            request_queue_capacity: 16,
+            outbound_queue_capacity: 16,
+            election_timeout_min: Duration::from_millis(120),
+            election_timeout_max: Duration::from_millis(240),
+            heartbeat_interval: Duration::from_millis(30),
+            rpc_timeout: Duration::from_millis(100),
+            max_clients: 10_000,
+            snapshot_threshold_entries: 100,
+            peer_endpoints: BTreeMap::new(),
+            local_peer_endpoint: "http://node-1:9080".to_owned(),
+            staging: false,
+        };
+        let target =
+            ClusterConfiguration::new([(1, "http://node-1:9081".to_owned())]).expect("target");
+        let operation_id = [4; 16];
+        let running = start_static_node(config.clone()).expect("start node");
+        let handle = running.handle;
+        let first = handle
+            .change_membership(operation_id, target.clone())
+            .await
+            .expect("membership commits");
+        assert_eq!(first.operation_id, operation_id);
+        assert_eq!(
+            first.members,
+            vec![(NodeId(1), "http://node-1:9081".to_owned())]
+        );
+        assert_eq!(
+            handle
+                .change_membership(operation_id, target.clone())
+                .await
+                .expect("retry is idempotent"),
+            first
+        );
+        assert_eq!(handle.membership().await.expect("query"), first);
+        drop(handle);
+
+        let restarted = start_static_node(config).expect("restart node");
+        let retried = restarted
+            .handle
+            .change_membership(operation_id, target)
+            .await
+            .expect("durable retry");
+        assert_eq!(retried.operation_id, first.operation_id);
+        assert_eq!(retried.members, first.members);
+        assert!(retried.commit_index >= first.commit_index);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn real_cluster_adds_staged_voter_and_removes_leader() {
+        let directory = temp_directory();
+        let addresses = [
+            available_address(),
+            available_address(),
+            available_address(),
+            available_address(),
+        ];
+        let endpoints = addresses
+            .iter()
+            .enumerate()
+            .map(|(offset, address)| {
+                (
+                    NodeId(u64::try_from(offset + 1).expect("node id")),
+                    format!("http://{address}"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let initial = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut handles = BTreeMap::new();
+        let mut shutdowns = Vec::new();
+
+        for (offset, address) in addresses.iter().copied().enumerate() {
+            let node_id = NodeId(u64::try_from(offset + 1).expect("node id"));
+            let mut peer_endpoints = endpoints.clone();
+            peer_endpoints.remove(&node_id);
+            let running = start_static_node(StaticNodeConfig {
+                cluster_id: ClusterId([9; 16]),
+                node_id,
+                voters: initial.clone(),
+                data_file: directory.join(format!("dynamic-{}.sqlite3", node_id.0)),
+                request_queue_capacity: 128,
+                outbound_queue_capacity: 256,
+                election_timeout_min: Duration::from_millis(180),
+                election_timeout_max: Duration::from_millis(360),
+                heartbeat_interval: Duration::from_millis(40),
+                rpc_timeout: Duration::from_millis(300),
+                max_clients: 10_000,
+                snapshot_threshold_entries: 100,
+                peer_endpoints,
+                local_peer_endpoint: endpoints[&node_id].clone(),
+                staging: node_id == NodeId(4),
+            })
+            .expect("start dynamic node");
+            let (handle, service) = running.spawn_dispatcher();
+            let (shutdown, receive_shutdown) = oneshot::channel();
+            shutdowns.push(shutdown);
+            tokio::spawn(async move {
+                serve_peer(address, service, async {
+                    let _ = receive_shutdown.await;
+                })
+                .await
+                .expect("peer server");
+            });
+            handles.insert(node_id, handle);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let leader = loop {
+            let mut leaders = std::collections::BTreeSet::new();
+            for handle in handles.values() {
+                if let Ok((Some(observed), _)) = handle.status().await {
+                    leaders.insert(observed);
+                }
+            }
+            if let Some(leader) = leaders.iter().next().copied()
+                && leaders.len() == 1
+            {
+                break leader;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leader election timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        };
+        let caller = handles
+            .iter()
+            .find(|(node, _)| **node != leader && **node != NodeId(4))
+            .map(|(_, handle)| handle)
+            .expect("follower caller");
+        let four = ClusterConfiguration::new(
+            endpoints
+                .iter()
+                .map(|(node, endpoint)| (node.0, endpoint.clone())),
+        )
+        .expect("four-voter target");
+        let added = caller
+            .change_membership([10; 16], four)
+            .await
+            .expect("forwarded addition commits");
+        assert_eq!(added.members.len(), 4);
+
+        let remaining = ClusterConfiguration::new(
+            endpoints
+                .iter()
+                .filter(|(node, _)| **node != leader)
+                .map(|(node, endpoint)| (node.0, endpoint.clone())),
+        )
+        .expect("leader removal target");
+        let removed = caller
+            .change_membership([11; 16], remaining)
+            .await
+            .expect("leader removal commits");
+        assert_eq!(removed.members.len(), 3);
+        assert!(!removed.members.iter().any(|(node, _)| *node == leader));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut observed = None;
+            for (node, handle) in &handles {
+                if *node != leader
+                    && let Ok(view) = handle.membership().await
+                {
+                    observed = Some(view);
+                    break;
+                }
+            }
+            if let Some(view) = observed {
+                assert_eq!(view.members.len(), 3);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reelection timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        for shutdown in shutdowns {
+            let _ = shutdown.send(());
+        }
+        drop(handles);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_real_rpc_nodes_elect_commit_and_apply() {
         let directory = temp_directory();
@@ -1012,6 +1650,7 @@ mod tests {
                 snapshot_threshold_entries: 2,
                 peer_endpoints,
                 local_peer_endpoint: endpoints[&node_id].clone(),
+                staging: false,
             })
             .expect("start node");
             let (handle, service) = running.spawn_dispatcher();
@@ -1122,6 +1761,7 @@ mod tests {
             snapshot_threshold_entries: 2,
             peer_endpoints,
             local_peer_endpoint: endpoints[&node_id].clone(),
+            staging: false,
         })
         .expect("start lagging node");
         let (handle, service) = running.spawn_dispatcher();

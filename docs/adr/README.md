@@ -8,5 +8,9 @@ the normative specification.
 3. Accept it in the same change that first relies on the decision.
 4. Never rewrite an accepted decision's history; supersede it with a new ADR.
 5. Update the specification first if a decision would alter a normative
-   requirement.
+requirement.
 
+Accepted decisions: [0001](0001-deterministic-core.md),
+[0002](0002-sqlite-storage.md), [0003](0003-peer-grpc.md),
+[0004](0004-snapshot-format.md), and
+[0005](0005-joint-membership.md).

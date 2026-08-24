@@ -15,7 +15,7 @@ will use immutable digests before formal checks become release gates.
 - Trace validation from deterministic simulation and sampled real executions.
 
 The pull-request suite checks `RaftElection.cfg`, `Raft.cfg`, and
-`KvStateMachine.cfg`, and `RaftSnapshot.cfg`. Their adjacent Markdown files
+`KvStateMachine.cfg`, `RaftSnapshot.cfg`, and `RaftMembership.cfg`. Their adjacent Markdown files
 define the abstraction map and bounds. Extended configurations are reserved
 for scheduled and release checks.
 

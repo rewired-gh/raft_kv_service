@@ -22,7 +22,7 @@ tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["catch-panic", "limit", "request-id", "sensitive-headers", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-uuid = "1.25.0"
+uuid = { version = "1.25.0", features = ["serde"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

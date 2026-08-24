@@ -34,6 +34,7 @@ pub struct RaftConfig {
     pub rpc_timeout_ms: u64,
     pub max_clients: u64,
     pub snapshot_threshold_entries: u64,
+    pub staging: bool,
 }
 
 impl Default for RaftConfig {
@@ -52,6 +53,7 @@ impl Default for RaftConfig {
             rpc_timeout_ms: 250,
             max_clients: 10_000,
             snapshot_threshold_entries: 10_000,
+            staging: false,
         }
     }
 }
@@ -121,6 +123,7 @@ pub struct ServerConfig {
     pub host: IpAddr,
     pub port: u16,
     pub request_timeout_seconds: u64,
+    pub operational_token: String,
 }
 
 impl Default for ServerConfig {
@@ -129,6 +132,7 @@ impl Default for ServerConfig {
             host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 8080,
             request_timeout_seconds: 30,
+            operational_token: "local-development-only".to_owned(),
         }
     }
 }

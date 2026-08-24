@@ -21,7 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -37,6 +37,10 @@ use crate::kv::{
     ClientId, Command, CommandResult, Mutation, MutationCommand, MutationResult, ReadResult,
     validate_key,
 };
+use crate::{
+    cluster::{MembershipError, MembershipView},
+    raft::ClusterConfiguration,
+};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CLIENT_ID_HEADER: &str = "raft-kv-client-id";
@@ -46,12 +50,20 @@ const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
 type ExecutionFuture = Pin<Box<dyn Future<Output = Result<CommandResult, ServiceError>> + Send>>;
 type Executor = Arc<dyn Fn(Command) -> ExecutionFuture + Send + Sync>;
+type MembershipFuture =
+    Pin<Box<dyn Future<Output = Result<MembershipView, MembershipError>> + Send>>;
+type MembershipChanger =
+    Arc<dyn Fn([u8; 16], ClusterConfiguration) -> MembershipFuture + Send + Sync>;
+type MembershipReader = Arc<dyn Fn() -> MembershipFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
     service_name: Arc<str>,
     ready: Arc<AtomicBool>,
     executor: Option<Executor>,
+    membership_changer: Option<MembershipChanger>,
+    membership_reader: Option<MembershipReader>,
+    operational_token: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -60,7 +72,28 @@ impl AppState {
             service_name: service_name.into(),
             ready: Arc::new(AtomicBool::new(false)),
             executor: None,
+            membership_changer: None,
+            membership_reader: None,
+            operational_token: None,
         }
+    }
+
+    pub fn with_membership<C, CFut, R, RFut>(
+        mut self,
+        token: impl Into<Arc<str>>,
+        changer: C,
+        reader: R,
+    ) -> Self
+    where
+        C: Fn([u8; 16], ClusterConfiguration) -> CFut + Send + Sync + 'static,
+        CFut: Future<Output = Result<MembershipView, MembershipError>> + Send + 'static,
+        R: Fn() -> RFut + Send + Sync + 'static,
+        RFut: Future<Output = Result<MembershipView, MembershipError>> + Send + 'static,
+    {
+        self.operational_token = Some(token.into());
+        self.membership_changer = Some(Arc::new(move |id, target| Box::pin(changer(id, target))));
+        self.membership_reader = Some(Arc::new(move || Box::pin(reader())));
+        self
     }
 
     pub fn with_executor<F, Fut>(mut self, executor: F) -> Self
@@ -111,9 +144,180 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         .route("/v1/keys/{key}", get(read).put(put_key).delete(delete_key))
+        .route(
+            "/operational/v1/membership",
+            get(get_membership).put(put_membership),
+        )
         .fallback(not_found)
         .with_state(state)
         .layer(middleware)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipRequestBody {
+    operation_id: Uuid,
+    members: Vec<MemberBody>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MemberBody {
+    node_id: u64,
+    peer_endpoint: String,
+}
+
+#[derive(Serialize)]
+struct MembershipResponseBody {
+    operation_id: Uuid,
+    members: Vec<MemberBody>,
+    commit_index: u64,
+}
+
+async fn get_membership(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let request_id = request_id(&headers);
+    if !operational_authorized(&state, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "operational-unauthorized",
+            "Unauthorized",
+            "a valid operational bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    let Some(reader) = &state.membership_reader else {
+        return service_problem(ServiceError::Unavailable, request_id).into_response();
+    };
+    membership_response(reader().await, request_id)
+}
+
+async fn put_membership(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MembershipRequestBody>,
+) -> Response {
+    let request_id = request_id(&headers);
+    if !operational_authorized(&state, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "operational-unauthorized",
+            "Unauthorized",
+            "a valid operational bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    if body.members.iter().any(|member| {
+        !(member.peer_endpoint.starts_with("http://")
+            || member.peer_endpoint.starts_with("https://"))
+    }) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid-membership",
+            "Invalid membership",
+            "peer endpoints must use an explicit http or https URI",
+            request_id,
+        )
+        .into_response();
+    }
+    let target = match ClusterConfiguration::new(
+        body.members
+            .into_iter()
+            .map(|member| (member.node_id, member.peer_endpoint)),
+    ) {
+        Ok(target) => target,
+        Err(_) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "invalid-membership",
+                "Invalid membership",
+                "members must be non-empty, unique, nonzero, and have valid peer endpoints",
+                request_id,
+            )
+            .into_response();
+        }
+    };
+    let Some(changer) = &state.membership_changer else {
+        return service_problem(ServiceError::Unavailable, request_id).into_response();
+    };
+    membership_response(
+        changer(*body.operation_id.as_bytes(), target).await,
+        request_id,
+    )
+}
+
+fn operational_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = &state.operational_token else {
+        return false;
+    };
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| provided == token.as_ref())
+}
+
+fn membership_response(
+    result: Result<MembershipView, MembershipError>,
+    request_id: String,
+) -> Response {
+    match result {
+        Ok(view) => Json(MembershipResponseBody {
+            operation_id: Uuid::from_bytes(view.operation_id),
+            members: view
+                .members
+                .into_iter()
+                .map(|(node, endpoint)| MemberBody {
+                    node_id: node.0,
+                    peer_endpoint: endpoint,
+                })
+                .collect(),
+            commit_index: view.commit_index,
+        })
+        .into_response(),
+        Err(error) => {
+            let (status, kind, title, detail) = match error {
+                MembershipError::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "membership-unavailable",
+                    "Membership unavailable",
+                    "the leader is unknown or unable to complete the operation",
+                ),
+                MembershipError::Overloaded => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "membership-overloaded",
+                    "Membership overloaded",
+                    "the bounded membership request queue is full",
+                ),
+                MembershipError::Invalid => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid-membership",
+                    "Invalid membership",
+                    "the membership request is invalid",
+                ),
+                MembershipError::Conflict => (
+                    StatusCode::CONFLICT,
+                    "membership-operation-conflict",
+                    "Membership operation conflict",
+                    "the operation ID was previously used for a different target",
+                ),
+                MembershipError::ChangeInProgress => (
+                    StatusCode::CONFLICT,
+                    "membership-change-in-progress",
+                    "Membership change in progress",
+                    "another membership operation is in progress",
+                ),
+                MembershipError::Internal => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal-error",
+                    "Internal error",
+                    "the membership operation failed internally",
+                ),
+            };
+            problem(status, kind, title, detail, request_id).into_response()
+        }
+    }
 }
 
 async fn liveness(State(state): State<AppState>) -> Json<Health> {
