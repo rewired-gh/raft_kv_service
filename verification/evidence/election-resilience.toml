@@ -1,0 +1,32 @@
+schema_version = 1
+property_set = "pre-vote-check-quorum-leadership-transfer"
+recorded_at = "2026-08-24T20:05:28+08:00"
+source_commit = "c5cce6d07c436723b6f6c3b7e7bdbe73252a0ee8"
+result = "pass"
+command = "./scripts/formal-matrix.sh && make check"
+tla_tools_release = "1.7.4"
+tlc_version = "2.19"
+tlc_revision = "5a47802"
+
+[[model]]
+configuration = "formal/RaftElection.cfg"
+generated_states = 4441735
+distinct_states = 578933
+runtime_seconds = 12
+result = "pass"
+
+[[model]]
+configuration = "formal/RaftElection.extended.cfg"
+generated_states = 89805
+distinct_states = 15342
+runtime_seconds = 1
+result = "pass"
+
+[runtime]
+test_command = "cargo test --all-targets --all-features"
+unit_tests = 123
+http_tests = 8
+result = "pass"
+
+[claim_boundary]
+statement = "TLC exhaustively checks the published finite election instances. Pre-Vote grants are nondeterministic prospective inputs, CheckQuorum only removes leaders, and TimeoutNow enters the ordinary persisted election path. This proves the declared safety invariants for those abstractions, not timed completion or arbitrary Rust executions."

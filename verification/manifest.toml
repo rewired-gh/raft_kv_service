@@ -44,6 +44,21 @@ evidence = [
 ]
 
 [[property]]
+id = "election-resilience-safety"
+spec_section = "10.1.1"
+model = "formal/RaftElection.tla"
+invariant = "ElectionSafety /\\ MessagesUseDurableTermAndVote"
+status = "verified"
+evidence = [
+  "formal/RaftElection.cfg",
+  "formal/RaftElection.extended.cfg",
+  "verification/evidence/election-resilience.toml",
+  "src/raft/election.rs",
+  "src/cluster.rs",
+  "src/peer.rs",
+]
+
+[[property]]
 id = "log-matching"
 spec_section = "12.1.2"
 model = "formal/Raft.tla"

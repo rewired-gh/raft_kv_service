@@ -12,7 +12,7 @@ use axum::{
     },
 };
 use raft_kv_service::{
-    cluster::{LeadershipTransferResult, MembershipView, NodeDiagnostics},
+    cluster::{LeadershipTransferError, LeadershipTransferResult, MembershipView, NodeDiagnostics},
     http::{AppState, ServiceError, router},
     kv::{Command, KvStateMachine},
     metrics::Metrics,
@@ -319,5 +319,130 @@ async fn leadership_transfer_is_authenticated_and_reports_observed_completion() 
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
     assert_eq!(body["target_node_id"], 2);
     assert_eq!(body["term"], 7);
+    Ok(())
+}
+
+#[tokio::test]
+async fn leadership_transfer_errors_are_stable_and_fail_closed() -> Result<()> {
+    for (error, expected) in [
+        (
+            LeadershipTransferError::InvalidTarget,
+            StatusCode::BAD_REQUEST,
+        ),
+        (LeadershipTransferError::Busy, StatusCode::CONFLICT),
+        (
+            LeadershipTransferError::TimedOut,
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            LeadershipTransferError::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            LeadershipTransferError::Overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            LeadershipTransferError::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let state = AppState::new("test-service")
+            .with_membership(
+                "secret",
+                |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+                || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+            )
+            .with_leadership_transfer(move |_| async move { Err(error) });
+        let response = router(state, Duration::from_secs(1))
+            .oneshot(
+                Request::post("/operational/v1/leadership-transfer")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target_node_id":2}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
+
+    let state = AppState::new("test-service")
+        .with_membership(
+            "secret",
+            |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+            || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+        )
+        .with_leadership_transfer(|_| async {
+            Err(raft_kv_service::cluster::LeadershipTransferError::InvalidTarget)
+        });
+    let response = router(state, Duration::from_secs(1))
+        .oneshot(
+            Request::post("/operational/v1/leadership-transfer")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_node_id":0}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let state = AppState::new("test-service").with_membership(
+        "secret",
+        |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+        || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+    );
+    let response = router(state, Duration::from_secs(1))
+        .oneshot(
+            Request::post("/operational/v1/leadership-transfer")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_node_id":2}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pre_candidate_is_visible_in_status_and_metrics() -> Result<()> {
+    for (role, expected) in [
+        (Role::Follower, "follower"),
+        (Role::PreCandidate, "pre_candidate"),
+        (Role::Candidate, "candidate"),
+    ] {
+        let mut status = diagnostics();
+        status.role = role;
+        status.leader = None;
+        status.leadership_transfer_target = Some(NodeId(2));
+        let state = AppState::new("test-service")
+            .with_membership(
+                "secret",
+                |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+                || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+            )
+            .with_diagnostics(move || {
+                let status = status.clone();
+                async move { Ok(status) }
+            });
+        let app = router(state, Duration::from_secs(1));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/operational/v1/status")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await?)?;
+        assert_eq!(body["role"], expected);
+        assert_eq!(body["leadership_transfer_target_id"], 2);
+        let metrics = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::OK);
+    }
     Ok(())
 }

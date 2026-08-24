@@ -3423,4 +3423,225 @@ mod tests {
             .expect("caught-up target campaigns immediately");
         assert!(matches!(effects.as_slice(), [Effect::PersistHardState(_)]));
     }
+
+    #[test]
+    fn leadership_transfer_rejects_every_unsafe_boundary() {
+        let mut follower = core(1, &[1, 2, 3]);
+        assert_eq!(
+            follower.transfer_leadership(NodeId(2)),
+            Err(CoreError::NotLeader)
+        );
+
+        let mut leader = ready_three_node_leader();
+        leader
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("leader becomes ready");
+        assert_eq!(
+            leader.transfer_leadership(NodeId(1)),
+            Err(CoreError::InvalidLeadershipTransferTarget(NodeId(1)))
+        );
+        assert_eq!(
+            leader.transfer_leadership(NodeId(9)),
+            Err(CoreError::InvalidLeadershipTransferTarget(NodeId(9)))
+        );
+
+        leader.active_voters = ActiveVoters::Joint {
+            old: voters(&[1, 2, 3]),
+            new: voters(&[1, 2, 4]),
+        };
+        assert_eq!(
+            leader.transfer_leadership(NodeId(2)),
+            Err(CoreError::ConfigurationChangeInProgress)
+        );
+
+        let mut leader = ready_three_node_leader();
+        leader.leader_noop_index = Some(leader.commit_index + 1);
+        assert_eq!(
+            leader.transfer_leadership(NodeId(2)),
+            Err(CoreError::LeaderNotReady)
+        );
+
+        let mut leader = ready_three_node_leader();
+        leader
+            .handle(receive(
+                3,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("other voter makes the leader ready");
+        let effects = leader
+            .transfer_leadership(NodeId(2))
+            .expect("lagging target starts catch-up");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Envelope {
+                message: Message::AppendEntries { .. },
+                ..
+            })]
+        ));
+        assert_eq!(
+            leader.transfer_leadership(NodeId(3)),
+            Err(CoreError::LeadershipTransferInProgress)
+        );
+        assert_eq!(
+            leader.propose_membership(MembershipEntry {
+                operation_id: [9; 16],
+                phase: ConfigurationPhase::Joint,
+                old: leader.membership().new.clone(),
+                new: ClusterConfiguration::new([
+                    (1, "node://1".to_owned()),
+                    (2, "node://2".to_owned()),
+                ])
+                .expect("target configuration"),
+            }),
+            Err(CoreError::LeadershipTransferInProgress)
+        );
+        let caught_up = leader
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("catch-up acknowledgement");
+        assert!(caught_up.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(Envelope {
+                message: Message::TimeoutNow { .. },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn timeout_now_rejects_each_unauthorized_campaign_shape() {
+        let timeout = |sender, leader, term, fence_index| {
+            receive(
+                sender,
+                2,
+                Message::TimeoutNow {
+                    term: Term(term),
+                    leader: NodeId(leader),
+                    fence_index,
+                },
+            )
+        };
+        let mut follower = core(2, &[1, 2, 3]);
+        assert!(
+            follower
+                .handle(timeout(1, 1, 0, 0))
+                .expect("ignored")
+                .is_empty()
+        );
+        follower
+            .handle(receive(
+                1,
+                2,
+                append_request(0, LogPosition::default(), Vec::new(), 0),
+            ))
+            .expect("observe leader");
+        assert!(
+            follower
+                .handle(timeout(3, 1, 0, 0))
+                .expect("ignored")
+                .is_empty()
+        );
+        assert!(
+            follower
+                .handle(timeout(1, 1, 1, 0))
+                .expect("ignored")
+                .is_empty()
+        );
+        assert!(
+            follower
+                .handle(timeout(1, 1, 0, 1))
+                .expect("ignored")
+                .is_empty()
+        );
+
+        let mut leader = ready_three_node_leader();
+        assert!(
+            leader
+                .handle(timeout(1, 1, 1, 0))
+                .expect("ignored")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pre_vote_rejects_stale_or_spoofed_campaigns_and_ignores_noise() {
+        let mut node = core(2, &[1, 2, 3]);
+        for message in [
+            Message::PreVote {
+                prospective_term: Term(0),
+                candidate: NodeId(1),
+                last_log: LogPosition::default(),
+            },
+            Message::PreVote {
+                prospective_term: Term(1),
+                candidate: NodeId(3),
+                last_log: LogPosition::default(),
+            },
+        ] {
+            let effects = node
+                .handle(receive(1, 2, message))
+                .expect("pre-vote response");
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Send(Envelope {
+                    message: Message::PreVoteResponse {
+                        vote_granted: false,
+                        ..
+                    },
+                    ..
+                })]
+            ));
+        }
+        assert_eq!(node.handle(Event::CheckQuorum), Ok(Vec::new()));
+        node.handle(Event::ElectionTimeout).expect("pre-candidate");
+        assert!(
+            node.handle(receive(
+                1,
+                2,
+                Message::PreVoteResponse {
+                    current_term: Term(0),
+                    prospective_term: Term(2),
+                    vote_granted: true,
+                },
+            ))
+            .expect("wrong round ignored")
+            .is_empty()
+        );
+        assert!(
+            node.handle(receive(
+                1,
+                2,
+                Message::PreVoteResponse {
+                    current_term: Term(0),
+                    prospective_term: Term(1),
+                    vote_granted: false,
+                },
+            ))
+            .expect("rejection ignored")
+            .is_empty()
+        );
+    }
 }

@@ -985,7 +985,7 @@ complete only when its code, model, documentation, and required evidence agree.
 ### M1: Deterministic protocol kernel and election
 
 - Pure Raft state-transition core.
-- Follower, candidate, and leader election behavior.
+- Follower, pre-candidate, candidate, and leader election behavior.
 - Term and vote persistence contract.
 - Deterministic clock and message simulation.
 - TLA+ election model and election-safety checks.
