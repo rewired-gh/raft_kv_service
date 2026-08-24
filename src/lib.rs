@@ -1,6 +1,7 @@
 pub mod config;
 pub mod http;
 pub mod kv;
+pub mod peer;
 pub mod raft;
 pub mod service;
 pub mod storage;
