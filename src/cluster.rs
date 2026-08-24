@@ -26,9 +26,7 @@ use crate::{
         encode_request_vote, encode_request_vote_response, encode_snapshot_chunk,
         encode_snapshot_response, proto,
     },
-    raft::{
-        DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, Term, VoterSet,
-    },
+    raft::{DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, Term},
     storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage},
 };
 
@@ -47,6 +45,7 @@ pub struct StaticNodeConfig {
     pub max_clients: u64,
     pub snapshot_threshold_entries: u64,
     pub peer_endpoints: BTreeMap<NodeId, String>,
+    pub local_peer_endpoint: String,
 }
 
 pub struct RunningNode {
@@ -219,8 +218,26 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     }
     let storage = SqliteStorage::open_with_max_clients(&config.data_file, config.max_clients)
         .map_err(|error| error.to_string())?;
-    let voters = VoterSet::new(config.voters.iter().copied()).map_err(|error| error.to_string())?;
-    let raft = DurableRaft::recover_with_snapshot(config.node_id, voters, storage)
+    let members = config
+        .voters
+        .iter()
+        .map(|node| {
+            let endpoint = if *node == config.node_id {
+                config.local_peer_endpoint.clone()
+            } else {
+                config
+                    .peer_endpoints
+                    .get(node)
+                    .cloned()
+                    .ok_or_else(|| format!("missing endpoint for voter {}", node.0))?
+            };
+            Ok((node.0, endpoint))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let membership = crate::raft::MembershipEntry::initial(
+        crate::raft::ClusterConfiguration::new(members).map_err(|error| error.to_string())?,
+    );
+    let raft = DurableRaft::recover_with_snapshot_membership(config.node_id, membership, storage)
         .map_err(|error| error.to_string())?;
     let (sender, receiver) = mpsc::sync_channel(config.request_queue_capacity);
     let (outbound_sender, outbound) = tokio_mpsc::channel(config.outbound_queue_capacity);
@@ -333,6 +350,7 @@ struct IncomingSnapshot {
     format_version: u32,
     last_included: crate::raft::LogPosition,
     voters: Vec<NodeId>,
+    membership: crate::raft::MembershipEntry,
     snapshot_id: [u8; 32],
     total_size: usize,
     bytes: Vec<u8>,
@@ -560,6 +578,7 @@ impl NodeWorker {
                 && staging.format_version == chunk.format_version
                 && staging.last_included == chunk.last_included
                 && staging.voters == chunk.voters
+                && staging.membership == chunk.membership
                 && staging.snapshot_id == chunk.snapshot_id
                 && staging.total_size == chunk.total_size
         });
@@ -580,6 +599,7 @@ impl NodeWorker {
                 format_version: chunk.format_version,
                 last_included: chunk.last_included,
                 voters: chunk.voters.clone(),
+                membership: chunk.membership.clone(),
                 snapshot_id: chunk.snapshot_id,
                 total_size: chunk.total_size,
                 bytes: Vec::new(),
@@ -625,14 +645,10 @@ impl NodeWorker {
             cluster_id: self.config.cluster_id.0,
             last_included: staging.last_included,
             voters: staging.voters,
+            membership: staging.membership,
             payload: staging.bytes,
             digest: staging.snapshot_id,
         };
-        if snapshot.voters != self.raft.core().voters().members().collect::<Vec<_>>() {
-            return Err(Status::invalid_argument(
-                "snapshot voter set does not match the node",
-            ));
-        }
         if snapshot.last_included.index < self.raft.core().last_applied() {
             return Err(Status::failed_precondition(
                 "snapshot is older than applied state",
@@ -995,6 +1011,7 @@ mod tests {
                 max_clients: 10_000,
                 snapshot_threshold_entries: 2,
                 peer_endpoints,
+                local_peer_endpoint: endpoints[&node_id].clone(),
             })
             .expect("start node");
             let (handle, service) = running.spawn_dispatcher();
@@ -1104,6 +1121,7 @@ mod tests {
             max_clients: 10_000,
             snapshot_threshold_entries: 2,
             peer_endpoints,
+            local_peer_endpoint: endpoints[&node_id].clone(),
         })
         .expect("start lagging node");
         let (handle, service) = running.spawn_dispatcher();

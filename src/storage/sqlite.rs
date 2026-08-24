@@ -20,10 +20,13 @@ use crate::{
         ValueRecord, decode_command, decode_command_result, decode_mutation_result,
         encode_command_result, encode_mutation_result, fingerprint, validate_key,
     },
-    raft::{EntryPayload, HardState, LogEntry, LogPosition, NodeId, Term},
+    raft::{
+        ConfigurationPhase, EntryPayload, HardState, LogEntry, LogPosition, MembershipEntry,
+        NodeId, Term, decode_membership, encode_membership,
+    },
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
 
@@ -99,7 +102,7 @@ impl SqliteStorage {
             CREATE TABLE IF NOT EXISTS raft_log (
                 log_index BLOB PRIMARY KEY CHECK (length(log_index) = 8),
                 term BLOB NOT NULL CHECK (length(term) = 8),
-                entry_kind INTEGER NOT NULL CHECK (entry_kind IN (0, 1)),
+                entry_kind INTEGER NOT NULL CHECK (entry_kind IN (0, 1, 2)),
                 payload BLOB NOT NULL,
                 CHECK (entry_kind != 0 OR length(payload) = 0)
             ) STRICT;
@@ -151,7 +154,8 @@ impl SqliteStorage {
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match user_version {
-            0..=2 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
+            0 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
+            1..=3 => migrate_configuration_entries(&connection)?,
             SCHEMA_VERSION => {}
             found => {
                 return Err(StorageError::UnsupportedSchemaVersion {
@@ -209,6 +213,26 @@ impl SqliteStorage {
         }
         Ok(())
     }
+}
+
+fn migrate_configuration_entries(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE raft_log RENAME TO raft_log_previous;
+         CREATE TABLE raft_log (
+             log_index BLOB PRIMARY KEY CHECK (length(log_index) = 8),
+             term BLOB NOT NULL CHECK (length(term) = 8),
+             entry_kind INTEGER NOT NULL CHECK (entry_kind IN (0, 1, 2)),
+             payload BLOB NOT NULL,
+             CHECK (entry_kind != 0 OR length(payload) = 0)
+         ) STRICT;
+         INSERT INTO raft_log(log_index, term, entry_kind, payload)
+         SELECT log_index, term, entry_kind, payload FROM raft_log_previous;
+         DROP TABLE raft_log_previous;
+         PRAGMA user_version = 4;
+         COMMIT;",
+    )?;
+    Ok(())
 }
 
 impl RaftStorage for SqliteStorage {
@@ -386,6 +410,7 @@ impl StateMachineStorage for SqliteStorage {
                         max_clients,
                     )?)
                 }
+                EntryPayload::Configuration(_) => None,
             };
             let encoded_result = result
                 .as_ref()
@@ -423,9 +448,10 @@ impl SnapshotStorage for SqliteStorage {
     fn create_snapshot(
         &mut self,
         cluster_id: [u8; 16],
-        voters: &[NodeId],
+        membership: &MembershipEntry,
     ) -> Result<Snapshot, Self::Error> {
-        validate_voters(voters)?;
+        let voters = membership_voters(membership)?;
+        validate_voters(&voters)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -443,14 +469,20 @@ impl SnapshotStorage for SqliteStorage {
         {
             return Ok(current);
         }
-        let payload =
-            encode_snapshot_payload(&transaction, cluster_id, last_included, voters, max_clients)?;
+        let payload = encode_snapshot_payload(
+            &transaction,
+            cluster_id,
+            last_included,
+            membership,
+            max_clients,
+        )?;
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let snapshot = Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             cluster_id,
             last_included,
-            voters: voters.to_vec(),
+            voters,
+            membership: membership.clone(),
             payload,
             digest,
         };
@@ -578,7 +610,7 @@ fn encode_snapshot_payload(
     connection: &Connection,
     cluster_id: [u8; 16],
     last_included: LogPosition,
-    voters: &[NodeId],
+    membership: &MembershipEntry,
     max_clients: u64,
 ) -> Result<Vec<u8>, StorageError> {
     let mut output = Vec::new();
@@ -587,13 +619,10 @@ fn encode_snapshot_payload(
     output.extend_from_slice(&cluster_id);
     put_u64(&mut output, last_included.index);
     put_u64(&mut output, last_included.term.0);
-    put_u64(
+    put_bytes(
         &mut output,
-        u64::try_from(voters.len()).map_err(|_| StorageError::SnapshotEncoding)?,
-    );
-    for voter in voters {
-        put_u64(&mut output, voter.0);
-    }
+        &encode_membership(membership).map_err(|_| StorageError::InvalidConfiguration)?,
+    )?;
     put_u64(&mut output, max_clients);
 
     let mut statement =
@@ -672,16 +701,15 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
         index: input.u64()?,
         term: Term(input.u64()?),
     };
-    let voter_count = input.count()?;
-    let mut voters = Vec::new();
-    for _ in 0..voter_count {
-        voters.push(NodeId(input.u64()?));
-    }
+    let membership =
+        decode_membership(&input.bytes()?).map_err(|_| StorageError::InvalidConfiguration)?;
+    let voters = membership_voters(&membership)?;
     validate_voters(&voters)?;
     if format != snapshot.format_version
         || cluster_id != snapshot.cluster_id
         || position != snapshot.last_included
         || voters != snapshot.voters
+        || membership != snapshot.membership
         || position.index == 0
         || position.term == Term(0)
     {
@@ -801,12 +829,17 @@ fn load_snapshot(connection: &Connection) -> Result<Option<Snapshot>, StorageErr
                 term: Term(decode_u64("snapshot term", &term)?),
             },
             voters: Vec::new(),
+            membership: MembershipEntry::initial(
+                crate::raft::ClusterConfiguration::new([(1, "invalid".to_owned())])
+                    .map_err(|_| StorageError::InvalidConfiguration)?,
+            ),
             payload,
             digest,
         };
-        let decoded_voters = decode_snapshot_voters(&snapshot)?;
+        let decoded = decode_snapshot_header(&snapshot)?;
         let snapshot = Snapshot {
-            voters: decoded_voters,
+            voters: membership_voters(&decoded)?,
+            membership: decoded,
             ..snapshot
         };
         let _ = decode_snapshot(&snapshot)?;
@@ -815,7 +848,7 @@ fn load_snapshot(connection: &Connection) -> Result<Option<Snapshot>, StorageErr
     .transpose()
 }
 
-fn decode_snapshot_voters(snapshot: &Snapshot) -> Result<Vec<NodeId>, StorageError> {
+fn decode_snapshot_header(snapshot: &Snapshot) -> Result<MembershipEntry, StorageError> {
     if Sha256::digest(&snapshot.payload).as_slice() != snapshot.digest {
         return Err(StorageError::SnapshotDigestMismatch);
     }
@@ -827,11 +860,26 @@ fn decode_snapshot_voters(snapshot: &Snapshot) -> Result<Vec<NodeId>, StorageErr
     let _ = input.take(16)?;
     let _ = input.u64()?;
     let _ = input.u64()?;
-    let count = input.count()?;
-    let mut voters = Vec::new();
-    for _ in 0..count {
-        voters.push(NodeId(input.u64()?));
-    }
+    decode_membership(&input.bytes()?).map_err(|_| StorageError::InvalidConfiguration)
+}
+
+fn membership_voters(membership: &MembershipEntry) -> Result<Vec<NodeId>, StorageError> {
+    membership
+        .validate()
+        .map_err(|_| StorageError::InvalidConfiguration)?;
+    let mut voters = membership
+        .new
+        .node_ids()
+        .chain(
+            (membership.phase == ConfigurationPhase::Joint)
+                .then(|| membership.old.node_ids())
+                .into_iter()
+                .flatten(),
+        )
+        .map(NodeId)
+        .collect::<Vec<_>>();
+    voters.sort_unstable();
+    voters.dedup();
     Ok(voters)
 }
 
@@ -1271,9 +1319,15 @@ fn load_entry(connection: &Connection, index: u64) -> Result<Option<LogEntry>, S
 }
 
 fn insert_entry(transaction: &Transaction<'_>, entry: &LogEntry) -> Result<(), StorageError> {
+    let encoded_configuration;
     let (kind, payload): (i64, &[u8]) = match &entry.payload {
         EntryPayload::Noop => (0, &[]),
         EntryPayload::Command(payload) => (1, payload),
+        EntryPayload::Configuration(configuration) => {
+            encoded_configuration =
+                encode_membership(configuration).map_err(|_| StorageError::InvalidConfiguration)?;
+            (2, &encoded_configuration)
+        }
     };
     transaction.execute(
         "INSERT INTO raft_log(log_index, term, entry_kind, payload)
@@ -1296,6 +1350,13 @@ fn decode_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
     let payload = match kind {
         0 => EntryPayload::Noop,
         1 => EntryPayload::Command(bytes),
+        2 => EntryPayload::Configuration(decode_membership(&bytes).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?),
         value => {
             return Err(rusqlite::Error::IntegralValueOutOfRange(2, value));
         }
@@ -1350,6 +1411,7 @@ pub enum StorageError {
     OlderSnapshot { received: u64, applied: u64 },
     SnapshotConflict(u64),
     SnapshotEncoding,
+    InvalidConfiguration,
     Command(CommandError),
     HardStateRegression { current: HardState, next: HardState },
     InvalidLogEntry { index: u64, term: Term },
@@ -1418,6 +1480,7 @@ impl Display for StorageError {
                 write!(formatter, "conflicting snapshot at included index {index}")
             }
             Self::SnapshotEncoding => formatter.write_str("invalid snapshot encoding"),
+            Self::InvalidConfiguration => formatter.write_str("invalid membership configuration"),
             Self::Command(error) => Display::fmt(error, formatter),
             Self::HardStateRegression { current, next } => {
                 write!(
@@ -1484,6 +1547,15 @@ mod tests {
     use crate::kv::{MutationCommand, encode_command};
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn membership(ids: &[u64]) -> MembershipEntry {
+        MembershipEntry::initial(
+            crate::raft::ClusterConfiguration::new(
+                ids.iter().map(|id| (*id, format!("node://{id}"))),
+            )
+            .expect("configuration"),
+        )
+    }
 
     fn entry(index: u64, term: u64, byte: u8) -> LogEntry {
         LogEntry {
@@ -1828,7 +1900,7 @@ mod tests {
         source.apply_committed(&entries).expect("apply source log");
 
         let snapshot = source
-            .create_snapshot([7; 16], &[NodeId(1), NodeId(2), NodeId(3)])
+            .create_snapshot([7; 16], &membership(&[1, 2, 3]))
             .expect("create snapshot");
         assert_eq!(
             snapshot.last_included,
@@ -1896,7 +1968,7 @@ mod tests {
         source.append_local(&noop).expect("append");
         source.apply_committed(&[noop]).expect("apply");
         let snapshot = source
-            .create_snapshot([1; 16], &[NodeId(1)])
+            .create_snapshot([1; 16], &membership(&[1]))
             .expect("snapshot");
         let mut target = SqliteStorage::open_in_memory().expect("target");
         assert!(matches!(

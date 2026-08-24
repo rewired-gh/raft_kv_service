@@ -28,3 +28,4 @@ snapshot_threshold_entries = 10000
 [peer]
 host = "0.0.0.0"
 port = 9080
+advertised_url = "http://127.0.0.1:9080"

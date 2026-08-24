@@ -46,6 +46,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         max_clients: config.raft.max_clients,
         snapshot_threshold_entries: config.raft.snapshot_threshold_entries,
         peer_endpoints: endpoints,
+        local_peer_endpoint: config.peer.advertised_url.clone(),
     })
     .map_err(anyhow::Error::msg)
     .context("failed to start the static Raft node")?;

@@ -248,14 +248,6 @@ impl<S: SnapshotStorage> DurableRaft<S> {
             .map_or(super::LogPosition::default(), |snapshot| {
                 snapshot.last_included
             });
-        if let Some(snapshot) = &snapshot {
-            let configured = voters.members().collect::<Vec<_>>();
-            if snapshot.voters != configured {
-                return Err(RuntimeError::Core(CoreError::InvalidSnapshotPosition(
-                    snapshot.last_included,
-                )));
-            }
-        }
         let start = snapshot_position
             .index
             .checked_add(1)
@@ -264,9 +256,57 @@ impl<S: SnapshotStorage> DurableRaft<S> {
             .entries_from(start, usize::MAX)
             .map_err(RuntimeError::Storage)?;
         let last_applied = storage.last_applied().map_err(RuntimeError::Storage)?;
-        let core = RaftCore::recover_compacted(
+        let core = if let Some(snapshot) = snapshot {
+            RaftCore::recover_compacted_with_membership(
+                id,
+                snapshot.membership,
+                hard_state,
+                snapshot_position,
+                log,
+                last_applied,
+            )
+        } else {
+            RaftCore::recover_compacted(
+                id,
+                voters,
+                hard_state,
+                snapshot_position,
+                log,
+                last_applied,
+            )
+        }
+        .map_err(RuntimeError::Core)?;
+        Ok(Self {
+            core,
+            storage,
+            failed: false,
+        })
+    }
+
+    pub fn recover_with_snapshot_membership(
+        id: NodeId,
+        initial_membership: super::MembershipEntry,
+        storage: S,
+    ) -> Result<Self, RuntimeError<S::Error>> {
+        let hard_state = storage.load_hard_state().map_err(RuntimeError::Storage)?;
+        let snapshot = storage.current_snapshot().map_err(RuntimeError::Storage)?;
+        let snapshot_position = snapshot
+            .as_ref()
+            .map_or(super::LogPosition::default(), |value| value.last_included);
+        let base_membership = snapshot
+            .as_ref()
+            .map_or(initial_membership, |value| value.membership.clone());
+        let start = snapshot_position
+            .index
+            .checked_add(1)
+            .ok_or(RuntimeError::Core(CoreError::IndexExhausted))?;
+        let log = storage
+            .entries_from(start, usize::MAX)
+            .map_err(RuntimeError::Storage)?;
+        let last_applied = storage.last_applied().map_err(RuntimeError::Storage)?;
+        let core = RaftCore::recover_compacted_with_membership(
             id,
-            voters,
+            base_membership,
             hard_state,
             snapshot_position,
             log,
@@ -285,10 +325,13 @@ impl<S: SnapshotStorage> DurableRaft<S> {
         cluster_id: [u8; 16],
     ) -> Result<Snapshot, RuntimeError<S::Error>> {
         self.ensure_active()?;
-        let voters = self.core.voters().members().collect::<Vec<_>>();
+        let membership = self
+            .core
+            .committed_membership()
+            .map_err(RuntimeError::Core)?;
         let snapshot = self
             .storage
-            .create_snapshot(cluster_id, &voters)
+            .create_snapshot(cluster_id, &membership)
             .map_err(RuntimeError::Storage)?;
         self.core
             .compact_through(snapshot.last_included)
@@ -304,11 +347,6 @@ impl<S: SnapshotStorage> DurableRaft<S> {
         snapshot: &Snapshot,
     ) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
         self.ensure_active()?;
-        if snapshot.voters != self.core.voters().members().collect::<Vec<_>>() {
-            return Err(RuntimeError::Core(CoreError::InvalidSnapshotPosition(
-                snapshot.last_included,
-            )));
-        }
         let external = self.observe_snapshot_leader(sender, term)?;
         if let Err(error) = self.storage.install_snapshot(expected_cluster_id, snapshot) {
             self.failed = true;
@@ -324,7 +362,7 @@ impl<S: SnapshotStorage> DurableRaft<S> {
             .entries_from(start, usize::MAX)
             .map_err(RuntimeError::Storage)?;
         self.core
-            .restore_snapshot(snapshot.last_included, suffix)
+            .restore_snapshot(snapshot.last_included, snapshot.membership.clone(), suffix)
             .map_err(RuntimeError::Core)?;
         Ok(external)
     }

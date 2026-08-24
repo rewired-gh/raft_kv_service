@@ -67,6 +67,7 @@ pub struct PeerEndpointConfig {
 pub struct PeerServerConfig {
     pub host: IpAddr,
     pub port: u16,
+    pub advertised_url: String,
 }
 
 impl Default for PeerServerConfig {
@@ -74,6 +75,7 @@ impl Default for PeerServerConfig {
         Self {
             host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 9080,
+            advertised_url: "http://127.0.0.1:9080".to_owned(),
         }
     }
 }

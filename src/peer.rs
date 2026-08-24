@@ -10,7 +10,10 @@ use crate::{
         Command, CommandResult, decode_command, decode_command_result, encode_command,
         encode_command_result,
     },
-    raft::{EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term},
+    raft::{
+        EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term, decode_membership,
+        encode_membership,
+    },
     storage::{SNAPSHOT_FORMAT_VERSION, Snapshot},
 };
 
@@ -87,6 +90,22 @@ impl PeerContext {
         if voters.is_empty() || voters.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(PeerError::InvalidSnapshotVoters);
         }
+        let membership =
+            decode_membership(&request.membership).map_err(|_| PeerError::InvalidConfiguration)?;
+        let membership_voters = membership
+            .old
+            .node_ids()
+            .chain(membership.new.node_ids())
+            .map(NodeId)
+            .collect::<std::collections::BTreeSet<_>>();
+        if voters
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != membership_voters
+        {
+            return Err(PeerError::InvalidSnapshotVoters);
+        }
         let snapshot_id: [u8; 32] = request
             .snapshot_id
             .try_into()
@@ -124,6 +143,7 @@ impl PeerContext {
                 term: Term(request.last_included_term),
             },
             voters,
+            membership,
             snapshot_id,
             offset,
             total_size,
@@ -273,6 +293,7 @@ pub struct SnapshotChunk {
     pub format_version: u32,
     pub last_included: LogPosition,
     pub voters: Vec<NodeId>,
+    pub membership: crate::raft::MembershipEntry,
     pub snapshot_id: [u8; 32],
     pub offset: usize,
     pub total_size: usize,
@@ -309,6 +330,8 @@ pub fn encode_snapshot_chunk(
         chunk: snapshot.payload[offset..end].to_vec(),
         done: end == snapshot.payload.len(),
         sha256: snapshot.digest.to_vec(),
+        membership: encode_membership(&snapshot.membership)
+            .map_err(|_| PeerError::InvalidConfiguration)?,
     })
 }
 
@@ -487,6 +510,9 @@ fn encode_entry(entry: &LogEntry) -> proto::LogEntry {
     let payload = match &entry.payload {
         EntryPayload::Noop => proto::log_entry::Payload::Noop(true),
         EntryPayload::Command(command) => proto::log_entry::Payload::Command(command.clone()),
+        EntryPayload::Configuration(configuration) => proto::log_entry::Payload::Configuration(
+            encode_membership(configuration).expect("validated membership entry"),
+        ),
     };
     proto::LogEntry {
         index: entry.index,
@@ -506,6 +532,14 @@ fn decode_entry(entry: proto::LogEntry, max_command_bytes: usize) -> Result<LogE
             EntryPayload::Command(command)
         }
         proto::log_entry::Payload::Command(_) => return Err(PeerError::CommandTooLarge),
+        proto::log_entry::Payload::Configuration(configuration)
+            if configuration.len() <= max_command_bytes =>
+        {
+            EntryPayload::Configuration(
+                decode_membership(&configuration).map_err(|_| PeerError::InvalidConfiguration)?,
+            )
+        }
+        proto::log_entry::Payload::Configuration(_) => return Err(PeerError::CommandTooLarge),
     };
     Ok(LogEntry {
         index: entry.index,
@@ -548,6 +582,7 @@ pub enum PeerError {
     InvalidSnapshotDigest,
     SnapshotTooLarge,
     InvalidSnapshotChunk,
+    InvalidConfiguration,
 }
 
 impl Display for PeerError {
@@ -662,6 +697,13 @@ mod tests {
                 term: Term(3),
             },
             voters: vec![NodeId(1), NodeId(2)],
+            membership: crate::raft::MembershipEntry::initial(
+                crate::raft::ClusterConfiguration::new([
+                    (1, "node://1".to_owned()),
+                    (2, "node://2".to_owned()),
+                ])
+                .expect("configuration"),
+            ),
             payload: vec![1, 2, 3, 4],
             digest: [8; 32],
         };

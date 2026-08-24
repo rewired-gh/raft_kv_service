@@ -28,6 +28,7 @@ message LogEntry {
   oneof payload {
     bool noop = 3;
     bytes command = 4;
+    bytes configuration = 5;
   }
 }
 
@@ -80,6 +81,7 @@ message InstallSnapshotRequest {
   bytes chunk = 9;
   bool done = 10;
   bytes sha256 = 11;
+  bytes membership = 12;
 }
 
 message InstallSnapshotResponse {

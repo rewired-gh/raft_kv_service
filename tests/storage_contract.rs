@@ -9,11 +9,20 @@ use raft_kv_service::{
         ClientId, Command, CommandResult, Mutation, MutationCommand, MutationResult, ValueRecord,
         encode_command,
     },
-    raft::{EntryPayload, HardState, LogEntry, LogPosition, NodeId, Term},
+    raft::{
+        ClusterConfiguration, EntryPayload, HardState, LogEntry, LogPosition, MembershipEntry,
+        NodeId, Term,
+    },
     storage::{AppendOutcome, RaftStorage, SnapshotStorage, SqliteStorage, StateMachineStorage},
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+fn membership() -> MembershipEntry {
+    MembershipEntry::initial(
+        ClusterConfiguration::new([(1, "node://1".to_owned())]).expect("configuration"),
+    )
+}
 
 fn temp_database(label: &str) -> PathBuf {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -176,7 +185,7 @@ fn snapshot_crash_writer_process() {
     write_committed_state(Path::new(&database));
     let mut storage = SqliteStorage::open(&database).expect("reopen crash database");
     storage
-        .create_snapshot([1; 16], &[NodeId(1)])
+        .create_snapshot([1; 16], &membership())
         .expect("publish snapshot");
     std::process::exit(92);
 }

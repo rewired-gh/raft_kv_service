@@ -6,3 +6,6 @@ peer_endpoints = [
   { node_id = 2, url = "http://node2:9080" },
   { node_id = 3, url = "http://node3:9080" },
 ]
+
+[peer]
+advertised_url = "http://node1:9080"

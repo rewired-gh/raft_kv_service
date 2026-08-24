@@ -6,10 +6,10 @@ use std::{error::Error, fmt::Debug};
 
 use crate::{
     kv::{CommandResult, ValueRecord},
-    raft::{HardState, LogEntry, LogPosition, NodeId, Term},
+    raft::{HardState, LogEntry, LogPosition, MembershipEntry, NodeId, Term},
 };
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -17,6 +17,7 @@ pub struct Snapshot {
     pub cluster_id: [u8; 16],
     pub last_included: LogPosition,
     pub voters: Vec<NodeId>,
+    pub membership: MembershipEntry,
     pub payload: Vec<u8>,
     pub digest: [u8; 32],
 }
@@ -62,7 +63,7 @@ pub trait SnapshotStorage: StateMachineStorage {
     fn create_snapshot(
         &mut self,
         cluster_id: [u8; 16],
-        voters: &[NodeId],
+        membership: &MembershipEntry,
     ) -> Result<Snapshot, Self::Error>;
     fn install_snapshot(
         &mut self,

@@ -4,7 +4,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use super::LogEntry;
+use super::{ClusterConfiguration, ConfigurationPhase, EntryPayload, LogEntry, MembershipEntry};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(pub u64);
@@ -77,9 +77,45 @@ impl VoterSet {
         let granted = votes.intersection(&self.0).count();
         granted > self.0.len() / 2
     }
+}
 
-    fn peers(&self, local: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        self.0.iter().copied().filter(move |node| *node != local)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActiveVoters {
+    Stable(VoterSet),
+    Joint { old: VoterSet, new: VoterSet },
+}
+
+impl ActiveVoters {
+    fn contains(&self, node: NodeId) -> bool {
+        match self {
+            Self::Stable(voters) => voters.contains(node),
+            Self::Joint { old, new } => old.contains(node) || new.contains(node),
+        }
+    }
+
+    fn members(&self) -> BTreeSet<NodeId> {
+        match self {
+            Self::Stable(voters) => voters.0.clone(),
+            Self::Joint { old, new } => old.0.union(&new.0).copied().collect(),
+        }
+    }
+
+    fn peers(&self, local: NodeId) -> Vec<NodeId> {
+        self.members()
+            .into_iter()
+            .filter(|node| *node != local)
+            .collect()
+    }
+
+    fn has_quorum(&self, votes: &BTreeSet<NodeId>) -> bool {
+        match self {
+            Self::Stable(voters) => voters.has_quorum(votes),
+            Self::Joint { old, new } => old.has_quorum(votes) && new.has_quorum(votes),
+        }
+    }
+
+    fn is_joint(&self) -> bool {
+        matches!(self, Self::Joint { .. })
     }
 }
 
@@ -197,6 +233,8 @@ pub enum CoreError {
         received: Term,
         current: Term,
     },
+    InvalidConfiguration,
+    ConfigurationChangeInProgress,
     IndexExhausted,
     TermExhausted,
 }
@@ -288,6 +326,10 @@ impl Display for CoreError {
                 "snapshot term {} is older than current term {}",
                 received.0, current.0
             ),
+            Self::InvalidConfiguration => formatter.write_str("invalid membership configuration"),
+            Self::ConfigurationChangeInProgress => {
+                formatter.write_str("a membership transition is already in progress")
+            }
             Self::IndexExhausted => formatter.write_str("Raft log index exhausted"),
             Self::TermExhausted => formatter.write_str("Raft term exhausted"),
         }
@@ -336,7 +378,9 @@ pub struct ReplicationProgress {
 #[derive(Clone, Debug)]
 pub struct RaftCore {
     id: NodeId,
-    voters: VoterSet,
+    base_membership: MembershipEntry,
+    active_voters: ActiveVoters,
+    active_membership: MembershipEntry,
     hard_state: HardState,
     role: Role,
     leader: Option<NodeId>,
@@ -348,6 +392,7 @@ pub struct RaftCore {
     pending_log: Option<PendingLogPersistence>,
     commit_index: u64,
     replication: BTreeMap<NodeId, ReplicationProgress>,
+    staging: BTreeSet<NodeId>,
     leader_noop_index: Option<u64>,
     last_applied: u64,
     pending_application: Option<Vec<LogEntry>>,
@@ -409,9 +454,62 @@ impl RaftCore {
                 last_log,
             });
         }
+        let initial = ClusterConfiguration::new(
+            voters
+                .members()
+                .map(|node| (node.0, format!("node://{}", node.0))),
+        )
+        .map_err(|_| CoreError::InvalidConfiguration)?;
+        Self::recover_compacted_with_membership(
+            id,
+            MembershipEntry::initial(initial),
+            hard_state,
+            snapshot_position,
+            log,
+            last_applied,
+        )
+    }
+
+    pub fn recover_compacted_with_membership(
+        id: NodeId,
+        base_membership: MembershipEntry,
+        hard_state: HardState,
+        snapshot_position: LogPosition,
+        log: Vec<LogEntry>,
+        last_applied: u64,
+    ) -> Result<Self, CoreError> {
+        base_membership
+            .validate()
+            .map_err(|_| CoreError::InvalidConfiguration)?;
+        let base_voters = active_voters_for(&base_membership)?;
+        if !base_voters.contains(id) {
+            return Err(CoreError::LocalNodeIsNotVoter(id));
+        }
+        if let Some(voted_for) = hard_state.voted_for
+            && !base_voters.contains(voted_for)
+        {
+            return Err(CoreError::InvalidRecoveredVote(voted_for));
+        }
+        if (snapshot_position.index == 0) != (snapshot_position.term == Term(0)) {
+            return Err(CoreError::InvalidSnapshotPosition(snapshot_position));
+        }
+        validate_recovered_log(snapshot_position.index, &log)?;
+        let last_log = log
+            .last()
+            .map_or(snapshot_position.index, |entry| entry.index);
+        if last_applied < snapshot_position.index || last_applied > last_log {
+            return Err(CoreError::InvalidRecoveredApplied {
+                last_applied,
+                last_log,
+            });
+        }
+        let (active_voters, active_membership) =
+            active_membership_from_log(&base_membership, &log)?;
         Ok(Self {
             id,
-            voters,
+            base_membership,
+            active_voters,
+            active_membership,
             hard_state,
             role: Role::Follower,
             leader: None,
@@ -423,6 +521,7 @@ impl RaftCore {
             pending_log: None,
             commit_index: last_applied,
             replication: BTreeMap::new(),
+            staging: BTreeSet::new(),
             leader_noop_index: None,
             last_applied,
             pending_application: None,
@@ -433,8 +532,27 @@ impl RaftCore {
         self.id
     }
 
-    pub fn voters(&self) -> &VoterSet {
-        &self.voters
+    pub fn voter_ids(&self) -> Vec<NodeId> {
+        self.active_voters.members().into_iter().collect()
+    }
+
+    pub fn membership(&self) -> &MembershipEntry {
+        &self.active_membership
+    }
+
+    pub fn committed_membership(&self) -> Result<MembershipEntry, CoreError> {
+        let committed = self
+            .log
+            .iter()
+            .take_while(|entry| entry.index <= self.last_applied)
+            .cloned()
+            .collect::<Vec<_>>();
+        active_membership_from_log(&self.base_membership, &committed)
+            .map(|(_, membership)| membership)
+    }
+
+    pub fn membership_is_joint(&self) -> bool {
+        self.active_voters.is_joint()
     }
 
     pub fn role(&self) -> Role {
@@ -476,8 +594,11 @@ impl RaftCore {
         }
         let remove = usize::try_from(position.index - self.snapshot_position.index)
             .map_err(|_| CoreError::IndexExhausted)?;
+        let compacted = self.log.get(..remove).unwrap_or_default().to_vec();
+        self.base_membership = active_membership_from_log(&self.base_membership, &compacted)?.1;
         self.log.drain(..remove);
         self.snapshot_position = position;
+        self.refresh_active_voters()?;
         Ok(())
     }
 
@@ -486,7 +607,7 @@ impl RaftCore {
         term: Term,
         leader: NodeId,
     ) -> Result<Vec<Effect>, CoreError> {
-        if !self.voters.contains(leader) {
+        if !self.active_voters.contains(leader) {
             return Err(CoreError::LocalNodeIsNotVoter(leader));
         }
         if term < self.hard_state.current_term {
@@ -516,6 +637,7 @@ impl RaftCore {
     pub fn restore_snapshot(
         &mut self,
         position: LogPosition,
+        membership: MembershipEntry,
         retained_suffix: Vec<LogEntry>,
     ) -> Result<(), CoreError> {
         if position.index < self.last_applied || position.term == Term(0) {
@@ -523,7 +645,9 @@ impl RaftCore {
         }
         validate_recovered_log(position.index, &retained_suffix)?;
         self.snapshot_position = position;
+        self.base_membership = membership;
         self.log = retained_suffix;
+        self.refresh_active_voters()?;
         self.commit_index = position.index;
         self.last_applied = position.index;
         self.pending_application = None;
@@ -545,6 +669,35 @@ impl RaftCore {
 
     pub fn replication_progress(&self, peer: NodeId) -> Option<ReplicationProgress> {
         self.replication.get(&peer).copied()
+    }
+
+    pub fn stage_peer(&mut self, peer: NodeId) -> Result<Vec<Effect>, CoreError> {
+        if self.role != Role::Leader {
+            return Err(CoreError::NotLeader);
+        }
+        if self.membership_is_joint() {
+            return Err(CoreError::ConfigurationChangeInProgress);
+        }
+        if self.active_voters.contains(peer) {
+            return Ok(Vec::new());
+        }
+        self.staging.insert(peer);
+        let next_index = self
+            .last_log_position()
+            .index
+            .checked_add(1)
+            .ok_or(CoreError::IndexExhausted)?;
+        self.replication.entry(peer).or_insert(ReplicationProgress {
+            next_index,
+            match_index: 0,
+        });
+        Ok(vec![self.append_for_peer(peer)?])
+    }
+
+    pub fn unstage_peer(&mut self, peer: NodeId) {
+        if self.staging.remove(&peer) && !self.active_voters.contains(peer) {
+            self.replication.remove(&peer);
+        }
     }
 
     pub fn leader_ready(&self) -> bool {
@@ -570,6 +723,38 @@ impl RaftCore {
         &mut self,
         payload: super::EntryPayload,
     ) -> Result<(u64, Vec<Effect>), CoreError> {
+        if matches!(payload, EntryPayload::Configuration(_)) {
+            return Err(CoreError::InvalidConfiguration);
+        }
+        self.propose_payload(payload)
+    }
+
+    pub fn propose_membership(
+        &mut self,
+        entry: MembershipEntry,
+    ) -> Result<(u64, Vec<Effect>), CoreError> {
+        validate_membership_transition(&self.active_voters, &entry)?;
+        match entry.phase {
+            ConfigurationPhase::Joint if entry.old != self.active_membership.new => {
+                return Err(CoreError::InvalidConfiguration);
+            }
+            ConfigurationPhase::Stable
+                if entry.operation_id != self.active_membership.operation_id
+                    || entry.new != self.active_membership.new =>
+            {
+                return Err(CoreError::InvalidConfiguration);
+            }
+            _ => {}
+        }
+        if entry.phase == ConfigurationPhase::Stable
+            && self.latest_configuration_index() > self.commit_index
+        {
+            return Err(CoreError::ConfigurationChangeInProgress);
+        }
+        self.propose_payload(EntryPayload::Configuration(entry))
+    }
+
+    fn propose_payload(&mut self, payload: EntryPayload) -> Result<(u64, Vec<Effect>), CoreError> {
         if self.persistence_pending() {
             return Err(CoreError::PersistencePending);
         }
@@ -608,7 +793,7 @@ impl RaftCore {
             return Err(CoreError::NotLeader);
         }
         let mut effects = Vec::new();
-        for peer in self.voters.peers(self.id) {
+        for peer in self.replication_peers() {
             effects.push(self.append_for_peer(peer)?);
         }
         Ok(effects)
@@ -661,6 +846,7 @@ impl RaftCore {
             &mut self.log,
             &pending.mutation.entries,
         )?;
+        self.refresh_active_voters()?;
         match pending.continuation {
             PendingLogContinuation::FollowerAppend(request) => Ok(self.finish_append(request)),
             PendingLogContinuation::LeaderEntry => self.finish_leader_entry(),
@@ -688,6 +874,9 @@ impl RaftCore {
         if self.role == Role::Leader {
             return Ok(Vec::new());
         }
+        if !self.active_voters.contains(self.id) {
+            return Ok(Vec::new());
+        }
 
         let next_term = self.hard_state.current_term.checked_next()?;
         let hard_state = HardState {
@@ -698,7 +887,7 @@ impl RaftCore {
         granted_votes.insert(self.id);
 
         let mut after_persist = vec![Effect::ResetElectionTimer];
-        after_persist.extend(self.voters.peers(self.id).map(|peer| {
+        after_persist.extend(self.active_voters.peers(self.id).into_iter().map(|peer| {
             Effect::Send(Envelope {
                 from: self.id,
                 to: peer,
@@ -720,7 +909,9 @@ impl RaftCore {
     }
 
     fn handle_message(&mut self, envelope: Envelope) -> Result<Vec<Effect>, CoreError> {
-        if !self.voters.contains(envelope.from) {
+        let staged_replication_response = self.staging.contains(&envelope.from)
+            && matches!(envelope.message, Message::AppendEntriesResponse { .. });
+        if !self.active_voters.contains(envelope.from) && !staged_replication_response {
             return Ok(Vec::new());
         }
         match envelope.message {
@@ -904,6 +1095,13 @@ impl RaftCore {
         }
 
         if log_requires_update(self.snapshot_position.index, &self.log, &request.entries) {
+            let mut prospective = self.log.clone();
+            reconcile_log(
+                self.snapshot_position.index,
+                &mut prospective,
+                &request.entries,
+            )?;
+            let _ = active_membership_from_log(&self.base_membership, &prospective)?;
             let mutation = LogMutation {
                 previous: request.previous,
                 entries: request.entries.clone(),
@@ -931,6 +1129,7 @@ impl RaftCore {
             self.commit_index = next_commit;
             effects.push(Effect::CommitIndexAdvanced(next_commit));
             self.emit_committed_application(&mut effects);
+            self.step_down_if_removed();
         }
         effects.push(Effect::Send(Envelope {
             from: self.id,
@@ -995,11 +1194,14 @@ impl RaftCore {
         let mut effects = Vec::new();
         let previous_commit = self.commit_index;
         self.advance_leader_commit(&mut effects);
+        if self.role != Role::Leader {
+            return Ok(effects);
+        }
         if retry {
             effects.push(self.append_for_peer(peer)?);
         }
         if self.commit_index > previous_commit {
-            let peers = self.voters.peers(self.id).collect::<Vec<_>>();
+            let peers = self.replication_peers();
             for voter in peers {
                 effects.push(self.append_for_peer(voter)?);
             }
@@ -1030,7 +1232,7 @@ impl RaftCore {
     }
 
     fn promote_if_quorum(&mut self, effects: &mut Vec<Effect>) -> Result<(), CoreError> {
-        if self.role != Role::Candidate || !self.voters.has_quorum(&self.granted_votes) {
+        if self.role != Role::Candidate || !self.active_voters.has_quorum(&self.granted_votes) {
             return Ok(());
         }
 
@@ -1043,8 +1245,9 @@ impl RaftCore {
             .checked_add(1)
             .ok_or(CoreError::IndexExhausted)?;
         self.replication = self
-            .voters
+            .active_voters
             .peers(self.id)
+            .into_iter()
             .map(|peer| {
                 (
                     peer,
@@ -1075,11 +1278,37 @@ impl RaftCore {
     fn finish_leader_entry(&mut self) -> Result<Vec<Effect>, CoreError> {
         let mut effects = Vec::new();
         self.advance_leader_commit(&mut effects);
-        let peers = self.voters.peers(self.id).collect::<Vec<_>>();
+        let peers = self.replication_peers();
         for peer in peers {
             effects.push(self.append_for_peer(peer)?);
         }
         Ok(effects)
+    }
+
+    fn refresh_active_voters(&mut self) -> Result<(), CoreError> {
+        (self.active_voters, self.active_membership) =
+            active_membership_from_log(&self.base_membership, &self.log)?;
+        if self.role == Role::Leader {
+            let next_index = self
+                .last_log_position()
+                .index
+                .checked_add(1)
+                .ok_or(CoreError::IndexExhausted)?;
+            self.staging
+                .retain(|node| !self.active_voters.contains(*node));
+            let active = self
+                .replication_peers()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            self.replication.retain(|node, _| active.contains(node));
+            for node in active {
+                self.replication.entry(node).or_insert(ReplicationProgress {
+                    next_index,
+                    match_index: 0,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn append_for_peer(&self, peer: NodeId) -> Result<Effect, CoreError> {
@@ -1133,15 +1362,19 @@ impl RaftCore {
         let mut candidate = last;
         while candidate > self.commit_index {
             if self.term_at(candidate) == Some(self.hard_state.current_term) {
-                let replicated = 1 + self
+                let mut replicated = self
                     .replication
-                    .values()
-                    .filter(|progress| progress.match_index >= candidate)
-                    .count();
-                if replicated > self.voters.0.len() / 2 {
+                    .iter()
+                    .filter_map(|(node, progress)| {
+                        (progress.match_index >= candidate).then_some(*node)
+                    })
+                    .collect::<BTreeSet<_>>();
+                replicated.insert(self.id);
+                if self.active_voters.has_quorum(&replicated) {
                     self.commit_index = candidate;
                     effects.push(Effect::CommitIndexAdvanced(candidate));
                     self.emit_committed_application(effects);
+                    self.step_down_if_removed();
                     break;
                 }
             }
@@ -1210,6 +1443,118 @@ impl RaftCore {
         .ok()?;
         self.log.get(position).map(|entry| entry.term)
     }
+
+    fn replication_peers(&self) -> Vec<NodeId> {
+        self.active_voters
+            .members()
+            .into_iter()
+            .chain(self.staging.iter().copied())
+            .filter(|node| *node != self.id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn latest_configuration_index(&self) -> u64 {
+        self.log
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.payload, EntryPayload::Configuration(_)))
+            .map_or(self.snapshot_position.index, |entry| entry.index)
+    }
+
+    fn step_down_if_removed(&mut self) {
+        let removed_at = self.log.iter().rev().find_map(|entry| {
+            if entry.index > self.commit_index {
+                return None;
+            }
+            match &entry.payload {
+                EntryPayload::Configuration(configuration)
+                    if configuration.phase == ConfigurationPhase::Stable
+                        && !configuration
+                            .new
+                            .node_ids()
+                            .any(|node| NodeId(node) == self.id) =>
+                {
+                    Some(entry.index)
+                }
+                _ => None,
+            }
+        });
+        if removed_at.is_some() {
+            self.role = Role::Follower;
+            self.leader = None;
+            self.granted_votes.clear();
+            self.replication.clear();
+            self.staging.clear();
+            self.leader_noop_index = None;
+        }
+    }
+}
+
+fn voters_from_configuration(
+    configuration: &super::ClusterConfiguration,
+) -> Result<VoterSet, CoreError> {
+    VoterSet::new(configuration.node_ids().map(NodeId)).map_err(|_| CoreError::InvalidConfiguration)
+}
+
+fn validate_membership_transition(
+    active: &ActiveVoters,
+    entry: &MembershipEntry,
+) -> Result<(), CoreError> {
+    entry
+        .validate()
+        .map_err(|_| CoreError::InvalidConfiguration)?;
+    let old = voters_from_configuration(&entry.old)?;
+    let new = voters_from_configuration(&entry.new)?;
+    match (active, entry.phase) {
+        (ActiveVoters::Stable(current), ConfigurationPhase::Joint) if *current == old => Ok(()),
+        (ActiveVoters::Joint { new: target, .. }, ConfigurationPhase::Stable)
+            if *target == new && old == new =>
+        {
+            Ok(())
+        }
+        (ActiveVoters::Joint { .. }, ConfigurationPhase::Joint) => {
+            Err(CoreError::ConfigurationChangeInProgress)
+        }
+        _ => Err(CoreError::InvalidConfiguration),
+    }
+}
+
+fn active_voters_for(entry: &MembershipEntry) -> Result<ActiveVoters, CoreError> {
+    let old = voters_from_configuration(&entry.old)?;
+    let new = voters_from_configuration(&entry.new)?;
+    Ok(match entry.phase {
+        ConfigurationPhase::Joint => ActiveVoters::Joint { old, new },
+        ConfigurationPhase::Stable => ActiveVoters::Stable(new),
+    })
+}
+
+fn active_membership_from_log(
+    initial: &MembershipEntry,
+    log: &[LogEntry],
+) -> Result<(ActiveVoters, MembershipEntry), CoreError> {
+    let mut membership = initial.clone();
+    let mut active = active_voters_for(initial)?;
+    for entry in log {
+        if let EntryPayload::Configuration(configuration) = &entry.payload {
+            validate_membership_transition(&active, configuration)?;
+            if configuration.phase == ConfigurationPhase::Joint
+                && configuration.old != membership.new
+            {
+                return Err(CoreError::InvalidConfiguration);
+            }
+            if configuration.phase == ConfigurationPhase::Stable
+                && (configuration.operation_id != membership.operation_id
+                    || configuration.new != membership.new)
+            {
+                return Err(CoreError::InvalidConfiguration);
+            }
+            active = active_voters_for(configuration)?;
+            membership = configuration.clone();
+        }
+    }
+    Ok((active, membership))
 }
 
 fn validate_append_entries(previous: u64, entries: &[LogEntry]) -> Result<(), CoreError> {
@@ -1223,6 +1568,11 @@ fn validate_append_entries(previous: u64, entries: &[LogEntry]) -> Result<(), Co
         }
         if entry.term == Term(0) {
             return Err(CoreError::InvalidAppendEntriesTerm { index: entry.index });
+        }
+        if let EntryPayload::Configuration(configuration) = &entry.payload {
+            configuration
+                .validate()
+                .map_err(|_| CoreError::InvalidConfiguration)?;
         }
         expected = expected.checked_add(1).ok_or(CoreError::IndexExhausted)?;
     }
@@ -1338,6 +1688,42 @@ mod tests {
             term: Term(term),
             payload: EntryPayload::Command(vec![byte]),
         }
+    }
+
+    fn configuration(ids: &[u64]) -> ClusterConfiguration {
+        ClusterConfiguration::new(ids.iter().map(|id| (*id, format!("http://node-{id}:9080"))))
+            .expect("configuration")
+    }
+
+    fn ready_single_node() -> RaftCore {
+        let mut node = RaftCore::recover_compacted_with_membership(
+            NodeId(1),
+            MembershipEntry::initial(configuration(&[1])),
+            HardState::default(),
+            LogPosition::default(),
+            Vec::new(),
+            0,
+        )
+        .expect("configured core");
+        let hard_state = persist_from(
+            &node
+                .handle(Event::ElectionTimeout)
+                .expect("election starts"),
+        );
+        let effects = node
+            .acknowledge_persisted(hard_state)
+            .expect("term persists");
+        let mutation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistLog(mutation) => Some(mutation),
+                _ => None,
+            })
+            .expect("leader no-op");
+        node.acknowledge_log_persisted(mutation)
+            .expect("no-op persists");
+        node.acknowledge_applied(1).expect("no-op applies");
+        node
     }
 
     #[test]
@@ -1896,5 +2282,138 @@ mod tests {
             }
         );
         assert_eq!(node.last_log_position().index, 1);
+    }
+
+    #[test]
+    fn joint_configuration_requires_old_and_new_quorums() {
+        let mut node = ready_single_node();
+        node.stage_peer(NodeId(2))
+            .expect("prospective voter stages");
+        let operation_id = [7; 16];
+        let target = configuration(&[1, 2]);
+        let joint = MembershipEntry {
+            operation_id,
+            phase: ConfigurationPhase::Joint,
+            old: configuration(&[1]),
+            new: target.clone(),
+        };
+        let (joint_index, effects) = node
+            .propose_membership(joint)
+            .expect("joint entry proposed");
+        let mutation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistLog(mutation) => Some(mutation),
+                _ => None,
+            })
+            .expect("joint entry persists");
+        node.acknowledge_log_persisted(mutation)
+            .expect("joint entry durable");
+        assert_eq!(node.commit_index(), 1, "old quorum alone is insufficient");
+
+        let stable = MembershipEntry {
+            operation_id,
+            phase: ConfigurationPhase::Stable,
+            old: target.clone(),
+            new: target,
+        };
+        assert_eq!(
+            node.propose_membership(stable),
+            Err(CoreError::ConfigurationChangeInProgress)
+        );
+
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: joint_index,
+                    request_previous_index: 1,
+                },
+            ))
+            .expect("new voter acknowledges joint entry");
+        assert_eq!(node.commit_index(), joint_index);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CommitIndexAdvanced(index) if *index == joint_index
+        )));
+    }
+
+    #[test]
+    fn removed_leader_steps_down_when_stable_entry_commits() {
+        let mut node = ready_single_node();
+        node.stage_peer(NodeId(2)).expect("replacement stages");
+        let operation_id = [8; 16];
+        let target = configuration(&[2]);
+        let (_, effects) = node
+            .propose_membership(MembershipEntry {
+                operation_id,
+                phase: ConfigurationPhase::Joint,
+                old: configuration(&[1]),
+                new: target.clone(),
+            })
+            .expect("joint entry proposed");
+        let mutation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistLog(mutation) => Some(mutation),
+                _ => None,
+            })
+            .expect("joint mutation");
+        node.acknowledge_log_persisted(mutation)
+            .expect("joint durable");
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 2,
+                    request_previous_index: 1,
+                },
+            ))
+            .expect("joint commits");
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ApplyCommitted(_)))
+        );
+        node.acknowledge_applied(2).expect("joint applies");
+
+        let (_, effects) = node
+            .propose_membership(MembershipEntry {
+                operation_id,
+                phase: ConfigurationPhase::Stable,
+                old: target.clone(),
+                new: target,
+            })
+            .expect("stable entry proposed");
+        let mutation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistLog(mutation) => Some(mutation),
+                _ => None,
+            })
+            .expect("stable mutation");
+        node.acknowledge_log_persisted(mutation)
+            .expect("stable durable");
+        assert_eq!(node.role(), Role::Leader);
+        node.handle(receive(
+            2,
+            1,
+            Message::AppendEntriesResponse {
+                term: Term(1),
+                accepted: true,
+                match_index: 3,
+                request_previous_index: 2,
+            },
+        ))
+        .expect("replacement commits stable configuration");
+        assert_eq!(node.commit_index(), 3);
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.propose(EntryPayload::Noop), Err(CoreError::NotLeader));
     }
 }

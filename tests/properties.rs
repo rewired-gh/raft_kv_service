@@ -4,7 +4,7 @@ use raft_kv_service::{
         ClientId, Command, KvStateMachine, Mutation, MutationCommand, decode_command,
         encode_command,
     },
-    raft::{EntryPayload, LogEntry, NodeId, Term},
+    raft::{ClusterConfiguration, EntryPayload, LogEntry, MembershipEntry, Term},
     storage::{RaftStorage, SnapshotStorage, SqliteStorage, StateMachineStorage},
 };
 
@@ -40,6 +40,12 @@ fn command_strategy() -> impl Strategy<Value = Command> {
                 })
             }
         })
+}
+
+fn membership() -> MembershipEntry {
+    MembershipEntry::initial(
+        ClusterConfiguration::new([(1, "node://1".to_owned())]).expect("configuration"),
+    )
 }
 
 proptest! {
@@ -116,7 +122,7 @@ proptest! {
         }
 
         let snapshot = storage
-            .create_snapshot([3; 16], &[NodeId(1)])
+            .create_snapshot([3; 16], &membership())
             .expect("create generated snapshot");
         let mut restored = SqliteStorage::open_in_memory().expect("restored storage");
         restored
