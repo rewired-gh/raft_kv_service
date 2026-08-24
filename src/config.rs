@@ -242,3 +242,48 @@ pub enum LogFormat {
     #[default]
     Pretty,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_validation_covers_disabled_server_and_mutual_modes() {
+        let disabled = TlsFileConfig::default();
+        assert!(!disabled.enabled());
+        disabled.validate(false).expect("disabled TLS is valid");
+        disabled.validate(true).expect("disabled mTLS is valid");
+
+        let certificate_only = TlsFileConfig {
+            certificate_file: Some("cert.pem".into()),
+            ..TlsFileConfig::default()
+        };
+        assert!(certificate_only.enabled());
+        assert!(certificate_only.validate(false).is_err());
+
+        let server = TlsFileConfig {
+            certificate_file: Some("cert.pem".into()),
+            private_key_file: Some("key.pem".into()),
+            client_ca_file: None,
+        };
+        server.validate(false).expect("server TLS is complete");
+        assert!(server.validate(true).is_err());
+
+        let mutual = TlsFileConfig {
+            client_ca_file: Some("ca.pem".into()),
+            ..server
+        };
+        mutual.validate(true).expect("mutual TLS is complete");
+    }
+
+    #[test]
+    fn defaults_are_safe_and_timeouts_are_exact() {
+        let config = AppConfig::default();
+        assert_eq!(config.raft.node_id, 1);
+        assert_eq!(config.raft.voters, vec![1]);
+        assert_eq!(config.server.request_timeout(), Duration::from_secs(30));
+        assert!(matches!(config.telemetry.log_format, LogFormat::Pretty));
+        assert_eq!(PeerServerConfig::default().port, 9080);
+        assert_eq!(OperationalServerConfig::default().port, 8088);
+    }
+}

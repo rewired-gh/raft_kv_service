@@ -862,6 +862,60 @@ mod tests {
     }
 
     #[test]
+    fn identity_validation_rejects_each_ambiguous_peer_boundary() {
+        let envelope = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::RequestVote {
+                term: Term(1),
+                candidate: NodeId(1),
+                last_log: LogPosition::default(),
+            },
+        };
+        let valid = encode_request_vote(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode request");
+
+        let mut missing = valid.clone();
+        missing.identity = None;
+        assert_eq!(
+            context().decode_request_vote(missing),
+            Err(PeerError::MissingIdentity)
+        );
+
+        let mut wrong_cluster = valid.clone();
+        wrong_cluster
+            .identity
+            .as_mut()
+            .expect("identity")
+            .cluster_id = vec![9; 16];
+        assert_eq!(
+            context().decode_request_vote(wrong_cluster),
+            Err(PeerError::ClusterMismatch)
+        );
+
+        for (sender, recipient, term, expected) in [
+            (0, 2, 1, PeerError::ZeroNodeId),
+            (1, 0, 1, PeerError::ZeroNodeId),
+            (1, 3, 1, PeerError::RecipientMismatch),
+            (1, 2, 0, PeerError::ZeroTerm),
+        ] {
+            let mut request = valid.clone();
+            let identity = request.identity.as_mut().expect("identity");
+            identity.sender_id = sender;
+            identity.recipient_id = recipient;
+            identity.term = term;
+            assert_eq!(context().decode_request_vote(request), Err(expected));
+        }
+
+        let mut mismatched_candidate = valid;
+        mismatched_candidate.candidate_id = 3;
+        assert_eq!(
+            context().decode_request_vote(mismatched_candidate),
+            Err(PeerError::SenderRoleMismatch)
+        );
+    }
+
+    #[test]
     fn forwarding_round_trips_once_and_rejects_another_hop() {
         let command = Command::Read {
             key: "forwarded".into(),
@@ -927,6 +981,101 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_rejects_resource_encoding_and_membership_ambiguity() {
+        let command = Command::Read { key: "key".into() };
+        let valid = encode_forward_command(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(1),
+            &command,
+        )
+        .expect("encode command");
+        let mut limited = context();
+        limited.limits.max_command_bytes = 1;
+        assert_eq!(
+            limited.decode_forward_command(valid.clone()),
+            Err(PeerError::CommandTooLarge)
+        );
+        let mut malformed = valid;
+        malformed.command = vec![0xff];
+        assert_eq!(
+            context().decode_forward_command(malformed),
+            Err(PeerError::InvalidCommand)
+        );
+
+        let query = encode_forward_membership(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(1),
+            None,
+        )
+        .expect("encode query");
+        let mut looped = query.clone();
+        looped.hop_count = 2;
+        assert_eq!(
+            context().decode_forward_membership(looped),
+            Err(PeerError::ForwardingLoop)
+        );
+        let mut ambiguous_query = query;
+        ambiguous_query.operation_id = vec![1; 16];
+        assert_eq!(
+            context().decode_forward_membership(ambiguous_query),
+            Err(PeerError::InvalidConfiguration)
+        );
+
+        let target =
+            ClusterConfiguration::new([(1, "http://node-1:9080".to_owned())]).expect("target");
+        let mutation = encode_forward_membership(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(1),
+            Some(([1; 16], &target)),
+        )
+        .expect("encode mutation");
+        let mut zero_operation = mutation.clone();
+        zero_operation.operation_id = vec![0; 16];
+        assert_eq!(
+            context().decode_forward_membership(zero_operation),
+            Err(PeerError::InvalidConfiguration)
+        );
+        let mut invalid_endpoint = mutation;
+        invalid_endpoint.members[0].peer_endpoint = "node://1".to_owned();
+        assert_eq!(
+            context().decode_forward_membership(invalid_endpoint),
+            Err(PeerError::InvalidConfiguration)
+        );
+
+        let result = CommandResult::Read(crate::kv::ReadResult::NotFound);
+        let response = encode_forward_response(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(1),
+            &result,
+        )
+        .expect("encode response");
+        let mut oversized_response = response.clone();
+        oversized_response.result = vec![0; PeerLimits::default().max_command_bytes + 1];
+        assert_eq!(
+            context().decode_forward_response(oversized_response),
+            Err(PeerError::CommandTooLarge)
+        );
+        let mut malformed_response = response;
+        malformed_response.result = vec![0xff];
+        assert_eq!(
+            context().decode_forward_response(malformed_response),
+            Err(PeerError::InvalidCommandResult)
+        );
+    }
+
+    #[test]
     fn snapshot_chunks_bind_identity_offsets_and_digest() {
         let snapshot = Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
@@ -967,6 +1116,103 @@ mod tests {
         invalid.done = true;
         assert_eq!(
             context().decode_snapshot_chunk(invalid),
+            Err(PeerError::InvalidSnapshotChunk)
+        );
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_each_framing_and_resource_boundary() {
+        let snapshot = Snapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            cluster_id: [4; 16],
+            last_included: LogPosition {
+                index: 9,
+                term: Term(3),
+            },
+            voters: vec![NodeId(1), NodeId(2)],
+            membership: crate::raft::MembershipEntry::initial(
+                crate::raft::ClusterConfiguration::new([
+                    (1, "node://1".to_owned()),
+                    (2, "node://2".to_owned()),
+                ])
+                .expect("configuration"),
+            ),
+            payload: vec![1, 2, 3, 4],
+            digest: [8; 32],
+        };
+        let valid = encode_snapshot_chunk(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            (NodeId(1), NodeId(2), Term(3)),
+            &snapshot,
+            0,
+            2,
+        )
+        .expect("encode chunk");
+
+        let mut wrong_format = valid.clone();
+        wrong_format.format_version += 1;
+        assert!(matches!(
+            context().decode_snapshot_chunk(wrong_format),
+            Err(PeerError::UnsupportedSnapshotFormat(_))
+        ));
+        for mutate in [
+            |request: &mut proto::InstallSnapshotRequest| request.last_included_index = 0,
+            |request: &mut proto::InstallSnapshotRequest| request.last_included_term = 0,
+        ] {
+            let mut request = valid.clone();
+            mutate(&mut request);
+            assert_eq!(
+                context().decode_snapshot_chunk(request),
+                Err(PeerError::InvalidSnapshotPosition)
+            );
+        }
+
+        for voters in [vec![], vec![2, 1], vec![1]] {
+            let mut request = valid.clone();
+            request.voter_ids = voters;
+            assert_eq!(
+                context().decode_snapshot_chunk(request),
+                Err(PeerError::InvalidSnapshotVoters)
+            );
+        }
+
+        let mut wrong_digest = valid.clone();
+        wrong_digest.snapshot_id[0] ^= 1;
+        assert_eq!(
+            context().decode_snapshot_chunk(wrong_digest),
+            Err(PeerError::InvalidSnapshotDigest)
+        );
+        for size in [
+            0,
+            u64::try_from(PeerLimits::default().max_snapshot_bytes)
+                .expect("snapshot limit fits u64")
+                + 1,
+        ] {
+            let mut request = valid.clone();
+            request.total_size = size;
+            assert_eq!(
+                context().decode_snapshot_chunk(request),
+                Err(PeerError::SnapshotTooLarge)
+            );
+        }
+
+        let mut empty = valid.clone();
+        empty.chunk.clear();
+        assert_eq!(
+            context().decode_snapshot_chunk(empty),
+            Err(PeerError::InvalidSnapshotChunk)
+        );
+        let mut past_end = valid.clone();
+        past_end.offset = 3;
+        assert_eq!(
+            context().decode_snapshot_chunk(past_end),
+            Err(PeerError::InvalidSnapshotChunk)
+        );
+        let mut limited = context();
+        limited.limits.snapshot_chunk_bytes = 1;
+        assert_eq!(
+            limited.decode_snapshot_chunk(valid),
             Err(PeerError::InvalidSnapshotChunk)
         );
     }

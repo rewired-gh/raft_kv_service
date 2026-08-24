@@ -649,6 +649,29 @@ mod tests {
         .expect("recover")
     }
 
+    fn durable_snapshot() -> Snapshot {
+        let mut storage = SqliteStorage::open_in_memory().expect("snapshot source");
+        let entry = LogEntry {
+            index: 1,
+            term: Term(1),
+            payload: EntryPayload::Noop,
+        };
+        storage.append_local(&entry).expect("append snapshot entry");
+        storage
+            .apply_committed(&[entry])
+            .expect("apply snapshot entry");
+        let membership = super::super::MembershipEntry::initial(
+            super::super::ClusterConfiguration::new([
+                (1, "node://1".to_owned()),
+                (2, "node://2".to_owned()),
+            ])
+            .expect("membership"),
+        );
+        storage
+            .create_snapshot([9; 16], &membership)
+            .expect("create source snapshot")
+    }
+
     #[test]
     fn injected_term_and_log_write_failures_are_terminal() {
         let mut term_failure = injectable_runtime();
@@ -735,5 +758,81 @@ mod tests {
             ),
             Err(RuntimeError::Storage(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_install_restores_core_and_storage_atomically() {
+        let snapshot = durable_snapshot();
+        let voters = VoterSet::new([NodeId(1), NodeId(2)]).expect("voters");
+        let storage =
+            FaultInjectingStorage::new(SqliteStorage::open_in_memory().expect("snapshot target"));
+        let mut runtime =
+            DurableRaft::recover_with_snapshot(NodeId(2), voters, storage).expect("recover target");
+        runtime
+            .install_snapshot(NodeId(1), Term(1), [9; 16], &snapshot)
+            .expect("install snapshot");
+        assert_eq!(runtime.core().snapshot_position(), snapshot.last_included);
+        assert_eq!(runtime.core().last_applied(), snapshot.last_included.index);
+        assert_eq!(
+            runtime
+                .storage()
+                .current_snapshot()
+                .expect("load installed snapshot"),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn snapshot_install_and_followup_read_failures_are_terminal() {
+        let snapshot = durable_snapshot();
+        let voters = VoterSet::new([NodeId(1), NodeId(2)]).expect("voters");
+
+        let storage =
+            FaultInjectingStorage::new(SqliteStorage::open_in_memory().expect("snapshot target"));
+        storage.fail_next(FaultPoint::InstallSnapshot, FaultKind::Write);
+        let mut install_failure =
+            DurableRaft::recover_with_snapshot(NodeId(2), voters.clone(), storage)
+                .expect("recover target");
+        assert!(matches!(
+            install_failure.install_snapshot(NodeId(1), Term(1), [9; 16], &snapshot),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(install_failure.is_failed());
+
+        let storage =
+            FaultInjectingStorage::new(SqliteStorage::open_in_memory().expect("snapshot target"));
+        let mut read_failure =
+            DurableRaft::recover_with_snapshot(NodeId(2), voters, storage).expect("recover target");
+        read_failure
+            .storage()
+            .fail_next(FaultPoint::EntriesFrom, FaultKind::Read);
+        assert!(matches!(
+            read_failure.install_snapshot(NodeId(1), Term(1), [9; 16], &snapshot),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(read_failure.is_failed());
+    }
+
+    #[test]
+    fn snapshot_recovery_fails_closed_on_each_initial_read() {
+        for point in [
+            FaultPoint::LoadHardState,
+            FaultPoint::CurrentSnapshot,
+            FaultPoint::EntriesFrom,
+            FaultPoint::LastApplied,
+        ] {
+            let storage = FaultInjectingStorage::new(
+                SqliteStorage::open_in_memory().expect("snapshot target"),
+            );
+            storage.fail_next(point, FaultKind::Read);
+            assert!(matches!(
+                DurableRaft::recover_with_snapshot(
+                    NodeId(1),
+                    VoterSet::new([NodeId(1)]).expect("voters"),
+                    storage,
+                ),
+                Err(RuntimeError::Storage(_))
+            ));
+        }
     }
 }

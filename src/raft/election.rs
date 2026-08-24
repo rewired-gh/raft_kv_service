@@ -2618,6 +2618,69 @@ mod tests {
     }
 
     #[test]
+    fn leader_admission_distinguishes_active_staged_and_not_ready_peers() {
+        let mut leader = core(1, &[1, 2, 3]);
+        let hard_state = persist_from(
+            &leader
+                .handle(Event::ElectionTimeout)
+                .expect("start election"),
+        );
+        let effects = leader
+            .acknowledge_persisted(hard_state)
+            .expect("persist candidacy");
+        leader
+            .handle(receive(
+                2,
+                1,
+                Message::RequestVoteResponse {
+                    term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("win election");
+        let mutation = effects.into_iter().find_map(|effect| match effect {
+            Effect::PersistLog(mutation) => Some(mutation),
+            _ => None,
+        });
+        assert!(
+            mutation.is_none(),
+            "quorum response creates the leader no-op"
+        );
+        assert_eq!(leader.role(), Role::Leader);
+        assert!(!leader.leader_ready());
+        assert_eq!(
+            leader.propose(EntryPayload::Noop),
+            Err(CoreError::PersistencePending)
+        );
+
+        let pending = leader
+            .pending_log
+            .clone()
+            .expect("leader no-op pending")
+            .mutation;
+        leader
+            .acknowledge_log_persisted(pending)
+            .expect("persist leader no-op");
+        assert_eq!(
+            leader.propose(EntryPayload::Noop),
+            Err(CoreError::LeaderNotReady)
+        );
+        assert!(
+            leader
+                .stage_peer(NodeId(1))
+                .expect("active voter is already admitted")
+                .is_empty()
+        );
+        leader
+            .stage_peer(NodeId(4))
+            .expect("stage a learner for catch-up");
+        assert!(leader.replication_progress(NodeId(4)).is_some());
+        leader.unstage_peer(NodeId(4));
+        assert!(leader.replication_progress(NodeId(4)).is_none());
+        leader.unstage_peer(NodeId(1));
+    }
+
+    #[test]
     fn snapshot_and_compaction_validate_all_boundaries() {
         let base = MembershipEntry::initial(configuration(&[1]));
         let position = LogPosition {

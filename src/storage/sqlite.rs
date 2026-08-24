@@ -1781,8 +1781,17 @@ mod tests {
     }
 
     fn command_entry(index: u64, sequence: u64, mutation: Mutation) -> LogEntry {
+        command_entry_for(index, ClientId([3; 16]), sequence, mutation)
+    }
+
+    fn command_entry_for(
+        index: u64,
+        client_id: ClientId,
+        sequence: u64,
+        mutation: Mutation,
+    ) -> LogEntry {
         let command = Command::Mutate(MutationCommand {
-            client_id: ClientId([3; 16]),
+            client_id,
             sequence,
             mutation,
         });
@@ -1823,6 +1832,40 @@ mod tests {
     }
 
     #[test]
+    fn hard_state_accepts_only_monotonic_same_term_vote_transitions() {
+        let mut storage = SqliteStorage::open_in_memory().expect("storage");
+        let term_only = HardState {
+            current_term: Term(4),
+            voted_for: None,
+        };
+        storage
+            .persist_hard_state(term_only)
+            .expect("advance term without vote");
+        let voted = HardState {
+            current_term: Term(4),
+            voted_for: Some(NodeId(2)),
+        };
+        storage
+            .persist_hard_state(voted)
+            .expect("first same-term vote");
+        storage
+            .persist_hard_state(voted)
+            .expect("same vote is idempotent");
+        assert!(matches!(
+            storage.persist_hard_state(term_only),
+            Err(StorageError::HardStateRegression { .. })
+        ));
+        let next = HardState {
+            current_term: Term(5),
+            voted_for: Some(NodeId(3)),
+        };
+        storage
+            .persist_hard_state(next)
+            .expect("higher term may choose a new vote");
+        assert_eq!(storage.load_hard_state().expect("state"), next);
+    }
+
+    #[test]
     fn local_append_requires_a_contiguous_nonzero_log() {
         let mut storage = SqliteStorage::open_in_memory().expect("storage opens");
         assert!(matches!(
@@ -1844,6 +1887,80 @@ mod tests {
                 index: 2,
                 term: Term(1)
             }
+        );
+    }
+
+    #[test]
+    fn log_and_application_validation_rejects_every_atomicity_boundary() {
+        let mut storage = SqliteStorage::open_in_memory().expect("storage opens");
+        for invalid in [entry(0, 1, 0), entry(1, 0, 0)] {
+            assert!(matches!(
+                storage.append_local(&invalid),
+                Err(StorageError::InvalidLogEntry { .. })
+            ));
+        }
+        assert!(storage.entries_from(1, 0).expect("zero limit").is_empty());
+
+        let first = LogEntry {
+            index: 1,
+            term: Term(1),
+            payload: EntryPayload::Noop,
+        };
+        let second = LogEntry {
+            index: 2,
+            term: Term(1),
+            payload: EntryPayload::Noop,
+        };
+        storage.append_local(&first).expect("append first");
+        storage.append_local(&second).expect("append second");
+        assert_eq!(
+            storage
+                .append_from_leader(LogPosition::default(), &[first.clone(), second.clone()])
+                .expect("matching leader prefix"),
+            AppendOutcome::Appended { last_index: 2 }
+        );
+        assert!(matches!(
+            storage.append_from_leader(
+                LogPosition::default(),
+                &[
+                    first.clone(),
+                    LogEntry {
+                        index: 3,
+                        term: Term(1),
+                        payload: EntryPayload::Noop,
+                    },
+                ]
+            ),
+            Err(StorageError::NonContiguousLog {
+                expected: 2,
+                found: 3
+            })
+        ));
+
+        assert!(matches!(
+            storage.apply_committed(&[entry(1, 9, 1)]),
+            Err(StorageError::ApplicationLogMismatch { index: 1 })
+        ));
+        assert!(matches!(
+            storage.apply_committed(std::slice::from_ref(&second)),
+            Err(StorageError::NonContiguousApplication {
+                expected: 1,
+                found: 2
+            })
+        ));
+        storage
+            .apply_committed(std::slice::from_ref(&first))
+            .expect("apply first");
+        assert!(matches!(
+            storage.apply_committed(&[entry(1, 9, 1)]),
+            Err(StorageError::ApplicationLogMismatch { index: 1 })
+        ));
+        assert_eq!(
+            storage
+                .apply_committed(std::slice::from_ref(&first))
+                .expect("idempotent application")[0]
+                .index,
+            1
         );
     }
 
@@ -2057,6 +2174,199 @@ mod tests {
                 .expect("idempotent replay"),
             results
         );
+    }
+
+    #[test]
+    fn mutation_preconditions_and_session_boundaries_are_persisted_results() {
+        let first = ClientId([1; 16]);
+        let second = ClientId([2; 16]);
+        let mutations = [
+            Mutation::Update {
+                key: "key".into(),
+                value: b"missing".to_vec(),
+                expected_revision: None,
+            },
+            Mutation::Create {
+                key: "key".into(),
+                value: b"created".to_vec(),
+            },
+            Mutation::Create {
+                key: "key".into(),
+                value: b"conflict".to_vec(),
+            },
+            Mutation::Update {
+                key: "key".into(),
+                value: b"updated".to_vec(),
+                expected_revision: Some(2),
+            },
+            Mutation::Delete {
+                key: "key".into(),
+                expected_revision: Some(2),
+            },
+            Mutation::Delete {
+                key: "key".into(),
+                expected_revision: Some(4),
+            },
+            Mutation::Delete {
+                key: "key".into(),
+                expected_revision: None,
+            },
+        ];
+        let entries = mutations
+            .into_iter()
+            .enumerate()
+            .map(|(offset, mutation)| {
+                let index = u64::try_from(offset + 1).expect("bounded index");
+                command_entry_for(index, first, index, mutation)
+            })
+            .collect::<Vec<_>>();
+        let mut storage = SqliteStorage::open_in_memory().expect("storage");
+        for entry in &entries {
+            storage.append_local(entry).expect("append mutation");
+        }
+        let results = storage.apply_committed(&entries).expect("apply mutations");
+        let mutations = results
+            .into_iter()
+            .map(|entry| match entry.result.expect("mutation result") {
+                CommandResult::Mutation(result) => result,
+                CommandResult::Read(_) => panic!("unexpected read result"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            vec![
+                MutationResult::PreconditionFailed {
+                    current_revision: None,
+                },
+                MutationResult::Created { revision: 2 },
+                MutationResult::PreconditionFailed {
+                    current_revision: Some(2),
+                },
+                MutationResult::Updated { revision: 4 },
+                MutationResult::PreconditionFailed {
+                    current_revision: Some(4),
+                },
+                MutationResult::Deleted { revision: 6 },
+                MutationResult::PreconditionFailed {
+                    current_revision: None,
+                },
+            ]
+        );
+
+        let stale = command_entry_for(
+            8,
+            first,
+            6,
+            Mutation::Delete {
+                key: "key".into(),
+                expected_revision: None,
+            },
+        );
+        let identity_conflict = command_entry_for(
+            9,
+            first,
+            7,
+            Mutation::Create {
+                key: "different".into(),
+                value: Vec::new(),
+            },
+        );
+        let sequence_gap = command_entry_for(
+            10,
+            first,
+            9,
+            Mutation::Create {
+                key: "gap".into(),
+                value: Vec::new(),
+            },
+        );
+        let new_client_gap = command_entry_for(
+            11,
+            second,
+            2,
+            Mutation::Create {
+                key: "second".into(),
+                value: Vec::new(),
+            },
+        );
+        for entry in [&stale, &identity_conflict, &sequence_gap, &new_client_gap] {
+            storage
+                .append_local(entry)
+                .expect("append session boundary");
+        }
+        let results = storage
+            .apply_committed(&[stale, identity_conflict, sequence_gap, new_client_gap])
+            .expect("persist session boundary results");
+        assert!(matches!(
+            results[0].result,
+            Some(CommandResult::Mutation(MutationResult::StaleSequence {
+                latest: 7
+            }))
+        ));
+        assert!(matches!(
+            results[1].result,
+            Some(CommandResult::Mutation(MutationResult::IdentityConflict {
+                sequence: 7
+            }))
+        ));
+        assert!(matches!(
+            results[2].result,
+            Some(CommandResult::Mutation(MutationResult::SequenceGap {
+                expected: 8
+            }))
+        ));
+        assert!(matches!(
+            results[3].result,
+            Some(CommandResult::Mutation(MutationResult::SequenceGap {
+                expected: 1
+            }))
+        ));
+    }
+
+    #[test]
+    fn client_capacity_is_a_deterministic_replicated_result() {
+        let limits = StorageLimits {
+            max_clients: 1,
+            ..StorageLimits::default()
+        };
+        let mut storage = SqliteStorage::initialize(
+            Connection::open_in_memory().expect("connection"),
+            false,
+            limits,
+            None,
+        )
+        .expect("limited storage");
+        let first = command_entry_for(
+            1,
+            ClientId([1; 16]),
+            1,
+            Mutation::Create {
+                key: "first".into(),
+                value: Vec::new(),
+            },
+        );
+        let second = command_entry_for(
+            2,
+            ClientId([2; 16]),
+            1,
+            Mutation::Create {
+                key: "second".into(),
+                value: Vec::new(),
+            },
+        );
+        for entry in [&first, &second] {
+            storage.append_local(entry).expect("append");
+        }
+        let results = storage
+            .apply_committed(&[first, second])
+            .expect("capacity result applies");
+        assert!(matches!(
+            results[1].result,
+            Some(CommandResult::Mutation(
+                MutationResult::ClientCapacityReached
+            ))
+        ));
+        assert_eq!(storage.value("second").expect("read"), None);
     }
 
     #[test]

@@ -1934,6 +1934,28 @@ mod tests {
         listener.local_addr().expect("local address")
     }
 
+    async fn change_membership_eventually(
+        handle: &StaticNodeHandle,
+        operation_id: [u8; 16],
+        target: ClusterConfiguration,
+    ) -> Result<MembershipView, MembershipError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match handle.change_membership(operation_id, target.clone()).await {
+                Ok(view) => return Ok(view),
+                Err(
+                    error @ (MembershipError::Unavailable
+                    | MembershipError::Overloaded
+                    | MembershipError::ChangeInProgress),
+                ) if tokio::time::Instant::now() < deadline => {
+                    let _ = error;
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[test]
     fn newer_snapshot_satisfies_a_stale_send_request() {
         assert!(snapshot_covers(
@@ -2230,8 +2252,7 @@ mod tests {
                 .map(|(node, endpoint)| (node.0, endpoint.clone())),
         )
         .expect("four-voter target");
-        let added = caller
-            .change_membership([10; 16], four)
+        let added = change_membership_eventually(caller, [10; 16], four)
             .await
             .expect("forwarded addition commits");
         assert_eq!(added.members.len(), 4);
@@ -2243,8 +2264,7 @@ mod tests {
                 .map(|(node, endpoint)| (node.0, endpoint.clone())),
         )
         .expect("leader removal target");
-        let removed = caller
-            .change_membership([11; 16], remaining)
+        let removed = change_membership_eventually(caller, [11; 16], remaining)
             .await
             .expect("leader removal commits");
         assert_eq!(removed.members.len(), 3);

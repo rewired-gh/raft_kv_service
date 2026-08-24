@@ -343,4 +343,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn membership_decoder_rejects_every_structural_boundary() {
+        let membership = MembershipEntry::initial(configuration(&[1]));
+        let encoded = encode_membership(&membership).expect("encode membership");
+
+        let mut impossible_member_count = encoded.clone();
+        impossible_member_count[25..29].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut invalid_utf8_endpoint = encoded.clone();
+        invalid_utf8_endpoint[41] = 0xff;
+
+        let mut zero_node = encoded.clone();
+        zero_node[29..37].copy_from_slice(&0_u64.to_be_bytes());
+
+        let mut empty_endpoint = encoded.clone();
+        empty_endpoint[37..41].copy_from_slice(&0_u32.to_be_bytes());
+
+        for (malformed, expected) in [
+            (impossible_member_count, ConfigurationError::InvalidEncoding),
+            (invalid_utf8_endpoint, ConfigurationError::InvalidEncoding),
+            (zero_node, ConfigurationError::ZeroNodeId),
+            (empty_endpoint, ConfigurationError::InvalidEndpoint),
+        ] {
+            assert_eq!(decode_membership(&malformed), Err(expected));
+        }
+
+        for length in 0..encoded.len() {
+            assert_eq!(
+                decode_membership(&encoded[..length]),
+                Err(ConfigurationError::InvalidEncoding),
+                "prefix of length {length} must not decode"
+            );
+        }
+    }
 }

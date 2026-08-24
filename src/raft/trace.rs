@@ -659,6 +659,29 @@ mod tests {
         ))
     }
 
+    fn trace_record(action: TraceAction) -> TraceRecord {
+        TraceRecord {
+            sequence: 0,
+            action,
+            node: 1,
+            peer: None,
+            term: None,
+            index: None,
+            message: None,
+            accepted: None,
+        }
+    }
+
+    fn trace(mut records: Vec<TraceRecord>) -> ProtocolTrace {
+        for (sequence, record) in records.iter_mut().enumerate() {
+            record.sequence = u64::try_from(sequence).expect("bounded sequence");
+        }
+        ProtocolTrace {
+            schema_version: TRACE_SCHEMA_VERSION,
+            records,
+        }
+    }
+
     #[test]
     fn simulation_trace_round_trips_and_validates() {
         let mut simulation =
@@ -693,6 +716,174 @@ mod tests {
             trace.validate_m2_abstraction(),
             Err(TraceError::AcknowledgementBeforeDurableLog(0))
         );
+    }
+
+    #[test]
+    fn m2_validator_rejects_each_persistence_order_violation() {
+        let mut unsupported = trace(Vec::new());
+        unsupported.schema_version += 1;
+        assert!(matches!(
+            unsupported.validate_m2_abstraction(),
+            Err(TraceError::UnsupportedSchema(_))
+        ));
+
+        let mut non_contiguous = trace(vec![trace_record(TraceAction::ElectionTimeout)]);
+        non_contiguous.records[0].sequence = 7;
+        assert!(matches!(
+            non_contiguous.validate_m2_abstraction(),
+            Err(TraceError::NonContiguousSequence {
+                expected: 0,
+                found: 7
+            })
+        ));
+
+        let missing_term = trace(vec![trace_record(TraceAction::HardStatePersisted)]);
+        assert!(matches!(
+            missing_term.validate_m2_abstraction(),
+            Err(TraceError::MissingField { field: "term", .. })
+        ));
+
+        let mut hard_two = trace_record(TraceAction::HardStatePersisted);
+        hard_two.term = Some(2);
+        let mut hard_one = hard_two.clone();
+        hard_one.term = Some(1);
+        assert!(matches!(
+            trace(vec![hard_two.clone(), hard_one]).validate_m2_abstraction(),
+            Err(TraceError::TermRegression(1))
+        ));
+
+        let mut log_two = trace_record(TraceAction::LogPersisted);
+        log_two.index = Some(2);
+        let mut commit_two = trace_record(TraceAction::CommitAdvanced);
+        commit_two.index = Some(2);
+        let mut log_one = log_two.clone();
+        log_one.index = Some(1);
+        assert!(matches!(
+            trace(vec![log_two.clone(), commit_two.clone(), log_one]).validate_m2_abstraction(),
+            Err(TraceError::DurableLogBelowCommit(2))
+        ));
+
+        let mut commit_one = commit_two.clone();
+        commit_one.index = Some(1);
+        assert!(matches!(
+            trace(vec![log_two.clone(), commit_two.clone(), commit_one]).validate_m2_abstraction(),
+            Err(TraceError::CommitRegression(2))
+        ));
+        assert!(matches!(
+            trace(vec![commit_two.clone()]).validate_m2_abstraction(),
+            Err(TraceError::CommitBeyondDurableLog(0))
+        ));
+
+        let mut applied_two = trace_record(TraceAction::EntriesApplied);
+        applied_two.index = Some(2);
+        assert!(matches!(
+            trace(vec![applied_two.clone()]).validate_m2_abstraction(),
+            Err(TraceError::ApplicationBeyondCommit(0))
+        ));
+        let mut applied_one = applied_two.clone();
+        applied_one.index = Some(1);
+        assert!(matches!(
+            trace(vec![log_two, commit_two, applied_two, applied_one]).validate_m2_abstraction(),
+            Err(TraceError::ApplicationRegression(3))
+        ));
+    }
+
+    #[test]
+    fn m2_validator_binds_every_sent_message_to_durable_state() {
+        let sent = trace_record(TraceAction::MessageSent);
+        assert!(matches!(
+            trace(vec![sent.clone()]).validate_m2_abstraction(),
+            Err(TraceError::MissingField {
+                field: "message",
+                ..
+            })
+        ));
+
+        let mut vote = sent.clone();
+        vote.message = Some(TraceMessage::RequestVote);
+        vote.term = Some(1);
+        assert!(matches!(
+            trace(vec![vote]).validate_m2_abstraction(),
+            Err(TraceError::MessageBeforeHardState(0))
+        ));
+
+        let mut hard = trace_record(TraceAction::HardStatePersisted);
+        hard.term = Some(1);
+        let mut append = sent.clone();
+        append.message = Some(TraceMessage::AppendEntries);
+        append.term = Some(1);
+        append.index = Some(1);
+        assert!(matches!(
+            trace(vec![hard.clone(), append]).validate_m2_abstraction(),
+            Err(TraceError::AppendBeforeDurableLog(1))
+        ));
+
+        let mut rejected = sent;
+        rejected.message = Some(TraceMessage::AppendEntriesResponse);
+        rejected.term = Some(1);
+        rejected.index = Some(9);
+        rejected.accepted = Some(false);
+        trace(vec![hard, rejected])
+            .validate_m2_abstraction()
+            .expect("a rejection does not acknowledge a durable index");
+    }
+
+    #[test]
+    fn m4_validator_rejects_each_snapshot_causality_violation() {
+        let mut applied = trace_record(TraceAction::EntriesApplied);
+        applied.index = Some(2);
+        let mut durable = trace_record(TraceAction::LogPersisted);
+        durable.index = Some(2);
+        let mut committed = trace_record(TraceAction::CommitAdvanced);
+        committed.index = Some(2);
+        let prefix = [durable, committed, applied];
+
+        for (index, term) in [(0, 1), (1, 0), (3, 1)] {
+            let mut published = trace_record(TraceAction::SnapshotPublished);
+            published.index = Some(index);
+            published.term = Some(term);
+            assert!(matches!(
+                trace(prefix.iter().cloned().chain([published]).collect())
+                    .validate_m4_abstraction(),
+                Err(TraceError::InvalidSnapshotPublication(3))
+            ));
+        }
+
+        let mut published_two = trace_record(TraceAction::SnapshotPublished);
+        published_two.index = Some(2);
+        published_two.term = Some(1);
+        let mut published_one = published_two.clone();
+        published_one.index = Some(1);
+        assert!(matches!(
+            trace(
+                prefix
+                    .iter()
+                    .cloned()
+                    .chain([published_two.clone(), published_one])
+                    .collect()
+            )
+            .validate_m4_abstraction(),
+            Err(TraceError::SnapshotRegression(4))
+        ));
+
+        let mut transfer = trace_record(TraceAction::SnapshotTransferStarted);
+        transfer.peer = Some(2);
+        transfer.index = Some(1);
+        transfer.term = Some(1);
+        assert!(matches!(
+            trace(vec![transfer]).validate_m4_abstraction(),
+            Err(TraceError::UnknownSnapshotTransfer(0))
+        ));
+
+        let mut install = trace_record(TraceAction::SnapshotInstalled);
+        install.node = 2;
+        install.peer = Some(1);
+        install.index = Some(2);
+        install.term = Some(1);
+        assert!(matches!(
+            trace(vec![install]).validate_m4_abstraction(),
+            Err(TraceError::InstallWithoutTransfer(0))
+        ));
     }
 
     #[test]

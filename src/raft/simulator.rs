@@ -117,14 +117,6 @@ impl ClusterSimulator {
                 max: election_timeout_max,
             });
         }
-        election_timeout_max
-            .checked_sub(election_timeout_min)
-            .and_then(|width| width.checked_add(1))
-            .ok_or(SimError::InvalidElectionTimeoutRange {
-                min: election_timeout_min,
-                max: election_timeout_max,
-            })?;
-
         let ids = ids.into_iter().collect::<Vec<_>>();
         let voters = VoterSet::new(ids.iter().copied())?;
         let mut nodes = BTreeMap::new();
@@ -717,14 +709,9 @@ impl ClusterSimulator {
     }
 
     fn reset_election_deadline(&mut self, node: NodeId) -> Result<(), SimError> {
-        let width = self
-            .election_timeout_max
-            .checked_sub(self.election_timeout_min)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(SimError::InvalidElectionTimeoutRange {
-                min: self.election_timeout_min,
-                max: self.election_timeout_max,
-            })?;
+        // Construction establishes `0 < min <= max`; therefore the inclusive
+        // width is in `1..=u64::MAX` and cannot underflow or overflow.
+        let width = self.election_timeout_max - self.election_timeout_min + 1;
         let timeout = self.election_timeout_min + self.next_random() % width;
         let deadline = self
             .now
@@ -866,6 +853,85 @@ mod tests {
     fn three_nodes() -> ClusterSimulator {
         ClusterSimulator::new([NodeId(1), NodeId(2), NodeId(3)])
             .expect("simulator configuration is valid")
+    }
+
+    #[test]
+    fn public_fault_controls_reject_every_invalid_state() {
+        for (minimum, maximum) in [(0, 1), (2, 1)] {
+            assert!(matches!(
+                ClusterSimulator::new_with_seed([NodeId(1)], 1, minimum, maximum),
+                Err(SimError::InvalidElectionTimeoutRange { .. })
+            ));
+        }
+
+        let mut simulation = three_nodes();
+        assert!(matches!(
+            simulation.restart(NodeId(1)),
+            Err(SimError::NodeAlreadyOnline(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.resume(NodeId(1)),
+            Err(SimError::NodeNotPaused(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.duplicate_next_message(NodeId(1), NodeId(2)),
+            Err(SimError::NoMatchingMessage { .. })
+        ));
+        assert!(matches!(
+            simulation.delay_next_message(NodeId(1), NodeId(2)),
+            Err(SimError::NoMatchingMessage { .. })
+        ));
+
+        simulation.pause(NodeId(1)).expect("pause online node");
+        assert!(matches!(
+            simulation.timeout(NodeId(1)),
+            Err(SimError::NodePaused(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.propose(NodeId(1), EntryPayload::Noop),
+            Err(SimError::NodePaused(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.heartbeat(NodeId(1)),
+            Err(SimError::NodePaused(NodeId(1)))
+        ));
+        simulation.resume(NodeId(1)).expect("resume paused node");
+
+        simulation.crash(NodeId(1)).expect("crash online node");
+        assert!(matches!(
+            simulation.crash(NodeId(1)),
+            Err(SimError::NodeOffline(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.pause(NodeId(1)),
+            Err(SimError::NodeOffline(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.fail_next_storage(NodeId(1)),
+            Err(SimError::NodeOffline(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.timeout(NodeId(1)),
+            Err(SimError::NodeOffline(NodeId(1)))
+        ));
+        assert!(matches!(
+            simulation.partition(NodeId(1), NodeId(99)),
+            Err(SimError::UnknownNode(NodeId(99)))
+        ));
+
+        let mut single = ClusterSimulator::new([NodeId(1)]).expect("single node");
+        single.crash(NodeId(1)).expect("crash only node");
+        assert!(matches!(
+            single.advance_to_next_timeout(),
+            Err(SimError::NoElectionDeadline)
+        ));
+
+        let mut limited = three_nodes();
+        limited.timeout(NodeId(1)).expect("schedule persistence");
+        assert!(matches!(
+            limited.run_until_idle(0),
+            Err(SimError::StepLimitExceeded(0))
+        ));
     }
 
     #[test]

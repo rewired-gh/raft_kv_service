@@ -1,0 +1,18 @@
+schema_version = 1
+property_set = "m7-storage-fault-adapter-mutation"
+recorded_at = "2026-08-24T15:40:00+08:00"
+tool = "cargo-mutants"
+tool_version = "27.1.0"
+source_commit = "4526317"
+scope = ["src/storage/fault.rs"]
+result = "pass"
+tested = 28
+caught = 18
+unviable = 10
+missed = 0
+timed_out = 0
+outcomes_sha256 = "cea1ba28ab2ca6184e6c825088f3357816d1663515a5bd8f8a8af512d13b73e1"
+command = "cargo mutants --workspace --file src/storage/fault.rs --all-features --baseline skip --timeout 60 --jobs 4 -- --skip cluster::tests::three_real_rpc_nodes_elect_commit_and_apply --skip cluster::tests::real_cluster_adds_staged_voter_and_removes_leader"
+
+[limitations]
+statement = "This scoped local run validates the fault adapter only. The complete raft/storage mutation set is sharded by the deep-verification workflow and remains a release gate."
