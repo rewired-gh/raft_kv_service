@@ -10,3 +10,7 @@ request_timeout_seconds = 30
 log_filter = "raft_kv_service=debug,tower_http=info"
 log_format = "pretty"
 
+[raft]
+node_id = 1
+data_file = "data/node-1.sqlite3"
+request_queue_capacity = 256

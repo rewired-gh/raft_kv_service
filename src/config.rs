@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -13,6 +14,25 @@ pub struct AppConfig {
     pub service: ServiceConfig,
     pub server: ServerConfig,
     pub telemetry: TelemetryConfig,
+    pub raft: RaftConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct RaftConfig {
+    pub node_id: u64,
+    pub data_file: PathBuf,
+    pub request_queue_capacity: usize,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: 1,
+            data_file: PathBuf::from("data/node-1.sqlite3"),
+            request_queue_capacity: 256,
+        }
+    }
 }
 
 impl AppConfig {

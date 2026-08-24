@@ -2,6 +2,7 @@ pub mod config;
 pub mod http;
 pub mod kv;
 pub mod raft;
+pub mod service;
 pub mod storage;
 pub mod telemetry;
 
@@ -10,15 +11,26 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use config::AppConfig;
 use http::AppState;
+use raft::NodeId;
+use service::KvNodeHandle;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    let node = KvNodeHandle::start_one_node(
+        NodeId(config.raft.node_id),
+        &config.raft.data_file,
+        config.raft.request_queue_capacity,
+    )
+    .context("failed to start the local Raft node")?;
     let address = SocketAddr::new(config.server.host, config.server.port);
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind HTTP listener to {address}"))?;
-    let state = AppState::new(config.service.name);
+    let state = AppState::new(config.service.name).with_executor(move |command| {
+        let node = node.clone();
+        async move { node.execute(command).await }
+    });
     let app = http::router(state.clone(), config.server.request_timeout());
 
     state.set_ready(true);
