@@ -49,9 +49,13 @@ async fn unknown_routes_return_a_stable_error_shape() -> anyhow::Result<()> {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = to_bytes(response.into_body(), 4096).await?;
-    assert_eq!(
-        String::from_utf8(body.to_vec())?,
-        r#"{"code":"not_found","message":"the requested resource does not exist"}"#
+    let problem: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(problem["type"], "urn:raft-kv:error:route-not-found");
+    assert_eq!(problem["status"], 404);
+    assert!(
+        problem["request_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
     );
     Ok(())
 }

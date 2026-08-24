@@ -1,0 +1,167 @@
+openapi: 3.1.0
+info:
+  title: Raft KV Service
+  version: 0.1.0
+  description: >-
+    Linearizable CRUD API for one Raft-replicated key-value namespace. A
+    timeout does not prove that a mutation failed; retry ambiguous mutations
+    with the same client ID, sequence, precondition, key, and body.
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/keys/{key}:
+    parameters:
+      - $ref: '#/components/parameters/Key'
+    get:
+      operationId: readKey
+      summary: Perform a logged linearizable read
+      responses:
+        '200':
+          description: Key found
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Raft-KV-Revision: { $ref: '#/components/headers/Revision' }
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/octet-stream:
+              schema: { type: string, contentEncoding: base64 }
+        '404': { $ref: '#/components/responses/KeyNotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    put:
+      operationId: putKey
+      summary: Conditionally create or update a key
+      description: >-
+        If-None-Match: * selects Create. If-Match: * or an exact strong
+        revision ETag selects Update. Exactly one condition is required.
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/RequestSequence'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, contentEncoding: base64, maxLength: 1048576 }
+      responses:
+        '201':
+          description: Key created
+          headers:
+            Location: { schema: { type: string } }
+            ETag: { $ref: '#/components/headers/ETag' }
+            Raft-KV-Revision: { $ref: '#/components/headers/Revision' }
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        '204':
+          description: Key updated
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Raft-KV-Revision: { $ref: '#/components/headers/Revision' }
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '409': { $ref: '#/components/responses/SequenceConflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '413': { $ref: '#/components/responses/ValueTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      operationId: deleteKey
+      summary: Conditionally delete a key
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/RequestSequence'
+        - $ref: '#/components/parameters/IfMatchRequired'
+      responses:
+        '204':
+          description: Key deleted
+          headers:
+            Raft-KV-Revision: { $ref: '#/components/headers/Revision' }
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '409': { $ref: '#/components/responses/SequenceConflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  parameters:
+    Key:
+      name: key
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9._~-]+$' }
+    ClientId:
+      name: Raft-KV-Client-ID
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+    RequestSequence:
+      name: Raft-KV-Request-Sequence
+      in: header
+      required: true
+      schema: { type: integer, format: uint64, minimum: 1 }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      schema: { type: string, const: '*' }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema: { type: string, pattern: '^(\*|"rev-[1-9][0-9]*")$' }
+    IfMatchRequired:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string, pattern: '^(\*|"rev-[1-9][0-9]*")$' }
+  headers:
+    ETag:
+      schema: { type: string, pattern: '^"rev-[1-9][0-9]*"$' }
+    Revision:
+      schema: { type: integer, format: uint64, minimum: 1 }
+    RequestId:
+      schema: { type: string }
+    CacheControl:
+      schema: { type: string, const: no-store }
+  schemas:
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, detail, request_id]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        request_id: { type: string }
+  responses:
+    InvalidRequest:
+      description: Invalid syntax, key, identity, sequence, or conditional headers
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    KeyNotFound:
+      description: Key absent at the linearization point
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    SequenceConflict:
+      description: Stale, skipped, or conflicting request sequence
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    PreconditionFailed:
+      description: Committed resource precondition evaluated false
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    PreconditionRequired:
+      description: Required conditional request header missing
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    ValueTooLarge:
+      description: Value exceeds the configured maximum
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    UnsupportedMediaType:
+      description: Body is not application/octet-stream
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unavailable:
+      description: No usable leader, overload, or client-record capacity reached
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 0 } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
