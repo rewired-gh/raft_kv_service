@@ -4,12 +4,16 @@ schema_version = 1
 rust = "1.98.0"
 tla_tools = "1.7.4"
 tla_tools_sha256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
-apalache = "0.58.3"
+apalache = "0.62.1"
+apalache_sha256 = "93fef2f381d30465eff906a2d6afa3358cb2c9adf6a8aad3bec0ded4f45432bb"
+coverage_toolchain = "nightly-2026-08-24"
+cargo_llvm_cov = "0.9.0"
+cargo_mutants = "27.1.0"
 
 [policy]
 version_strategy = "reviewed latest-stable updates with immutable lock files and release digests"
-pull_request_checks = ["format", "clippy", "unit", "integration"]
-scheduled_checks = ["extended-model", "fuzz", "mutation", "supply-chain"]
+pull_request_checks = ["format", "clippy", "unit", "integration", "fast-formal", "bounded-fuzz"]
+scheduled_checks = ["extended-model", "inductive", "coverage", "multi-seed-fuzz", "mutation", "supply-chain"]
 
 [[property]]
 id = "election-safety"

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run check fmt lint test formal-setup formal supply-chain docker-dev image reset-local clean
+.PHONY: help setup run check fmt lint test formal-setup formal formal-full formal-inductive formal-container coverage-setup coverage fuzz mutation supply-chain docker-dev image reset-local clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -24,6 +24,7 @@ test: ## Run all tests
 
 formal-setup: ## Fetch checksum-pinned formal tools
 	./scripts/tlc.sh setup
+	./scripts/apalache.sh setup
 
 formal: ## Model-check the fast formal suite
 	./scripts/tlc.sh check formal/RaftElection.cfg
@@ -31,6 +32,32 @@ formal: ## Model-check the fast formal suite
 	./scripts/tlc.sh check formal/KvStateMachine.cfg
 	./scripts/tlc.sh check formal/RaftSnapshot.cfg
 	./scripts/tlc.sh check formal/RaftMembership.cfg
+	./scripts/tlc.sh check formal/RaftLiveness.cfg
+
+formal-inductive: ## Prove inductive safety obligations with Apalache
+	./scripts/apalache.sh check
+
+formal-full: ## Run the published TLC matrix and inductive proof
+	./scripts/formal-matrix.sh
+	./scripts/apalache.sh check
+
+formal-container: ## Run full formal verification in the immutable CI image
+	docker build --file Dockerfile.formal --tag raft-kv-formal:local .
+	mkdir -p target/formal-container
+	docker run --rm --user "$$(id -u):$$(id -g)" --volume "$(CURDIR)/target/formal-container:/evidence" raft-kv-formal:local full
+
+coverage-setup: ## Install the pinned nightly coverage toolchain
+	./scripts/coverage.sh setup
+
+coverage: ## Run tests and real-process campaigns with coverage gates
+	./scripts/coverage.sh check
+
+fuzz: ## Run a reproducible real-process fuzz campaign (SEED/OPS optional)
+	cargo build --locked --bins
+	./target/debug/raft-kv-fuzz --seed "$${SEED:-424242}" --operations "$${OPS:-12}" --cluster-size "$${NODES:-3}" --artifact-dir "target/fuzz/$${SEED:-424242}-$${NODES:-3}"
+
+mutation: ## Mutation-test consensus and persistence modules
+	cargo mutants --workspace --file 'src/raft/*.rs' --file 'src/storage/*.rs' --all-features
 
 supply-chain: ## Audit Rust dependencies, licenses, and sources
 	cargo audit

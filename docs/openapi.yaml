@@ -290,6 +290,9 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     PreconditionFailed:
       description: Committed resource precondition evaluated false
+      headers:
+        Raft-KV-Revision:
+          $ref: '#/components/headers/Revision'
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     PreconditionRequired:
       description: Required conditional request header missing

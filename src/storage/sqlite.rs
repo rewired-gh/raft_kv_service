@@ -17,9 +17,10 @@ use super::{
 };
 use crate::{
     kv::{
-        ClientId, Command, CommandError, CommandResult, Mutation, MutationResult, ReadResult,
-        ValueRecord, decode_command, decode_command_result, decode_mutation_result,
-        encode_command_result, encode_mutation_result, fingerprint, validate_key,
+        ClientId, Command, CommandError, CommandResult, MAX_KEY_BYTES, MAX_VALUE_BYTES, Mutation,
+        MutationResult, ReadResult, ValueRecord, decode_command, decode_command_result,
+        decode_mutation_result, encode_command_result, encode_mutation_result, fingerprint,
+        validate_command_limits, validate_key,
     },
     raft::{
         ConfigurationPhase, EntryPayload, HardState, LogEntry, LogPosition, MembershipEntry,
@@ -27,10 +28,27 @@ use crate::{
     },
 };
 
-pub const STORAGE_SCHEMA_VERSION: u32 = 5;
+pub const STORAGE_SCHEMA_VERSION: u32 = 6;
 const SCHEMA_VERSION: i64 = STORAGE_SCHEMA_VERSION as i64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageLimits {
+    pub max_clients: u64,
+    pub max_key_bytes: u64,
+    pub max_value_bytes: u64,
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self {
+            max_clients: DEFAULT_MAX_CLIENTS,
+            max_key_bytes: MAX_KEY_BYTES as u64,
+            max_value_bytes: MAX_VALUE_BYTES as u64,
+        }
+    }
+}
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -51,12 +69,25 @@ impl SqliteStorage {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with_max_clients(path, DEFAULT_MAX_CLIENTS)
+        Self::open_with_limits(path, StorageLimits::default())
     }
 
     pub fn open_with_max_clients(
         path: impl AsRef<Path>,
         max_clients: u64,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_limits(
+            path,
+            StorageLimits {
+                max_clients,
+                ..StorageLimits::default()
+            },
+        )
+    }
+
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
     ) -> Result<Self, StorageError> {
         let process_lock = acquire_process_lock(path.as_ref())?;
         let connection = Connection::open_with_flags(
@@ -65,14 +96,14 @@ impl SqliteStorage {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Self::initialize(connection, true, max_clients, Some(process_lock))
+        Self::initialize(connection, true, limits, Some(process_lock))
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         Self::initialize(
             Connection::open_in_memory()?,
             false,
-            DEFAULT_MAX_CLIENTS,
+            StorageLimits::default(),
             None,
         )
     }
@@ -80,11 +111,16 @@ impl SqliteStorage {
     fn initialize(
         connection: Connection,
         file_backed: bool,
-        max_clients: u64,
+        limits: StorageLimits,
         process_lock: Option<File>,
     ) -> Result<Self, StorageError> {
-        if max_clients == 0 {
-            return Err(StorageError::InvalidMaxClients(max_clients));
+        if limits.max_clients == 0
+            || limits.max_key_bytes == 0
+            || limits.max_value_bytes == 0
+            || limits.max_key_bytes > MAX_KEY_BYTES as u64
+            || limits.max_value_bytes > MAX_VALUE_BYTES as u64
+        {
+            return Err(StorageError::InvalidLimits(limits));
         }
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
@@ -120,7 +156,9 @@ impl SqliteStorage {
             CREATE TABLE IF NOT EXISTS state_machine_meta (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_applied BLOB NOT NULL CHECK (length(last_applied) = 8),
-                max_clients BLOB NOT NULL CHECK (length(max_clients) = 8)
+                max_clients BLOB NOT NULL CHECK (length(max_clients) = 8),
+                max_key_bytes BLOB NOT NULL CHECK (length(max_key_bytes) = 8),
+                max_value_bytes BLOB NOT NULL CHECK (length(max_value_bytes) = 8)
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS kv_state (
@@ -161,9 +199,15 @@ impl SqliteStorage {
             ",
         )?;
         connection.execute(
-            "INSERT OR IGNORE INTO state_machine_meta(singleton, last_applied, max_clients)
-             VALUES (1, ?1, ?2)",
-            params![encode_u64(0).as_slice(), encode_u64(max_clients).as_slice()],
+            "INSERT OR IGNORE INTO state_machine_meta(
+                singleton, last_applied, max_clients, max_key_bytes, max_value_bytes
+             ) VALUES (1, ?1, ?2, ?3, ?4)",
+            params![
+                encode_u64(0).as_slice(),
+                encode_u64(limits.max_clients).as_slice(),
+                encode_u64(limits.max_key_bytes).as_slice(),
+                encode_u64(limits.max_value_bytes).as_slice(),
+            ],
         )?;
 
         let user_version: i64 =
@@ -185,11 +229,11 @@ impl SqliteStorage {
             _process_lock: process_lock,
         };
         storage.validate()?;
-        let (_, persisted_max_clients) = load_state_machine_meta(&storage.connection)?;
-        if persisted_max_clients != max_clients {
-            return Err(StorageError::MaxClientsMismatch {
-                configured: max_clients,
-                persisted: persisted_max_clients,
+        let (_, persisted_limits) = load_state_machine_meta(&storage.connection)?;
+        if persisted_limits != limits {
+            return Err(StorageError::LimitsMismatch {
+                configured: limits,
+                persisted: persisted_limits,
             });
         }
         Ok(storage)
@@ -391,7 +435,7 @@ impl StateMachineStorage for SqliteStorage {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (mut last_applied, max_clients) = load_state_machine_meta(&transaction)?;
+        let (mut last_applied, limits) = load_state_machine_meta(&transaction)?;
         let mut applied = Vec::with_capacity(entries.len());
         for entry in entries {
             if load_entry(&transaction, entry.index)?.as_ref() != Some(entry) {
@@ -419,12 +463,7 @@ impl StateMachineStorage for SqliteStorage {
                 EntryPayload::Noop => None,
                 EntryPayload::Command(encoded) => {
                     let command = decode_command(encoded).map_err(StorageError::Command)?;
-                    Some(apply_command(
-                        &transaction,
-                        entry.index,
-                        &command,
-                        max_clients,
-                    )?)
+                    Some(apply_command(&transaction, entry.index, &command, limits)?)
                 }
                 EntryPayload::Configuration(configuration) => {
                     if configuration.phase == ConfigurationPhase::Stable {
@@ -508,7 +547,7 @@ impl SnapshotStorage for SqliteStorage {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (last_applied, max_clients) = load_state_machine_meta(&transaction)?;
+        let (last_applied, limits) = load_state_machine_meta(&transaction)?;
         if last_applied == 0 {
             return Err(StorageError::SnapshotAppliedEntryMissingTerm(0));
         }
@@ -522,13 +561,8 @@ impl SnapshotStorage for SqliteStorage {
         {
             return Ok(current);
         }
-        let payload = encode_snapshot_payload(
-            &transaction,
-            cluster_id,
-            last_included,
-            membership,
-            max_clients,
-        )?;
+        let payload =
+            encode_snapshot_payload(&transaction, cluster_id, last_included, membership, limits)?;
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let snapshot = Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
@@ -562,17 +596,17 @@ impl SnapshotStorage for SqliteStorage {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (last_applied, configured_max_clients) = load_state_machine_meta(&transaction)?;
+        let (last_applied, configured_limits) = load_state_machine_meta(&transaction)?;
         if snapshot.last_included.index < last_applied {
             return Err(StorageError::OlderSnapshot {
                 received: snapshot.last_included.index,
                 applied: last_applied,
             });
         }
-        if decoded.max_clients != configured_max_clients {
-            return Err(StorageError::MaxClientsMismatch {
-                configured: configured_max_clients,
-                persisted: decoded.max_clients,
+        if decoded.limits != configured_limits {
+            return Err(StorageError::LimitsMismatch {
+                configured: configured_limits,
+                persisted: decoded.limits,
             });
         }
         if let Some(current) = load_snapshot(&transaction)?
@@ -651,7 +685,7 @@ struct SnapshotClient {
 
 #[derive(Debug)]
 struct DecodedSnapshot {
-    max_clients: u64,
+    limits: StorageLimits,
     keys: Vec<SnapshotKey>,
     clients: Vec<SnapshotClient>,
     membership_operations: Vec<MembershipEntry>,
@@ -674,7 +708,7 @@ fn encode_snapshot_payload(
     cluster_id: [u8; 16],
     last_included: LogPosition,
     membership: &MembershipEntry,
-    max_clients: u64,
+    limits: StorageLimits,
 ) -> Result<Vec<u8>, StorageError> {
     let mut output = Vec::new();
     output.extend_from_slice(SNAPSHOT_MAGIC);
@@ -686,7 +720,9 @@ fn encode_snapshot_payload(
         &mut output,
         &encode_membership(membership).map_err(|_| StorageError::InvalidConfiguration)?,
     )?;
-    put_u64(&mut output, max_clients);
+    put_u64(&mut output, limits.max_clients);
+    put_u64(&mut output, limits.max_key_bytes);
+    put_u64(&mut output, limits.max_value_bytes);
 
     let mut statement =
         connection.prepare("SELECT key, value, revision FROM kv_state ORDER BY key ASC")?;
@@ -797,12 +833,27 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
     {
         return Err(StorageError::SnapshotEncoding);
     }
-    let max_clients = input.u64()?;
+    let limits = StorageLimits {
+        max_clients: input.u64()?,
+        max_key_bytes: input.u64()?,
+        max_value_bytes: input.u64()?,
+    };
+    if limits.max_clients == 0
+        || limits.max_key_bytes == 0
+        || limits.max_value_bytes == 0
+        || limits.max_key_bytes > MAX_KEY_BYTES as u64
+        || limits.max_value_bytes > MAX_VALUE_BYTES as u64
+    {
+        return Err(StorageError::InvalidLimits(limits));
+    }
     let key_count = input.count()?;
     let mut keys = Vec::new();
     for _ in 0..key_count {
         let key = String::from_utf8(input.bytes()?).map_err(|_| StorageError::SnapshotEncoding)?;
         validate_key(&key).map_err(StorageError::Command)?;
+        if key.len() as u64 > limits.max_key_bytes {
+            return Err(StorageError::SnapshotEncoding);
+        }
         if keys
             .last()
             .is_some_and(|previous: &SnapshotKey| previous.key.as_str() >= key.as_str())
@@ -810,6 +861,9 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
             return Err(StorageError::SnapshotEncoding);
         }
         let value = input.bytes()?;
+        if value.len() as u64 > limits.max_value_bytes {
+            return Err(StorageError::SnapshotEncoding);
+        }
         let revision = input.u64()?;
         if revision == 0 || revision > position.index {
             return Err(StorageError::SnapshotEncoding);
@@ -867,11 +921,11 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
         previous_operation = Some(operation_id);
         membership_operations.push(operation);
     }
-    if !input.is_empty() || u64::try_from(clients.len()).unwrap_or(u64::MAX) > max_clients {
+    if !input.is_empty() || u64::try_from(clients.len()).unwrap_or(u64::MAX) > limits.max_clients {
         return Err(StorageError::SnapshotEncoding);
     }
     Ok(DecodedSnapshot {
-        max_clients,
+        limits,
         keys,
         clients,
         membership_operations,
@@ -1061,8 +1115,14 @@ fn apply_command(
     transaction: &Transaction<'_>,
     revision: u64,
     command: &Command,
-    max_clients: u64,
+    limits: StorageLimits,
 ) -> Result<CommandResult, StorageError> {
+    validate_command_limits(
+        command,
+        usize::try_from(limits.max_key_bytes).map_err(|_| StorageError::InvalidLimits(limits))?,
+        usize::try_from(limits.max_value_bytes).map_err(|_| StorageError::InvalidLimits(limits))?,
+    )
+    .map_err(StorageError::Command)?;
     match command {
         Command::Read { key } => Ok(CommandResult::Read(load_value(transaction, key)?.map_or(
             ReadResult::NotFound,
@@ -1111,7 +1171,7 @@ fn apply_command(
                         .query_row("SELECT COUNT(*) FROM client_sessions", [], |row| row.get(0))?;
                 let client_count = u64::try_from(client_count)
                     .map_err(|_| StorageError::InvalidClientCount(client_count))?;
-                if client_count >= max_clients {
+                if client_count >= limits.max_clients {
                     return Ok(CommandResult::Mutation(
                         MutationResult::ClientCapacityReached,
                     ));
@@ -1252,15 +1312,25 @@ fn load_client(
     .transpose()
 }
 
-fn load_state_machine_meta(connection: &Connection) -> Result<(u64, u64), StorageError> {
-    let (last_applied, max_clients): (Vec<u8>, Vec<u8>) = connection.query_row(
-        "SELECT last_applied, max_clients FROM state_machine_meta WHERE singleton = 1",
+fn load_state_machine_meta(connection: &Connection) -> Result<(u64, StorageLimits), StorageError> {
+    let (last_applied, max_clients, max_key_bytes, max_value_bytes): (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = connection.query_row(
+        "SELECT last_applied, max_clients, max_key_bytes, max_value_bytes
+         FROM state_machine_meta WHERE singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     Ok((
         decode_u64("last_applied", &last_applied)?,
-        decode_u64("max_clients", &max_clients)?,
+        StorageLimits {
+            max_clients: decode_u64("max_clients", &max_clients)?,
+            max_key_bytes: decode_u64("max_key_bytes", &max_key_bytes)?,
+            max_value_bytes: decode_u64("max_value_bytes", &max_value_bytes)?,
+        },
     ))
 }
 
@@ -1500,31 +1570,62 @@ pub enum StorageError {
     Io(std::io::Error),
     DataFileLocked(PathBuf),
     Sqlite(rusqlite::Error),
-    UnsupportedSchemaVersion { expected: i64, found: i64 },
+    UnsupportedSchemaVersion {
+        expected: i64,
+        found: i64,
+    },
     IntegrityCheckFailed(String),
-    InvalidIntegerEncoding { field: &'static str, length: usize },
+    InvalidIntegerEncoding {
+        field: &'static str,
+        length: usize,
+    },
     InvalidFingerprintEncoding(usize),
     InvalidClientCount(i64),
-    InvalidMaxClients(u64),
-    MaxClientsMismatch { configured: u64, persisted: u64 },
+    InvalidLimits(StorageLimits),
+    LimitsMismatch {
+        configured: StorageLimits,
+        persisted: StorageLimits,
+    },
     UnsupportedSnapshotFormat(u32),
     SnapshotDigestMismatch,
     SnapshotClusterMismatch,
     InvalidSnapshotVoters,
     SnapshotAppliedEntryMissingTerm(u64),
-    OlderSnapshot { received: u64, applied: u64 },
+    OlderSnapshot {
+        received: u64,
+        applied: u64,
+    },
     SnapshotConflict(u64),
     SnapshotEncoding,
     InvalidConfiguration,
     MembershipOperationConflict,
     Command(CommandError),
-    HardStateRegression { current: HardState, next: HardState },
-    InvalidLogEntry { index: u64, term: Term },
-    NonContiguousLog { expected: u64, found: u64 },
-    NonContiguousApplication { expected: u64, found: u64 },
-    ApplicationLogMismatch { index: u64 },
-    MissingAppliedResult { index: u64 },
-    AppliedBeyondLog { last_applied: u64, last_log: u64 },
+    HardStateRegression {
+        current: HardState,
+        next: HardState,
+    },
+    InvalidLogEntry {
+        index: u64,
+        term: Term,
+    },
+    NonContiguousLog {
+        expected: u64,
+        found: u64,
+    },
+    NonContiguousApplication {
+        expected: u64,
+        found: u64,
+    },
+    ApplicationLogMismatch {
+        index: u64,
+    },
+    MissingAppliedResult {
+        index: u64,
+    },
+    AppliedBeyondLog {
+        last_applied: u64,
+        last_log: u64,
+    },
     IndexExhausted,
 }
 
@@ -1562,18 +1663,15 @@ impl Display for StorageError {
             Self::InvalidClientCount(count) => {
                 write!(formatter, "invalid persisted client count {count}")
             }
-            Self::InvalidMaxClients(value) => {
-                write!(
-                    formatter,
-                    "maximum client count must be positive, got {value}"
-                )
+            Self::InvalidLimits(limits) => {
+                write!(formatter, "invalid replicated storage limits: {limits:?}")
             }
-            Self::MaxClientsMismatch {
+            Self::LimitsMismatch {
                 configured,
                 persisted,
             } => write!(
                 formatter,
-                "configured maximum client count {configured} does not match persisted value {persisted}"
+                "configured replicated limits {configured:?} do not match persisted limits {persisted:?}"
             ),
             Self::UnsupportedSnapshotFormat(version) => {
                 write!(formatter, "unsupported snapshot format version {version}")
@@ -1992,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_client_capacity_rejects_configuration_drift() {
+    fn persisted_command_limits_reject_configuration_drift() {
         let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "raft-kv-capacity-test-{}-{suffix}",
@@ -2000,16 +2098,100 @@ mod tests {
         ));
         std::fs::create_dir(&directory).expect("create temporary directory");
         let path = directory.join("capacity.sqlite3");
-        drop(SqliteStorage::open_with_max_clients(&path, 7).expect("create storage"));
+        let persisted = StorageLimits {
+            max_clients: 7,
+            max_key_bytes: 64,
+            max_value_bytes: 4_096,
+        };
+        drop(SqliteStorage::open_with_limits(&path, persisted).expect("create storage"));
+        let configured = StorageLimits {
+            max_clients: 8,
+            ..persisted
+        };
         assert!(matches!(
-            SqliteStorage::open_with_max_clients(&path, 8),
-            Err(StorageError::MaxClientsMismatch {
-                configured: 8,
-                persisted: 7,
-            })
+            SqliteStorage::open_with_limits(&path, configured),
+            Err(StorageError::LimitsMismatch {
+                configured: found_configured,
+                persisted: found_persisted,
+            }) if found_configured == configured && found_persisted == persisted
         ));
-        drop(SqliteStorage::open_with_max_clients(&path, 7).expect("matching capacity reopens"));
+        drop(SqliteStorage::open_with_limits(&path, persisted).expect("matching limits reopen"));
         std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn replicated_limits_bound_application_and_snapshot_compatibility() {
+        let limits = StorageLimits {
+            max_clients: 7,
+            max_key_bytes: 8,
+            max_value_bytes: 4,
+        };
+        let mut source = SqliteStorage::initialize(
+            Connection::open_in_memory().expect("connection"),
+            false,
+            limits,
+            None,
+        )
+        .expect("limited source");
+        let valid = command_entry(
+            1,
+            1,
+            Mutation::Create {
+                key: "bounded".into(),
+                value: vec![1, 2, 3, 4],
+            },
+        );
+        source.append_local(&valid).expect("append valid command");
+        source
+            .apply_committed(std::slice::from_ref(&valid))
+            .expect("apply command at configured limit");
+
+        let invalid = command_entry(
+            2,
+            2,
+            Mutation::Update {
+                key: "bounded".into(),
+                value: vec![1, 2, 3, 4, 5],
+                expected_revision: Some(1),
+            },
+        );
+        source
+            .append_local(&invalid)
+            .expect("append replicated bytes");
+        assert!(matches!(
+            source.apply_committed(std::slice::from_ref(&invalid)),
+            Err(StorageError::Command(CommandError::FieldTooLarge))
+        ));
+        assert_eq!(source.last_applied().expect("application rolled back"), 1);
+
+        let snapshot = source
+            .create_snapshot([7; 16], &membership(&[1]))
+            .expect("snapshot includes configured limits");
+        let mut incompatible = SqliteStorage::open_in_memory().expect("default target");
+        assert!(matches!(
+            incompatible.install_snapshot([7; 16], &snapshot),
+            Err(StorageError::LimitsMismatch {
+                configured,
+                persisted,
+            }) if configured == StorageLimits::default() && persisted == limits
+        ));
+        let mut compatible = SqliteStorage::initialize(
+            Connection::open_in_memory().expect("connection"),
+            false,
+            limits,
+            None,
+        )
+        .expect("limited target");
+        compatible
+            .install_snapshot([7; 16], &snapshot)
+            .expect("matching target accepts snapshot");
+        assert_eq!(
+            compatible.value("bounded").expect("restored value"),
+            Some(ValueRecord {
+                value: vec![1, 2, 3, 4],
+                revision: 1,
+            })
+        );
     }
 
     #[test]
@@ -2030,7 +2212,7 @@ mod tests {
         assert!(matches!(
             SqliteStorage::open(&path),
             Err(StorageError::UnsupportedSchemaVersion {
-                expected: 5,
+                expected: 6,
                 found: 4,
             })
         ));
@@ -2143,5 +2325,123 @@ mod tests {
             Err(StorageError::SnapshotDigestMismatch)
         ));
         assert_eq!(target.last_applied().expect("unchanged target"), 0);
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_each_canonical_header_and_bound_violation() {
+        let mut source = SqliteStorage::open_in_memory().expect("source");
+        let create = command_entry(
+            1,
+            1,
+            Mutation::Create {
+                key: "bounded".into(),
+                value: b"value".to_vec(),
+            },
+        );
+        source.append_local(&create).expect("append");
+        source.apply_committed(&[create]).expect("apply");
+        let snapshot = source
+            .create_snapshot([3; 16], &membership(&[1]))
+            .expect("snapshot");
+        let membership_length = u64::from_be_bytes(
+            snapshot.payload[44..52]
+                .try_into()
+                .expect("membership length"),
+        ) as usize;
+        let limits = 52 + membership_length;
+        let key_count = limits + 24;
+        let key_length = key_count + 8;
+        let key = key_length + 8;
+        let value_length = key + "bounded".len();
+        let value = value_length + 8;
+        let revision = value + b"value".len();
+
+        assert_snapshot_rejected(snapshot.clone(), |payload| payload[0] ^= 1);
+        assert_snapshot_rejected(snapshot.clone(), |payload| write_u32_at(payload, 8, 99));
+        assert_snapshot_rejected(snapshot.clone(), |payload| payload[12] ^= 1);
+        assert_snapshot_rejected(snapshot.clone(), |payload| write_u64_at(payload, 28, 2));
+        assert_snapshot_rejected(snapshot.clone(), |payload| write_u64_at(payload, 36, 0));
+        for offset in [limits, limits + 8, limits + 16] {
+            assert_snapshot_rejected(snapshot.clone(), |payload| write_u64_at(payload, offset, 0));
+        }
+        assert_snapshot_rejected(snapshot.clone(), |payload| {
+            write_u64_at(payload, limits + 8, 3)
+        });
+        assert_snapshot_rejected(snapshot.clone(), |payload| {
+            write_u64_at(payload, limits + 16, 4)
+        });
+        assert_snapshot_rejected(snapshot.clone(), |payload| {
+            write_u64_at(payload, revision, 0)
+        });
+        assert_snapshot_rejected(snapshot.clone(), |payload| {
+            write_u64_at(payload, revision, 2)
+        });
+        assert_snapshot_rejected(snapshot.clone(), |payload| payload.push(0));
+        assert_eq!(
+            u64::from_be_bytes(
+                snapshot.payload[key_length..key]
+                    .try_into()
+                    .expect("key length")
+            ),
+            7
+        );
+        assert_eq!(
+            u64::from_be_bytes(
+                snapshot.payload[value_length..value]
+                    .try_into()
+                    .expect("value length")
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn invalid_replicated_limit_components_fail_closed() {
+        for limits in [
+            StorageLimits {
+                max_clients: 0,
+                ..StorageLimits::default()
+            },
+            StorageLimits {
+                max_key_bytes: 0,
+                ..StorageLimits::default()
+            },
+            StorageLimits {
+                max_value_bytes: 0,
+                ..StorageLimits::default()
+            },
+            StorageLimits {
+                max_key_bytes: MAX_KEY_BYTES as u64 + 1,
+                ..StorageLimits::default()
+            },
+            StorageLimits {
+                max_value_bytes: MAX_VALUE_BYTES as u64 + 1,
+                ..StorageLimits::default()
+            },
+        ] {
+            assert!(matches!(
+                SqliteStorage::initialize(
+                    Connection::open_in_memory().expect("connection"),
+                    false,
+                    limits,
+                    None,
+                ),
+                Err(StorageError::InvalidLimits(found)) if found == limits
+            ));
+        }
+    }
+
+    fn assert_snapshot_rejected(mut snapshot: Snapshot, mutate: impl FnOnce(&mut Vec<u8>)) {
+        mutate(&mut snapshot.payload);
+        snapshot.digest = Sha256::digest(&snapshot.payload).into();
+        assert!(decode_snapshot(&snapshot).is_err());
+    }
+
+    fn write_u32_at(payload: &mut [u8], offset: usize, value: u32) {
+        payload[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_u64_at(payload: &mut [u8], offset: usize, value: u64) {
+        payload[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
     }
 }

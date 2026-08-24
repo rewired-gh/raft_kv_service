@@ -4,13 +4,17 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt::{self, Display, Formatter},
+    fs::{File, OpenOptions},
+    io::{self, BufRead, BufReader, BufWriter, Write},
+    path::Path,
+    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
 
 use super::{Envelope, Message, simulator::TraceEvent};
 
-pub const TRACE_SCHEMA_VERSION: u16 = 2;
+pub const TRACE_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +35,8 @@ pub enum TraceAction {
     SnapshotTransferStarted,
     SnapshotTransferInterrupted,
     SnapshotInstalled,
+    StorageFailed,
+    TraceTerminated,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -67,7 +73,202 @@ pub struct ProtocolTrace {
     pub records: Vec<TraceRecord>,
 }
 
+#[derive(Clone)]
+pub struct ProtocolTraceRecorder {
+    inner: Arc<Mutex<RecorderInner>>,
+}
+
+struct RecorderInner {
+    output: BufWriter<File>,
+    next_sequence: u64,
+    observed: Option<ObservedState>,
+}
+
+impl Drop for RecorderInner {
+    fn drop(&mut self) {
+        let node = self.observed.map_or(0, |state| state.node);
+        let _ = self.write(TraceAction::TraceTerminated, node, None, None);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ObservedState {
+    node: u64,
+    term: u64,
+    last_log: u64,
+    commit: u64,
+    applied: u64,
+    snapshot_index: u64,
+    snapshot_term: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TraceFileHeader {
+    schema_version: u16,
+    format: String,
+}
+
+impl ProtocolTraceRecorder {
+    pub fn create(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let mut output = BufWriter::new(file);
+        serde_json::to_writer(
+            &mut output,
+            &TraceFileHeader {
+                schema_version: TRACE_SCHEMA_VERSION,
+                format: "raft-kv-jsonl".to_owned(),
+            },
+        )?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(RecorderInner {
+                output,
+                next_sequence: 0,
+                observed: None,
+            })),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe(
+        &self,
+        node: u64,
+        term: u64,
+        last_log: u64,
+        commit: u64,
+        applied: u64,
+        snapshot_index: u64,
+        snapshot_term: u64,
+    ) -> io::Result<()> {
+        let next = ObservedState {
+            node,
+            term,
+            last_log,
+            commit,
+            applied,
+            snapshot_index,
+            snapshot_term,
+        };
+        if commit > last_log || applied > commit || snapshot_index > applied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "observed Raft indexes violate durable ordering",
+            ));
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("protocol trace recorder poisoned"))?;
+        if let Some(previous) = inner.observed
+            && (previous.node != node
+                || term < previous.term
+                || commit < previous.commit
+                || applied < previous.applied
+                || snapshot_index < previous.snapshot_index
+                || (snapshot_index == previous.snapshot_index
+                    && snapshot_term != previous.snapshot_term))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "observed Raft state regressed",
+            ));
+        }
+        let previous = inner.observed;
+        if previous.is_none_or(|state| term != state.term) && term > 0 {
+            inner.write(TraceAction::HardStatePersisted, node, Some(term), None)?;
+        }
+        if previous.is_none_or(|state| last_log != state.last_log) && last_log > 0 {
+            inner.write(TraceAction::LogPersisted, node, None, Some(last_log))?;
+        }
+        if previous.is_none_or(|state| commit != state.commit) && commit > 0 {
+            inner.write(TraceAction::CommitAdvanced, node, None, Some(commit))?;
+        }
+        if previous.is_none_or(|state| applied != state.applied) && applied > 0 {
+            inner.write(TraceAction::EntriesApplied, node, None, Some(applied))?;
+        }
+        if previous.is_none_or(|state| snapshot_index != state.snapshot_index) && snapshot_index > 0
+        {
+            inner.write(
+                TraceAction::SnapshotPublished,
+                node,
+                Some(snapshot_term),
+                Some(snapshot_index),
+            )?;
+        }
+        inner.observed = Some(next);
+        Ok(())
+    }
+}
+
+impl RecorderInner {
+    fn write(
+        &mut self,
+        action: TraceAction,
+        node: u64,
+        term: Option<u64>,
+        index: Option<u64>,
+    ) -> io::Result<()> {
+        let record = TraceRecord {
+            sequence: self.next_sequence,
+            action,
+            node,
+            peer: None,
+            term,
+            index,
+            message: None,
+            accepted: None,
+        };
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("protocol trace sequence exhausted"))?;
+        serde_json::to_writer(&mut self.output, &record)?;
+        self.output.write_all(b"\n")?;
+        self.output.flush()
+    }
+}
+
 impl ProtocolTrace {
+    pub fn from_json_lines(path: &Path) -> Result<Self, TraceError> {
+        let file =
+            File::open(path).map_err(|error| TraceError::InvalidEncoding(error.to_string()))?;
+        let mut lines = BufReader::new(file).lines();
+        let header = lines
+            .next()
+            .ok_or(TraceError::Truncated)?
+            .map_err(|error| TraceError::InvalidEncoding(error.to_string()))?;
+        let header: TraceFileHeader = serde_json::from_str(&header)
+            .map_err(|error| TraceError::InvalidEncoding(error.to_string()))?;
+        if header.schema_version != TRACE_SCHEMA_VERSION || header.format != "raft-kv-jsonl" {
+            return Err(TraceError::UnsupportedSchema(header.schema_version));
+        }
+        let mut records = Vec::<TraceRecord>::new();
+        for line in lines {
+            let line = line.map_err(|error| TraceError::InvalidEncoding(error.to_string()))?;
+            if line.is_empty() {
+                return Err(TraceError::Truncated);
+            }
+            records.push(
+                serde_json::from_str(&line)
+                    .map_err(|error| TraceError::InvalidEncoding(error.to_string()))?,
+            );
+        }
+        if records.last().map(|record| record.action) != Some(TraceAction::TraceTerminated) {
+            return Err(TraceError::Truncated);
+        }
+        Ok(Self {
+            schema_version: header.schema_version,
+            records,
+        })
+    }
+
     pub fn from_simulator(events: &[TraceEvent]) -> Result<Self, TraceError> {
         let records = events
             .iter()
@@ -157,7 +358,9 @@ impl ProtocolTrace {
                 | TraceAction::StalePersistenceDiscarded
                 | TraceAction::SnapshotPublished
                 | TraceAction::SnapshotTransferStarted
-                | TraceAction::SnapshotTransferInterrupted => {}
+                | TraceAction::SnapshotTransferInterrupted
+                | TraceAction::StorageFailed
+                | TraceAction::TraceTerminated => {}
             }
         }
         Ok(())
@@ -352,6 +555,10 @@ fn record(sequence: u64, event: &TraceEvent) -> TraceRecord {
             record.index = Some(position.index);
             record.term = Some(position.term.0);
         }
+        TraceEvent::StorageFailed(node) => {
+            record.action = TraceAction::StorageFailed;
+            record.node = node.0;
+        }
     }
     record
 }
@@ -406,6 +613,8 @@ fn fill_message(record: &mut TraceRecord, action: TraceAction, envelope: &Envelo
 pub enum TraceError {
     UnsupportedSchema(u16),
     SequenceExhausted,
+    InvalidEncoding(String),
+    Truncated,
     NonContiguousSequence { expected: u64, found: u64 },
     MissingField { sequence: u64, field: &'static str },
     TermRegression(u64),
@@ -438,6 +647,17 @@ impl Error for TraceError {}
 mod tests {
     use super::*;
     use crate::raft::{NodeId, simulator::ClusterSimulator};
+
+    fn temporary_trace(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "raft-kv-{name}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn simulation_trace_round_trips_and_validates() {
@@ -473,5 +693,66 @@ mod tests {
             trace.validate_m2_abstraction(),
             Err(TraceError::AcknowledgementBeforeDurableLog(0))
         );
+    }
+
+    #[test]
+    fn real_process_json_lines_are_flushed_and_validated() {
+        let path = temporary_trace("recorder");
+        let recorder = ProtocolTraceRecorder::create(&path).expect("create trace");
+        recorder
+            .observe(1, 1, 3, 2, 2, 1, 1)
+            .expect("observe state");
+        recorder
+            .observe(1, 1, 4, 3, 3, 2, 1)
+            .expect("observe progress");
+        drop(recorder);
+
+        let trace = ProtocolTrace::from_json_lines(&path).expect("load trace");
+        trace.validate_m4_abstraction().expect("valid trace");
+        assert_eq!(trace.records.first().map(|record| record.sequence), Some(0));
+        assert!(
+            trace
+                .records
+                .iter()
+                .all(|record| record.peer.is_none() && record.message.is_none())
+        );
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn truncated_json_lines_are_rejected() {
+        let path = temporary_trace("truncated");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema_version\":{},\"format\":\"raft-kv-jsonl\"}}\n{{",
+                TRACE_SCHEMA_VERSION
+            ),
+        )
+        .expect("write malformed trace");
+        assert!(matches!(
+            ProtocolTrace::from_json_lines(&path),
+            Err(TraceError::InvalidEncoding(_))
+        ));
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn valid_prefix_without_terminal_record_is_rejected_as_truncated() {
+        let path = temporary_trace("valid-prefix");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema_version\":{},\"format\":\"raft-kv-jsonl\"}}\n\
+                 {{\"sequence\":0,\"action\":\"hard_state_persisted\",\"node\":1,\"term\":1}}\n",
+                TRACE_SCHEMA_VERSION
+            ),
+        )
+        .expect("write valid prefix");
+        assert_eq!(
+            ProtocolTrace::from_json_lines(&path),
+            Err(TraceError::Truncated)
+        );
+        std::fs::remove_file(path).expect("remove trace");
     }
 }

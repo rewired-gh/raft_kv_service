@@ -1688,6 +1688,28 @@ fn validate_recovered_log(base_index: u64, log: &[LogEntry]) -> Result<(), CoreE
 mod tests {
     use super::*;
     use crate::raft::EntryPayload;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn quorum_arithmetic_is_exact_strict_majority(
+            node_count in 1_usize..=8,
+            vote_mask in any::<u16>(),
+        ) {
+            let configured = (1..=node_count)
+                .map(|node| NodeId(u64::try_from(node).expect("bounded node")))
+                .collect::<Vec<_>>();
+            let voters = VoterSet::new(configured.iter().copied()).expect("voter set");
+            let votes = configured
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, node)| ((vote_mask & (1 << offset)) != 0).then_some(*node))
+                .collect::<BTreeSet<_>>();
+            prop_assert_eq!(voters.has_quorum(&votes), votes.len() * 2 > node_count);
+        }
+    }
 
     fn voters(ids: &[u64]) -> VoterSet {
         VoterSet::new(ids.iter().copied().map(NodeId)).expect("voter set is valid")
@@ -2461,5 +2483,193 @@ mod tests {
         assert_eq!(node.commit_index(), 3);
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.propose(EntryPayload::Noop), Err(CoreError::NotLeader));
+    }
+
+    #[test]
+    fn recovery_rejects_every_invalid_durable_boundary() {
+        let members = voters(&[1, 2, 3]);
+        assert_eq!(
+            RaftCore::recover_compacted(
+                NodeId(9),
+                members.clone(),
+                HardState::default(),
+                LogPosition::default(),
+                Vec::new(),
+                0,
+            )
+            .expect_err("a non-voter cannot recover as a voter"),
+            CoreError::LocalNodeIsNotVoter(NodeId(9))
+        );
+        assert_eq!(
+            RaftCore::recover_compacted(
+                NodeId(1),
+                members.clone(),
+                HardState {
+                    current_term: Term(2),
+                    voted_for: Some(NodeId(9)),
+                },
+                LogPosition::default(),
+                Vec::new(),
+                0,
+            )
+            .expect_err("a vote outside the voter set is corrupt"),
+            CoreError::InvalidRecoveredVote(NodeId(9))
+        );
+        for invalid in [
+            LogPosition {
+                index: 0,
+                term: Term(1),
+            },
+            LogPosition {
+                index: 2,
+                term: Term(0),
+            },
+        ] {
+            assert_eq!(
+                RaftCore::recover_compacted(
+                    NodeId(1),
+                    members.clone(),
+                    HardState::default(),
+                    invalid,
+                    Vec::new(),
+                    invalid.index,
+                )
+                .expect_err("snapshot boundary must have paired zero fields"),
+                CoreError::InvalidSnapshotPosition(invalid)
+            );
+        }
+        assert!(matches!(
+            RaftCore::recover_compacted(
+                NodeId(1),
+                members.clone(),
+                HardState::default(),
+                LogPosition {
+                    index: 2,
+                    term: Term(1),
+                },
+                vec![command_entry(3, 1, 1)],
+                1,
+            ),
+            Err(CoreError::InvalidRecoveredApplied { .. })
+        ));
+        assert!(matches!(
+            RaftCore::recover_compacted(
+                NodeId(1),
+                members,
+                HardState::default(),
+                LogPosition::default(),
+                vec![command_entry(1, 1, 1)],
+                2,
+            ),
+            Err(CoreError::InvalidRecoveredApplied { .. })
+        ));
+    }
+
+    #[test]
+    fn public_operations_fail_closed_at_invalid_protocol_states() {
+        let mut follower = core(1, &[1, 2, 3]);
+        assert_eq!(follower.stage_peer(NodeId(4)), Err(CoreError::NotLeader));
+        assert_eq!(follower.heartbeat(), Err(CoreError::NotLeader));
+        assert_eq!(
+            follower.propose(EntryPayload::Noop),
+            Err(CoreError::NotLeader)
+        );
+        assert_eq!(
+            follower.propose(EntryPayload::Configuration(MembershipEntry::initial(
+                configuration(&[1, 2, 3]),
+            ))),
+            Err(CoreError::InvalidConfiguration)
+        );
+        assert_eq!(
+            follower.acknowledge_persisted(HardState::default()),
+            Err(CoreError::NoPersistencePending)
+        );
+        assert_eq!(
+            follower.acknowledge_log_persisted(LogMutation {
+                previous: LogPosition::default(),
+                entries: Vec::new(),
+            }),
+            Err(CoreError::NoPersistencePending)
+        );
+        assert_eq!(
+            follower.acknowledge_applied(1),
+            Err(CoreError::NoApplicationPending)
+        );
+
+        let expected = persist_from(
+            &follower
+                .handle(Event::ElectionTimeout)
+                .expect("timeout requests persistence"),
+        );
+        assert_eq!(
+            follower.handle(Event::ElectionTimeout),
+            Err(CoreError::PersistencePending)
+        );
+        assert!(matches!(
+            follower.acknowledge_persisted(HardState {
+                current_term: Term(99),
+                voted_for: None,
+            }),
+            Err(CoreError::PersistenceAcknowledgementMismatch { .. })
+        ));
+        follower
+            .acknowledge_persisted(expected)
+            .expect("matching acknowledgement succeeds");
+    }
+
+    #[test]
+    fn snapshot_and_compaction_validate_all_boundaries() {
+        let base = MembershipEntry::initial(configuration(&[1]));
+        let position = LogPosition {
+            index: 2,
+            term: Term(3),
+        };
+        let mut node = RaftCore::recover_compacted_with_membership(
+            NodeId(1),
+            base.clone(),
+            HardState {
+                current_term: Term(3),
+                voted_for: None,
+            },
+            position,
+            vec![command_entry(3, 3, 7)],
+            2,
+        )
+        .expect("compacted state recovers");
+
+        assert_eq!(
+            node.compact_through(LogPosition {
+                index: 1,
+                term: Term(3),
+            }),
+            Err(CoreError::InvalidSnapshotPosition(LogPosition {
+                index: 1,
+                term: Term(3),
+            }))
+        );
+        assert!(matches!(
+            node.compact_through(LogPosition {
+                index: 3,
+                term: Term(3),
+            }),
+            Err(CoreError::SnapshotBeyondApplied { .. })
+        ));
+        assert!(matches!(
+            node.restore_snapshot(LogPosition::default(), base.clone(), Vec::new()),
+            Err(CoreError::InvalidSnapshotPosition(_))
+        ));
+        assert_eq!(
+            node.observe_snapshot_leader(Term(3), NodeId(9)),
+            Err(CoreError::LocalNodeIsNotVoter(NodeId(9)))
+        );
+        assert!(matches!(
+            node.observe_snapshot_leader(Term(2), NodeId(1)),
+            Err(CoreError::StaleSnapshotTerm { .. })
+        ));
+        assert_eq!(
+            node.observe_snapshot_leader(Term(3), NodeId(1)),
+            Ok(vec![Effect::ResetElectionTimer])
+        );
+        assert_eq!(node.leader(), Some(NodeId(1)));
     }
 }

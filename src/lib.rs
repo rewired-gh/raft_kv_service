@@ -69,7 +69,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
         heartbeat_interval: Duration::from_millis(config.raft.heartbeat_interval_ms),
         rpc_timeout: Duration::from_millis(config.raft.rpc_timeout_ms),
         max_clients: config.raft.max_clients,
+        max_key_bytes: config.raft.max_key_bytes,
+        max_value_bytes: config.raft.max_value_bytes,
         snapshot_threshold_entries: config.raft.snapshot_threshold_entries,
+        fault_file: config.raft.fault_file.clone(),
         peer_endpoints: endpoints,
         local_peer_endpoint: config.peer.advertised_url.clone(),
         staging: config.raft.staging,
@@ -80,6 +83,13 @@ pub async fn run(config: AppConfig) -> Result<()> {
     .map_err(anyhow::Error::msg)
     .context("failed to start the static Raft node")?;
     let (node, peer_service) = running.spawn_dispatcher();
+    let trace_recorder = config
+        .raft
+        .trace_file
+        .as_deref()
+        .map(raft::ProtocolTraceRecorder::create)
+        .transpose()
+        .context("failed to create protocol trace file")?;
     let address = SocketAddr::new(config.server.host, config.server.port);
     let peer_address = SocketAddr::new(config.peer.host, config.peer.port);
     let operational_address = SocketAddr::new(config.operational.host, config.operational.port);
@@ -94,8 +104,9 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let kv_node = node.clone();
     let membership_node = node.clone();
     let membership_reader = node.clone();
-    let diagnostics_node = node;
+    let diagnostics_node = node.clone();
     let state = AppState::new(config.service.name)
+        .with_command_limits(config.raft.max_key_bytes, config.raft.max_value_bytes)
         .with_metrics(metrics)
         .with_executor(move |command| {
             let node = kv_node.clone();
@@ -123,6 +134,13 @@ pub async fn run(config: AppConfig) -> Result<()> {
     info!(address = %address, operational_address = %operational_address, peer_address = %peer_address, "service is ready");
 
     let (shutdown, shutdown_receiver) = watch::channel(false);
+    if let Some(recorder) = trace_recorder {
+        let trace_node = node.clone();
+        let trace_shutdown = shutdown_receiver.clone();
+        tokio::spawn(async move {
+            record_protocol_state(trace_node, recorder, trace_shutdown).await;
+        });
+    }
     let signal_state = state.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -155,6 +173,43 @@ pub async fn run(config: AppConfig) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+async fn record_protocol_state(
+    node: cluster::StaticNodeHandle,
+    recorder: raft::ProtocolTraceRecorder,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        match node.diagnostics().await {
+            Ok(state) => {
+                if let Err(error) = recorder.observe(
+                    state.node_id.0,
+                    state.term.0,
+                    state.last_log_index,
+                    state.commit_index,
+                    state.applied_index,
+                    state.snapshot_index,
+                    state.snapshot_term.0,
+                ) {
+                    warn!(%error, "protocol trace recorder stopped");
+                    return;
+                }
+            }
+            Err(error) => {
+                warn!(?error, "protocol trace sampler stopped");
+                return;
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn serve_http(

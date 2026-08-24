@@ -169,6 +169,37 @@ fn abrupt_exit_after_snapshot_publication_recovers_compacted_state() {
 }
 
 #[test]
+fn every_public_durable_boundary_recovers_before_and_after_abrupt_exit() {
+    for point in [
+        "persist_hard_state",
+        "append_local",
+        "append_from_leader",
+        "apply_committed",
+        "create_snapshot",
+        "install_snapshot",
+    ] {
+        for phase in ["before", "after"] {
+            let database = temp_database(&format!("{point}-{phase}"));
+            let status = ProcessCommand::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "crash_boundary_writer_process", "--nocapture"])
+                .env("RAFT_KV_BOUNDARY_DATABASE", &database)
+                .env("RAFT_KV_BOUNDARY_POINT", point)
+                .env("RAFT_KV_BOUNDARY_PHASE", phase)
+                .status()
+                .expect("run boundary writer");
+            assert_eq!(
+                status.code(),
+                Some(93),
+                "{point}/{phase} must exit without destructors"
+            );
+            assert_boundary_recovery(&database, point, phase == "after");
+            std::fs::remove_dir_all(database.parent().expect("database directory"))
+                .expect("remove exact test directory");
+        }
+    }
+}
+
+#[test]
 fn crash_writer_process() {
     let Ok(database) = std::env::var("RAFT_KV_CRASH_TEST_DATABASE") else {
         return;
@@ -188,6 +219,111 @@ fn snapshot_crash_writer_process() {
         .create_snapshot([1; 16], &membership())
         .expect("publish snapshot");
     std::process::exit(92);
+}
+
+#[test]
+fn crash_boundary_writer_process() {
+    let (Ok(database), Ok(point), Ok(phase)) = (
+        std::env::var("RAFT_KV_BOUNDARY_DATABASE"),
+        std::env::var("RAFT_KV_BOUNDARY_POINT"),
+        std::env::var("RAFT_KV_BOUNDARY_PHASE"),
+    ) else {
+        return;
+    };
+    let mut storage = SqliteStorage::open(&database).expect("open boundary database");
+    let noop = LogEntry {
+        index: 1,
+        term: Term(2),
+        payload: EntryPayload::Noop,
+    };
+    match point.as_str() {
+        "persist_hard_state" => {
+            exit_before(&phase);
+            storage
+                .persist_hard_state(HardState {
+                    current_term: Term(2),
+                    voted_for: Some(NodeId(1)),
+                })
+                .expect("persist hard state");
+        }
+        "append_local" => {
+            exit_before(&phase);
+            storage.append_local(&noop).expect("append local");
+        }
+        "append_from_leader" => {
+            exit_before(&phase);
+            storage
+                .append_from_leader(LogPosition::default(), std::slice::from_ref(&noop))
+                .expect("append from leader");
+        }
+        "apply_committed" => {
+            storage.append_local(&noop).expect("prepare log");
+            exit_before(&phase);
+            storage
+                .apply_committed(std::slice::from_ref(&noop))
+                .expect("apply committed");
+        }
+        "create_snapshot" => {
+            storage.append_local(&noop).expect("prepare log");
+            storage
+                .apply_committed(std::slice::from_ref(&noop))
+                .expect("prepare applied state");
+            exit_before(&phase);
+            storage
+                .create_snapshot([1; 16], &membership())
+                .expect("create snapshot");
+        }
+        "install_snapshot" => {
+            let mut source = SqliteStorage::open_in_memory().expect("snapshot source");
+            source.append_local(&noop).expect("prepare source log");
+            source
+                .apply_committed(std::slice::from_ref(&noop))
+                .expect("prepare source state");
+            let snapshot = source
+                .create_snapshot([1; 16], &membership())
+                .expect("source snapshot");
+            exit_before(&phase);
+            storage
+                .install_snapshot([1; 16], &snapshot)
+                .expect("install snapshot");
+        }
+        _ => panic!("unknown durable boundary {point}"),
+    }
+    std::process::exit(93);
+}
+
+fn exit_before(phase: &str) {
+    if phase == "before" {
+        std::process::exit(93);
+    }
+    assert_eq!(phase, "after", "unknown crash phase");
+}
+
+fn assert_boundary_recovery(database: &Path, point: &str, after: bool) {
+    let storage = SqliteStorage::open(database).expect("reopen boundary database");
+    let hard_state = storage.load_hard_state().expect("load hard state");
+    let last_log = storage.last_log_position().expect("load last log");
+    let last_applied = storage.last_applied().expect("load last applied");
+    let snapshot = storage.current_snapshot().expect("load snapshot");
+    assert!(last_applied <= last_log.index, "applied prefix exceeds log");
+
+    match point {
+        "persist_hard_state" => assert_eq!(hard_state.current_term == Term(2), after),
+        "append_local" | "append_from_leader" => assert_eq!(last_log.index == 1, after),
+        "apply_committed" => {
+            assert_eq!(last_log.index, 1);
+            assert_eq!(last_applied == 1, after);
+        }
+        "create_snapshot" => {
+            assert_eq!(last_applied, 1);
+            assert_eq!(snapshot.is_some(), after);
+        }
+        "install_snapshot" => {
+            assert_eq!(last_applied == 1, after);
+            assert_eq!(snapshot.is_some(), after);
+        }
+        _ => panic!("unknown durable boundary {point}"),
+    }
 }
 
 fn write_committed_state(database: &Path) {

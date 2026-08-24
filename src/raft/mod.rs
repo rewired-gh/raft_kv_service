@@ -22,5 +22,6 @@ pub use log::{
 };
 pub use runtime::{AppliedBatch, DurableRaft, RuntimeError};
 pub use trace::{
-    ProtocolTrace, TRACE_SCHEMA_VERSION, TraceAction, TraceError, TraceMessage, TraceRecord,
+    ProtocolTrace, ProtocolTraceRecorder, TRACE_SCHEMA_VERSION, TraceAction, TraceError,
+    TraceMessage, TraceRecord,
 };

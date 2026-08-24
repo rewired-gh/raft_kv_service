@@ -26,6 +26,12 @@ records, and retained snapshots/log prefixes. Hold an OS-level exclusive lock
 for the lifetime of a file-backed SQLite owner. Overload is explicit and never
 bypasses persistence or quorum barriers.
 
+Peer protocol v3 carries the persisted retained-client, key-size, and
+value-size tuple in every authenticated RPC identity. A mismatch is rejected
+before protocol processing, preventing voters from applying one committed log
+differently. Fixed log-entry encoding bounds remain bound by the immutable peer
+protocol version.
+
 Expose bounded-label OpenMetrics and authenticated local diagnostics on the
 operational listener. Production images use digest-pinned bases, numeric
 non-root identity, liveness health checks, two supported architectures,

@@ -15,10 +15,10 @@ use crate::{
         ClusterConfiguration, EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term,
         decode_membership, encode_membership,
     },
-    storage::{SNAPSHOT_FORMAT_VERSION, Snapshot},
+    storage::{SNAPSHOT_FORMAT_VERSION, Snapshot, StorageLimits},
 };
 
-pub const PEER_PROTOCOL_VERSION: u32 = 2;
+pub const PEER_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_PEER_MESSAGE_BYTES: usize = 6 * 1024 * 1024;
 pub type ForwardMembershipOperation = Option<([u8; 16], ClusterConfiguration)>;
 
@@ -54,6 +54,7 @@ pub struct PeerContext {
     pub cluster_id: ClusterId,
     pub local_id: NodeId,
     pub limits: PeerLimits,
+    pub replicated_limits: StorageLimits,
 }
 
 impl PeerContext {
@@ -349,6 +350,17 @@ impl PeerContext {
         if identity.cluster_id.as_slice() != self.cluster_id.0 {
             return Err(PeerError::ClusterMismatch);
         }
+        let received_limits = StorageLimits {
+            max_clients: identity.max_clients,
+            max_key_bytes: identity.max_key_bytes,
+            max_value_bytes: identity.max_value_bytes,
+        };
+        if received_limits != self.replicated_limits {
+            return Err(PeerError::IncompatibleReplicatedLimits {
+                expected: self.replicated_limits,
+                received: received_limits,
+            });
+        }
         let sender = valid_node(identity.sender_id)?;
         if valid_node(identity.recipient_id)? != self.local_id {
             return Err(PeerError::RecipientMismatch);
@@ -365,6 +377,7 @@ impl PeerContext {
 
 pub fn encode_forward_membership(
     cluster: ClusterId,
+    limits: StorageLimits,
     from: NodeId,
     to: NodeId,
     term: Term,
@@ -385,7 +398,7 @@ pub fn encode_forward_membership(
         None => (Vec::new(), Vec::new(), true),
     };
     Ok(proto::ForwardMembershipRequest {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         operation_id,
         members,
         hop_count: 1,
@@ -395,6 +408,7 @@ pub fn encode_forward_membership(
 
 pub fn encode_forward_membership_response(
     cluster: ClusterId,
+    limits: StorageLimits,
     from: NodeId,
     to: NodeId,
     term: Term,
@@ -428,7 +442,7 @@ pub fn encode_forward_membership_response(
         ),
     };
     Ok(proto::ForwardMembershipResponse {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         operation_id,
         members,
         commit_index,
@@ -453,13 +467,13 @@ pub struct SnapshotChunk {
 
 pub fn encode_snapshot_chunk(
     cluster: ClusterId,
-    from: NodeId,
-    to: NodeId,
-    term: Term,
+    limits: StorageLimits,
+    identity: (NodeId, NodeId, Term),
     snapshot: &Snapshot,
     offset: usize,
     chunk_size: usize,
 ) -> Result<proto::InstallSnapshotRequest, PeerError> {
+    let (from, to, term) = identity;
     let end = offset
         .checked_add(chunk_size)
         .map(|end| end.min(snapshot.payload.len()))
@@ -468,7 +482,7 @@ pub fn encode_snapshot_chunk(
         return Err(PeerError::InvalidSnapshotChunk);
     }
     Ok(proto::InstallSnapshotRequest {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         format_version: snapshot.format_version,
         last_included_index: snapshot.last_included.index,
         last_included_term: snapshot.last_included.term.0,
@@ -487,15 +501,15 @@ pub fn encode_snapshot_chunk(
 
 pub fn encode_snapshot_response(
     cluster: ClusterId,
-    from: NodeId,
-    to: NodeId,
-    term: Term,
+    limits: StorageLimits,
+    identity: (NodeId, NodeId, Term),
     snapshot_id: [u8; 32],
     next_offset: usize,
     installed: bool,
 ) -> Result<proto::InstallSnapshotResponse, PeerError> {
+    let (from, to, term) = identity;
     Ok(proto::InstallSnapshotResponse {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         snapshot_id: snapshot_id.to_vec(),
         next_offset: u64::try_from(next_offset).map_err(|_| PeerError::InvalidSnapshotChunk)?,
         installed,
@@ -504,13 +518,14 @@ pub fn encode_snapshot_response(
 
 pub fn encode_forward_command(
     cluster: ClusterId,
+    limits: StorageLimits,
     from: NodeId,
     to: NodeId,
     term: Term,
     command: &Command,
 ) -> Result<proto::ForwardCommandRequest, PeerError> {
     Ok(proto::ForwardCommandRequest {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         command: encode_command(command).map_err(|_| PeerError::InvalidCommand)?,
         hop_count: 1,
     })
@@ -518,13 +533,14 @@ pub fn encode_forward_command(
 
 pub fn encode_forward_response(
     cluster: ClusterId,
+    limits: StorageLimits,
     from: NodeId,
     to: NodeId,
     term: Term,
     result: &CommandResult,
 ) -> Result<proto::ForwardCommandResponse, PeerError> {
     Ok(proto::ForwardCommandResponse {
-        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
         result: encode_command_result(result).map_err(|_| PeerError::InvalidCommandResult)?,
     })
 }
@@ -536,6 +552,7 @@ struct Identity {
 
 pub fn encode_request_vote(
     cluster: ClusterId,
+    limits: StorageLimits,
     envelope: &Envelope,
 ) -> Result<proto::RequestVoteRequest, PeerError> {
     let Message::RequestVote {
@@ -547,7 +564,7 @@ pub fn encode_request_vote(
         return Err(PeerError::WrongMessageKind);
     };
     Ok(proto::RequestVoteRequest {
-        identity: Some(encode_identity(cluster, envelope, *term)?),
+        identity: Some(encode_identity(cluster, limits, envelope, *term)?),
         candidate_id: candidate.0,
         last_log: Some(encode_position(*last_log)),
     })
@@ -555,19 +572,21 @@ pub fn encode_request_vote(
 
 pub fn encode_request_vote_response(
     cluster: ClusterId,
+    limits: StorageLimits,
     envelope: &Envelope,
 ) -> Result<proto::RequestVoteResponse, PeerError> {
     let Message::RequestVoteResponse { term, vote_granted } = &envelope.message else {
         return Err(PeerError::WrongMessageKind);
     };
     Ok(proto::RequestVoteResponse {
-        identity: Some(encode_identity(cluster, envelope, *term)?),
+        identity: Some(encode_identity(cluster, limits, envelope, *term)?),
         vote_granted: *vote_granted,
     })
 }
 
 pub fn encode_append_entries(
     cluster: ClusterId,
+    limits: StorageLimits,
     envelope: &Envelope,
 ) -> Result<proto::AppendEntriesRequest, PeerError> {
     let Message::AppendEntries {
@@ -581,7 +600,7 @@ pub fn encode_append_entries(
         return Err(PeerError::WrongMessageKind);
     };
     Ok(proto::AppendEntriesRequest {
-        identity: Some(encode_identity(cluster, envelope, *term)?),
+        identity: Some(encode_identity(cluster, limits, envelope, *term)?),
         leader_id: leader.0,
         previous: Some(encode_position(*previous)),
         entries: entries.iter().map(encode_entry).collect(),
@@ -591,6 +610,7 @@ pub fn encode_append_entries(
 
 pub fn encode_append_entries_response(
     cluster: ClusterId,
+    limits: StorageLimits,
     envelope: &Envelope,
 ) -> Result<proto::AppendEntriesResponse, PeerError> {
     let Message::AppendEntriesResponse {
@@ -603,7 +623,7 @@ pub fn encode_append_entries_response(
         return Err(PeerError::WrongMessageKind);
     };
     Ok(proto::AppendEntriesResponse {
-        identity: Some(encode_identity(cluster, envelope, *term)?),
+        identity: Some(encode_identity(cluster, limits, envelope, *term)?),
         accepted: *accepted,
         match_index: *match_index,
         request_previous_index: *request_previous_index,
@@ -612,14 +632,16 @@ pub fn encode_append_entries_response(
 
 fn encode_identity(
     cluster: ClusterId,
+    limits: StorageLimits,
     envelope: &Envelope,
     term: Term,
 ) -> Result<proto::RpcIdentity, PeerError> {
-    encode_rpc_identity(cluster, envelope.from, envelope.to, term)
+    encode_rpc_identity(cluster, limits, envelope.from, envelope.to, term)
 }
 
 fn encode_rpc_identity(
     cluster: ClusterId,
+    limits: StorageLimits,
     from: NodeId,
     to: NodeId,
     term: Term,
@@ -635,6 +657,9 @@ fn encode_rpc_identity(
         recipient_id: to.0,
         protocol_version: PEER_PROTOCOL_VERSION,
         term: term.0,
+        max_clients: limits.max_clients,
+        max_key_bytes: limits.max_key_bytes,
+        max_value_bytes: limits.max_value_bytes,
     })
 }
 
@@ -711,6 +736,10 @@ pub enum PeerError {
     MissingIdentity,
     UnsupportedProtocol(u32),
     ClusterMismatch,
+    IncompatibleReplicatedLimits {
+        expected: StorageLimits,
+        received: StorageLimits,
+    },
     RecipientMismatch,
     ZeroNodeId,
     ZeroTerm,
@@ -747,11 +776,16 @@ impl Error for PeerError {}
 mod tests {
     use super::*;
 
+    fn replicated_limits() -> StorageLimits {
+        StorageLimits::default()
+    }
+
     fn context() -> PeerContext {
         PeerContext {
             cluster_id: ClusterId([4; 16]),
             local_id: NodeId(2),
             limits: PeerLimits::default(),
+            replicated_limits: replicated_limits(),
         }
     }
 
@@ -775,7 +809,8 @@ mod tests {
                 leader_commit: 2,
             },
         };
-        let encoded = encode_append_entries(ClusterId([4; 16]), &envelope).expect("encode");
+        let encoded = encode_append_entries(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode");
         assert_eq!(
             context().decode_append_entries(encoded).expect("decode"),
             envelope
@@ -793,7 +828,8 @@ mod tests {
                 last_log: LogPosition::default(),
             },
         };
-        let mut encoded = encode_request_vote(ClusterId([4; 16]), &envelope).expect("encode");
+        let mut encoded = encode_request_vote(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode");
         encoded
             .identity
             .as_mut()
@@ -806,13 +842,39 @@ mod tests {
     }
 
     #[test]
+    fn replicated_limit_mismatch_fails_before_the_core() {
+        let envelope = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::RequestVote {
+                term: Term(1),
+                candidate: NodeId(1),
+                last_log: LogPosition::default(),
+            },
+        };
+        let mut encoded = encode_request_vote(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode");
+        encoded.identity.as_mut().expect("identity").max_value_bytes -= 1;
+        assert!(matches!(
+            context().decode_request_vote(encoded),
+            Err(PeerError::IncompatibleReplicatedLimits { .. })
+        ));
+    }
+
+    #[test]
     fn forwarding_round_trips_once_and_rejects_another_hop() {
         let command = Command::Read {
             key: "forwarded".into(),
         };
-        let mut request =
-            encode_forward_command(ClusterId([4; 16]), NodeId(1), NodeId(2), Term(3), &command)
-                .expect("encode request");
+        let mut request = encode_forward_command(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(3),
+            &command,
+        )
+        .expect("encode request");
         assert_eq!(
             context()
                 .decode_forward_command(request.clone())
@@ -826,9 +888,15 @@ mod tests {
         );
 
         let result = CommandResult::Read(crate::kv::ReadResult::NotFound);
-        let response =
-            encode_forward_response(ClusterId([4; 16]), NodeId(1), NodeId(2), Term(3), &result)
-                .expect("encode response");
+        let response = encode_forward_response(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(3),
+            &result,
+        )
+        .expect("encode response");
         assert_eq!(
             context()
                 .decode_forward_response(response)
@@ -843,6 +911,7 @@ mod tests {
         .expect("target");
         let membership = encode_forward_membership(
             ClusterId([4; 16]),
+            replicated_limits(),
             NodeId(1),
             NodeId(2),
             Term(3),
@@ -879,9 +948,8 @@ mod tests {
         };
         let encoded = encode_snapshot_chunk(
             ClusterId([4; 16]),
-            NodeId(1),
-            NodeId(2),
-            Term(3),
+            replicated_limits(),
+            (NodeId(1), NodeId(2), Term(3)),
             &snapshot,
             0,
             2,

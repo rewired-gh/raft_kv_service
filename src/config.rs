@@ -34,7 +34,11 @@ pub struct RaftConfig {
     pub heartbeat_interval_ms: u64,
     pub rpc_timeout_ms: u64,
     pub max_clients: u64,
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
     pub snapshot_threshold_entries: u64,
+    pub trace_file: Option<PathBuf>,
+    pub fault_file: Option<PathBuf>,
     pub staging: bool,
     pub peer_certificates: Vec<PeerCertificateConfig>,
 }
@@ -54,7 +58,11 @@ impl Default for RaftConfig {
             heartbeat_interval_ms: 100,
             rpc_timeout_ms: 250,
             max_clients: 10_000,
+            max_key_bytes: crate::kv::MAX_KEY_BYTES,
+            max_value_bytes: crate::kv::MAX_VALUE_BYTES,
             snapshot_threshold_entries: 10_000,
+            trace_file: None,
+            fault_file: None,
             staging: false,
             peer_certificates: Vec::new(),
         }

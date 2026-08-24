@@ -103,6 +103,12 @@ Defaults live in `config/default.toml`. Environment variables override them usin
 
 Use `pretty` logs for development and `json` in deployed environments. Every HTTP request receives an `x-request-id`, and authorization values are redacted from tracing.
 
+`raft.max_clients`, `raft.max_key_bytes`, and `raft.max_value_bytes` are
+cluster-scoped replicated-behavior settings. Configure the same values on
+every voter before bootstrap or join. They are persisted in SQLite, carried by
+snapshots, and negotiated on every peer RPC; changing them in place is rejected
+rather than risking divergent state-machine application.
+
 Plaintext is for loopback or isolated Compose experiments only. Distributed
 deployments configure client TLS, operational mTLS, and peer mTLS from mounted
 certificate/key files. Each peer certificate SHA-256 fingerprint maps to one

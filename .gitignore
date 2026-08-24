@@ -1,7 +1,14 @@
 /target/
 /.tools/
+/_apalache-out/
+/initialization/
+/preservation/
+/implication/
+/mutants.out*/
 .env
 .DS_Store
+__pycache__/
+*.py[cod]
 *.log
 .idea/
 .vscode/*

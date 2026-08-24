@@ -34,8 +34,8 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::kv::{
-    ClientId, Command, CommandResult, MAX_VALUE_BYTES, Mutation, MutationCommand, MutationResult,
-    ReadResult, validate_key,
+    ClientId, Command, CommandResult, MAX_KEY_BYTES, MAX_VALUE_BYTES, Mutation, MutationCommand,
+    MutationResult, ReadResult, validate_key_with_limit,
 };
 use crate::{
     cluster::{MembershipError, MembershipView, NodeDiagnostics},
@@ -70,6 +70,8 @@ pub struct AppState {
     operational_token: Option<Arc<str>>,
     diagnostics_reader: Option<DiagnosticsReader>,
     metrics: Metrics,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
 }
 
 impl AppState {
@@ -83,6 +85,8 @@ impl AppState {
             operational_token: None,
             diagnostics_reader: None,
             metrics: Metrics::new(),
+            max_key_bytes: MAX_KEY_BYTES,
+            max_value_bytes: MAX_VALUE_BYTES,
         }
     }
 
@@ -97,6 +101,12 @@ impl AppState {
 
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    pub fn with_command_limits(mut self, max_key_bytes: usize, max_value_bytes: usize) -> Self {
+        self.max_key_bytes = max_key_bytes;
+        self.max_value_bytes = max_value_bytes;
         self
     }
 
@@ -147,6 +157,7 @@ pub enum ServiceError {
 }
 
 pub fn router(state: AppState, request_timeout: Duration) -> Router {
+    let max_body_bytes = state.max_value_bytes;
     with_middleware(
         Router::new()
             .route("/health/live", get(liveness))
@@ -161,10 +172,12 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
             .fallback(not_found)
             .with_state(state),
         request_timeout,
+        max_body_bytes,
     )
 }
 
 pub fn client_router(state: AppState, request_timeout: Duration) -> Router {
+    let max_body_bytes = state.max_value_bytes;
     with_middleware(
         Router::new()
             .route("/health/live", get(liveness))
@@ -173,10 +186,12 @@ pub fn client_router(state: AppState, request_timeout: Duration) -> Router {
             .fallback(not_found)
             .with_state(state),
         request_timeout,
+        max_body_bytes,
     )
 }
 
 pub fn operational_router(state: AppState, request_timeout: Duration) -> Router {
+    let max_body_bytes = state.max_value_bytes;
     with_middleware(
         Router::new()
             .route("/health/live", get(liveness))
@@ -190,10 +205,11 @@ pub fn operational_router(state: AppState, request_timeout: Duration) -> Router 
             .fallback(not_found)
             .with_state(state),
         request_timeout,
+        max_body_bytes,
     )
 }
 
-fn with_middleware(router: Router, request_timeout: Duration) -> Router {
+fn with_middleware(router: Router, request_timeout: Duration, max_body_bytes: usize) -> Router {
     let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
     let middleware = ServiceBuilder::new()
         .layer(TraceLayer::new_for_http().make_span_with(
@@ -208,7 +224,7 @@ fn with_middleware(router: Router, request_timeout: Duration) -> Router {
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(CatchPanicLayer::new())
         .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_HTTP_REQUESTS))
-        .layer(RequestBodyLimitLayer::new(MAX_VALUE_BYTES))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
@@ -574,10 +590,10 @@ async fn put_key(
 ) -> Response {
     let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
-    if let Err(problem) = validate_http_key(&key, &request_id) {
+    if let Err(problem) = validate_http_key(&key, state.max_key_bytes, &request_id) {
         return problem.into_response();
     }
-    if body.len() > MAX_VALUE_BYTES {
+    if body.len() > state.max_value_bytes {
         return problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             "value-too-large",
@@ -627,7 +643,7 @@ async fn delete_key(
 ) -> Response {
     let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
-    if let Err(problem) = validate_http_key(&key, &request_id) {
+    if let Err(problem) = validate_http_key(&key, state.max_key_bytes, &request_id) {
         return problem.into_response();
     }
     let expected_revision = match required_if_match(&headers, &request_id) {
@@ -661,7 +677,7 @@ async fn read(
 ) -> Response {
     let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
-    if let Err(problem) = validate_http_key(&key, &request_id) {
+    if let Err(problem) = validate_http_key(&key, state.max_key_bytes, &request_id) {
         return problem.into_response();
     }
     match state.execute(Command::Read { key }).await {
@@ -715,14 +731,24 @@ fn mutation_result_response(
         MutationResult::Deleted { revision } => {
             response_with_revision(StatusCode::NO_CONTENT, revision, None, false)
         }
-        MutationResult::PreconditionFailed { .. } => problem(
-            StatusCode::PRECONDITION_FAILED,
-            "precondition-failed",
-            "Precondition failed",
-            "the resource precondition was false at the linearization point",
-            request_id,
-        )
-        .into_response(),
+        MutationResult::PreconditionFailed { current_revision } => {
+            let mut response = problem(
+                StatusCode::PRECONDITION_FAILED,
+                "precondition-failed",
+                "Precondition failed",
+                "the resource precondition was false at the linearization point",
+                request_id,
+            )
+            .into_response();
+            if let Some(revision) = current_revision
+                && let Ok(value) = HeaderValue::from_str(&revision.to_string())
+            {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static(REVISION_HEADER), value);
+            }
+            response
+        }
         MutationResult::StaleSequence { .. } => conflict_problem(
             "stale-sequence",
             "the request sequence is older than the latest consumed sequence",
@@ -841,8 +867,8 @@ fn mutation_identity(headers: &HeaderMap, request_id: &str) -> Result<(ClientId,
     Ok((ClientId(*client.as_bytes()), sequence))
 }
 
-fn validate_http_key(key: &str, request_id: &str) -> Result<(), Problem> {
-    validate_key(key).map_err(|_| {
+fn validate_http_key(key: &str, max_key_bytes: usize, request_id: &str) -> Result<(), Problem> {
+    validate_key_with_limit(key, max_key_bytes).map_err(|_| {
         invalid_request(
             "invalid-key",
             "keys must be non-empty URI-unreserved ASCII strings",

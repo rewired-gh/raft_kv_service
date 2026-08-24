@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+
+# The formal image is intentionally linux/amd64: CI is the canonical execution
+# platform, and pinning the architecture manifest makes the root filesystem
+# immutable as well as the tag.
+FROM --platform=linux/amd64 eclipse-temurin:25.0.4_7-jre-noble@sha256:8c6736fa623090b057a5bbd36d42f90c9de4c7d2d4b6c285921a4f85ce65a445
+
+WORKDIR /workspace
+ADD --checksum=sha256:936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88 \
+    https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+    .tools/tla-1.7.4/tla2tools.jar
+ADD --checksum=sha256:93fef2f381d30465eff906a2d6afa3358cb2c9adf6a8aad3bec0ded4f45432bb \
+    https://github.com/apalache-mc/apalache/releases/download/v0.62.1/apalache-0.62.1.tgz \
+    /tmp/apalache.tgz
+RUN mkdir -p .tools /evidence && \
+    tar -xzf /tmp/apalache.tgz -C .tools && \
+    rm /tmp/apalache.tgz && \
+    chown -R 10001:10001 /workspace /evidence
+
+COPY --chown=10001:10001 formal ./formal
+COPY --chown=10001:10001 scripts ./scripts
+USER 10001:10001
+VOLUME ["/evidence"]
+ENTRYPOINT ["./scripts/formal-container.sh"]
+CMD ["full"]

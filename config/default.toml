@@ -24,7 +24,13 @@ election_timeout_max_ms = 600
 heartbeat_interval_ms = 100
 rpc_timeout_ms = 250
 max_clients = 10000
+max_key_bytes = 256
+max_value_bytes = 1048576
 snapshot_threshold_entries = 10000
+# Set to a new path to emit a payload-redacted, flush-per-record JSONL trace.
+# trace_file = "artifacts/node-1.trace.jsonl"
+# Test-only JSON fault plan; leave unset outside controlled experiments.
+# fault_file = "artifacts/fault-plan.json"
 staging = false
 
 [peer]

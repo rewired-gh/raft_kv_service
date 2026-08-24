@@ -31,11 +31,33 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+      - run: docker build --file Dockerfile.formal --tag raft-kv-formal:ci .
+      - run: mkdir -p target/formal-container
+      - run: docker run --rm --user "$(id -u):$(id -g)" --volume "$PWD/target/formal-container:/evidence" raft-kv-formal:ci fast
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
-          distribution: temurin
-          java-version: "25"
-      - run: make formal
+          name: formal-fast-${{ github.sha }}
+          path: target/formal-container
+          retention-days: 14
+
+  adversarial:
+    name: Bounded real-process campaign
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo build --locked --bins
+      - run: ./target/debug/raft-kv-fuzz --seed 424242 --operations 12 --cluster-size 3 --artifact-dir target/fuzz/ci
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: bounded-fuzz-${{ github.sha }}
+          path: target/fuzz/ci
+          retention-days: 14
 
   supply-chain:
     name: Dependency, license, and secret policy

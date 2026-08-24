@@ -97,6 +97,12 @@ fn generated_operation_matrix_matches_the_v1_http_contract() {
             .and_then(Value::as_str),
         Some("no-store")
     );
+    assert_eq!(
+        document
+            .pointer("/components/responses/PreconditionFailed/headers/Raft-KV-Revision/$ref")
+            .and_then(Value::as_str),
+        Some("#/components/headers/Revision")
+    );
 }
 
 #[test]

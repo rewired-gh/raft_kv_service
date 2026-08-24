@@ -1,5 +1,6 @@
 //! Durable Raft storage contract and implementations.
 
+mod fault;
 mod sqlite;
 
 use std::{error::Error, fmt::Debug};
@@ -9,7 +10,7 @@ use crate::{
     raft::{HardState, LogEntry, LogPosition, MembershipEntry, NodeId, Term},
 };
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -22,7 +23,8 @@ pub struct Snapshot {
     pub digest: [u8; 32],
 }
 
-pub use sqlite::{STORAGE_SCHEMA_VERSION, SqliteStorage};
+pub use fault::{FaultInjectingStorage, FaultKind, FaultPoint, InjectedStorageError};
+pub use sqlite::{STORAGE_SCHEMA_VERSION, SqliteStorage, StorageLimits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendOutcome {

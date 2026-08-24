@@ -348,17 +348,24 @@ impl<S: SnapshotStorage> DurableRaft<S> {
         cluster_id: [u8; 16],
     ) -> Result<Snapshot, RuntimeError<S::Error>> {
         self.ensure_active()?;
-        let membership = self
-            .core
-            .committed_membership()
-            .map_err(RuntimeError::Core)?;
-        let snapshot = self
-            .storage
-            .create_snapshot(cluster_id, &membership)
-            .map_err(RuntimeError::Storage)?;
-        self.core
-            .compact_through(snapshot.last_included)
-            .map_err(RuntimeError::Core)?;
+        let membership = match self.core.committed_membership() {
+            Ok(membership) => membership,
+            Err(error) => {
+                self.failed = true;
+                return Err(RuntimeError::Core(error));
+            }
+        };
+        let snapshot = match self.storage.create_snapshot(cluster_id, &membership) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.failed = true;
+                return Err(RuntimeError::Storage(error));
+            }
+        };
+        if let Err(error) = self.core.compact_through(snapshot.last_included) {
+            self.failed = true;
+            return Err(RuntimeError::Core(error));
+        }
         Ok(snapshot)
     }
 
@@ -375,18 +382,24 @@ impl<S: SnapshotStorage> DurableRaft<S> {
             self.failed = true;
             return Err(RuntimeError::Storage(error));
         }
-        let start = snapshot
-            .last_included
-            .index
-            .checked_add(1)
-            .ok_or(RuntimeError::Core(CoreError::IndexExhausted))?;
-        let suffix = self
-            .storage
-            .entries_from(start, usize::MAX)
-            .map_err(RuntimeError::Storage)?;
-        self.core
-            .restore_snapshot(snapshot.last_included, snapshot.membership.clone(), suffix)
-            .map_err(RuntimeError::Core)?;
+        let Some(start) = snapshot.last_included.index.checked_add(1) else {
+            self.failed = true;
+            return Err(RuntimeError::Core(CoreError::IndexExhausted));
+        };
+        let suffix = match self.storage.entries_from(start, usize::MAX) {
+            Ok(suffix) => suffix,
+            Err(error) => {
+                self.failed = true;
+                return Err(RuntimeError::Storage(error));
+            }
+        };
+        if let Err(error) =
+            self.core
+                .restore_snapshot(snapshot.last_included, snapshot.membership.clone(), suffix)
+        {
+            self.failed = true;
+            return Err(RuntimeError::Core(error));
+        }
         Ok(external)
     }
 }
@@ -400,7 +413,9 @@ mod tests {
 
     use crate::{
         raft::{Envelope, HardState, LogEntry, LogPosition, Role, Term},
-        storage::{AppendOutcome, RaftStorage, SqliteStorage},
+        storage::{
+            AppendOutcome, FaultInjectingStorage, FaultKind, FaultPoint, RaftStorage, SqliteStorage,
+        },
     };
 
     use super::*;
@@ -623,5 +638,102 @@ mod tests {
         assert_eq!(recovered.core().snapshot_position(), snapshot.last_included);
         assert_eq!(recovered.core().last_log_position(), snapshot.last_included);
         assert_eq!(recovered.core().last_applied(), 1);
+    }
+
+    fn injectable_runtime() -> DurableRaft<FaultInjectingStorage<SqliteStorage>> {
+        DurableRaft::recover(
+            NodeId(1),
+            VoterSet::new([NodeId(1)]).expect("voters"),
+            FaultInjectingStorage::new(SqliteStorage::open_in_memory().expect("storage")),
+        )
+        .expect("recover")
+    }
+
+    #[test]
+    fn injected_term_and_log_write_failures_are_terminal() {
+        let mut term_failure = injectable_runtime();
+        term_failure
+            .storage()
+            .fail_next(FaultPoint::PersistHardState, FaultKind::DiskFull);
+        assert!(matches!(
+            term_failure.handle(Event::ElectionTimeout),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(term_failure.is_failed());
+        assert!(matches!(
+            term_failure.handle(Event::ElectionTimeout),
+            Err(RuntimeError::Failed)
+        ));
+
+        let mut log_failure = injectable_runtime();
+        log_failure
+            .storage()
+            .fail_next(FaultPoint::AppendFromLeader, FaultKind::Write);
+        assert!(matches!(
+            log_failure.handle(Event::ElectionTimeout),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(log_failure.is_failed());
+    }
+
+    #[test]
+    fn injected_apply_and_snapshot_publication_failures_are_terminal() {
+        let mut apply_failure = injectable_runtime();
+        let effects = apply_failure
+            .handle(Event::ElectionTimeout)
+            .expect("elect before injected apply failure");
+        let committed = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::ApplyCommitted(entries) => Some(entries),
+                _ => None,
+            })
+            .expect("one-node noop commits");
+        apply_failure
+            .storage()
+            .fail_next(FaultPoint::ApplyCommitted, FaultKind::Transaction);
+        assert!(matches!(
+            apply_failure.apply_committed(&committed),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(apply_failure.is_failed());
+
+        let mut publication_failure = injectable_runtime();
+        let effects = publication_failure
+            .handle(Event::ElectionTimeout)
+            .expect("elect before snapshot publication failure");
+        let committed = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::ApplyCommitted(entries) => Some(entries),
+                _ => None,
+            })
+            .expect("one-node noop commits");
+        publication_failure
+            .apply_committed(&committed)
+            .expect("apply before snapshot");
+        publication_failure
+            .storage()
+            .fail_next(FaultPoint::CreateSnapshot, FaultKind::Publication);
+        assert!(matches!(
+            publication_failure.create_snapshot([1; 16]),
+            Err(RuntimeError::Storage(_))
+        ));
+        assert!(publication_failure.is_failed());
+    }
+
+    #[test]
+    fn injected_recovery_read_failure_prevents_startup() {
+        let storage =
+            FaultInjectingStorage::new(SqliteStorage::open_in_memory().expect("in-memory storage"));
+        storage.fail_next(FaultPoint::LoadHardState, FaultKind::Read);
+        assert!(matches!(
+            DurableRaft::recover(
+                NodeId(1),
+                VoterSet::new([NodeId(1)]).expect("voters"),
+                storage,
+            ),
+            Err(RuntimeError::Storage(_))
+        ));
     }
 }

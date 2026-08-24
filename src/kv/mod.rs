@@ -6,6 +6,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const COMMAND_VERSION: u8 = 1;
@@ -17,10 +18,10 @@ const RESULT_VERSION: u8 = 1;
 pub const MAX_KEY_BYTES: usize = 256;
 pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ClientId(pub [u8; 16]);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Mutation {
     Create {
         key: String,
@@ -37,20 +38,20 @@ pub enum Mutation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MutationCommand {
     pub client_id: ClientId,
     pub sequence: u64,
     pub mutation: Mutation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Command {
     Mutate(MutationCommand),
     Read { key: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MutationResult {
     Created { revision: u64 },
     Updated { revision: u64 },
@@ -63,19 +64,19 @@ pub enum MutationResult {
     ClientCapacityReached,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ReadResult {
     Found { value: Vec<u8>, revision: u64 },
     NotFound,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CommandResult {
     Mutation(MutationResult),
     Read(ReadResult),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValueRecord {
     pub value: Vec<u8>,
     pub revision: u64,
@@ -93,17 +94,32 @@ pub struct KvStateMachine {
     keys: BTreeMap<String, ValueRecord>,
     clients: BTreeMap<ClientId, ClientRecord>,
     max_clients: usize,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
 }
 
 impl KvStateMachine {
     pub fn new(max_clients: usize) -> Result<Self, CommandError> {
-        if max_clients == 0 {
-            return Err(CommandError::InvalidClientLimit);
+        Self::with_limits(max_clients, MAX_KEY_BYTES, MAX_VALUE_BYTES)
+    }
+
+    pub fn with_limits(
+        max_clients: usize,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+    ) -> Result<Self, CommandError> {
+        if max_clients == 0 || max_key_bytes == 0 || max_value_bytes == 0 {
+            return Err(CommandError::InvalidLimits);
+        }
+        if max_key_bytes > MAX_KEY_BYTES || max_value_bytes > MAX_VALUE_BYTES {
+            return Err(CommandError::FieldTooLarge);
         }
         Ok(Self {
             keys: BTreeMap::new(),
             clients: BTreeMap::new(),
             max_clients,
+            max_key_bytes,
+            max_value_bytes,
         })
     }
 
@@ -115,7 +131,7 @@ impl KvStateMachine {
         if log_index == 0 {
             return Err(CommandError::InvalidLogIndex);
         }
-        validate_command(command)?;
+        validate_command_limits(command, self.max_key_bytes, self.max_value_bytes)?;
         match command {
             Command::Read { key } => Ok(CommandResult::Read(self.read(key))),
             Command::Mutate(command) => self
@@ -452,10 +468,14 @@ fn decode_mutation_result_from(
 }
 
 pub fn validate_key(key: &str) -> Result<(), CommandError> {
+    validate_key_with_limit(key, MAX_KEY_BYTES)
+}
+
+pub(crate) fn validate_key_with_limit(key: &str, max_key_bytes: usize) -> Result<(), CommandError> {
     if key.is_empty() {
         return Err(CommandError::EmptyKey);
     }
-    if key.len() > MAX_KEY_BYTES {
+    if key.len() > max_key_bytes {
         return Err(CommandError::FieldTooLarge);
     }
     if !key
@@ -468,21 +488,29 @@ pub fn validate_key(key: &str) -> Result<(), CommandError> {
 }
 
 fn validate_command(command: &Command) -> Result<(), CommandError> {
+    validate_command_limits(command, MAX_KEY_BYTES, MAX_VALUE_BYTES)
+}
+
+pub(crate) fn validate_command_limits(
+    command: &Command,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
+) -> Result<(), CommandError> {
     match command {
-        Command::Read { key } => validate_key(key),
+        Command::Read { key } => validate_key_with_limit(key, max_key_bytes),
         Command::Mutate(command) => {
             if command.sequence == 0 {
                 return Err(CommandError::InvalidSequence);
             }
             match &command.mutation {
                 Mutation::Create { key, value } | Mutation::Update { key, value, .. } => {
-                    validate_key(key)?;
-                    if value.len() > MAX_VALUE_BYTES {
+                    validate_key_with_limit(key, max_key_bytes)?;
+                    if value.len() > max_value_bytes {
                         return Err(CommandError::FieldTooLarge);
                     }
                     Ok(())
                 }
-                Mutation::Delete { key, .. } => validate_key(key),
+                Mutation::Delete { key, .. } => validate_key_with_limit(key, max_key_bytes),
             }
         }
     }
@@ -594,7 +622,7 @@ impl<'a> Decoder<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandError {
-    InvalidClientLimit,
+    InvalidLimits,
     InvalidLogIndex,
     InvalidSequence,
     SequenceExhausted,
@@ -628,6 +656,33 @@ mod tests {
             sequence,
             mutation,
         })
+    }
+
+    #[test]
+    fn configured_limits_are_deterministic_state_machine_input() {
+        let mut state = KvStateMachine::with_limits(2, 4, 3).expect("bounded state machine");
+        assert_eq!(
+            state.apply(
+                1,
+                &Command::Read {
+                    key: "abcde".into()
+                }
+            ),
+            Err(CommandError::FieldTooLarge)
+        );
+        assert_eq!(
+            state.apply(
+                1,
+                &mutation(
+                    1,
+                    Mutation::Create {
+                        key: "key".into(),
+                        value: b"four".to_vec(),
+                    },
+                ),
+            ),
+            Err(CommandError::FieldTooLarge)
+        );
     }
 
     #[test]

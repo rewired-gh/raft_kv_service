@@ -12,5 +12,6 @@ requirement.
 
 Accepted decisions: [0001](0001-deterministic-core.md),
 [0002](0002-sqlite-storage.md), [0003](0003-peer-grpc.md),
-[0004](0004-snapshot-format.md), [0005](0005-joint-membership.md), and
-[0006](0006-operational-hardening.md).
+[0004](0004-snapshot-format.md), [0005](0005-joint-membership.md),
+[0006](0006-operational-hardening.md), and
+[0007](0007-verification-closure.md).

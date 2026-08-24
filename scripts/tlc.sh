@@ -8,7 +8,11 @@ readonly TOOL_DIR=".tools/tla-${TLA_VERSION}"
 readonly TLA_JAR="${TOOL_DIR}/tla2tools.jar"
 
 checksum() {
-  openssl dgst -sha256 "$1" | awk '{print $2}'
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $2}'
+  fi
 }
 
 setup() {
@@ -39,11 +43,19 @@ case "${1:-}" in
     ;;
   check)
     readonly MODEL_CONFIG="${2:?usage: scripts/tlc.sh check CONFIG}"
-    readonly MODEL_SPEC="${MODEL_CONFIG%.cfg}.tla"
+    readonly MODEL_STEM="${MODEL_CONFIG%.cfg}"
+    if [[ -f "${MODEL_STEM}.tla" ]]; then
+      readonly MODEL_SPEC="${MODEL_STEM}.tla"
+    else
+      readonly MODEL_SPEC="${MODEL_STEM%.extended}.tla"
+    fi
     setup
+    readonly MODEL_STATE_ROOT="${RAFT_KV_TLC_STATE_ROOT:-${TOOL_DIR}/states}"
+    readonly MODEL_STATE_DIR="${MODEL_STATE_ROOT}/$(basename "${MODEL_CONFIG}" .cfg)"
+    mkdir -p "${MODEL_STATE_DIR}"
     exec java -XX:+UseParallelGC -jar "${TLA_JAR}" \
       -config "${MODEL_CONFIG}" \
-      -metadir "${TOOL_DIR}/states" \
+      -metadir "${MODEL_STATE_DIR}" \
       -workers "${RAFT_KV_TLC_WORKERS:-1}" \
       "${MODEL_SPEC}"
     ;;

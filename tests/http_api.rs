@@ -52,7 +52,9 @@ fn diagnostics() -> NodeDiagnostics {
         leader: Some(NodeId(1)),
         commit_index: 9,
         applied_index: 9,
+        last_log_index: 9,
         snapshot_index: 4,
+        snapshot_term: Term(2),
         active_membership: membership.clone(),
         committed_membership: membership,
         replication: Vec::new(),
@@ -138,6 +140,48 @@ async fn missing_preconditions_are_rejected_before_mutation_identity() -> Result
 }
 
 #[tokio::test]
+async fn failed_precondition_exposes_the_current_revision() -> Result<()> {
+    let app = test_app();
+    let mut create = mutation_request("PUT", "/v1/keys/alpha", 1, b"one")?;
+    create.headers_mut().insert("if-none-match", "*".parse()?);
+    assert_eq!(
+        app.clone().oneshot(create).await?.status(),
+        StatusCode::CREATED
+    );
+
+    let mut update = mutation_request("PUT", "/v1/keys/alpha", 2, b"two")?;
+    update
+        .headers_mut()
+        .insert("if-match", "\"rev-999\"".parse()?);
+    let response = app.oneshot(update).await?;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers()["raft-kv-revision"], "1");
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_command_limits_are_enforced_before_log_admission() -> Result<()> {
+    let state = AppState::new("limited")
+        .with_command_limits(4, 3)
+        .with_executor(|_| async { Err(ServiceError::Internal) });
+    let app = router(state, Duration::from_secs(1));
+
+    let oversized_key = app
+        .clone()
+        .oneshot(Request::get("/v1/keys/abcde").body(Body::empty())?)
+        .await?;
+    assert_eq!(oversized_key.status(), StatusCode::BAD_REQUEST);
+
+    let mut oversized_value = mutation_request("PUT", "/v1/keys/key", 1, b"four")?;
+    oversized_value
+        .headers_mut()
+        .insert("if-none-match", "*".parse()?);
+    let oversized_value = app.oneshot(oversized_value).await?;
+    assert_eq!(oversized_value.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unavailable_executor_returns_retryable_problem() -> Result<()> {
     let response = router(AppState::new("test-service"), Duration::from_secs(1))
         .oneshot(Request::get("/v1/keys/alpha").body(Body::empty())?)
@@ -218,7 +262,7 @@ async fn authenticated_diagnostics_and_metrics_are_bounded_and_versioned() -> Re
     assert_eq!(status["role"], "leader");
     assert_eq!(status["commit_index"], 9);
     assert_eq!(status["request_queue_depth"], 2);
-    assert_eq!(status["peer_protocol_version"], 2);
+    assert_eq!(status["peer_protocol_version"], 3);
 
     let metrics = app
         .oneshot(

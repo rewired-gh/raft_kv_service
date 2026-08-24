@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tonic::{
@@ -36,7 +37,9 @@ use crate::{
         ClusterConfiguration, ConfigurationPhase, DurableRaft, Effect, EntryPayload, Envelope,
         Event, LogEntry, MembershipEntry, Message, NodeId, Role, Term,
     },
-    storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage, StateMachineStorage},
+    storage::{
+        AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage, StateMachineStorage, StorageLimits,
+    },
     tls::TlsMaterial,
 };
 
@@ -56,7 +59,9 @@ pub struct NodeDiagnostics {
     pub leader: Option<NodeId>,
     pub commit_index: u64,
     pub applied_index: u64,
+    pub last_log_index: u64,
     pub snapshot_index: u64,
+    pub snapshot_term: Term,
     pub active_membership: MembershipEntry,
     pub committed_membership: MembershipEntry,
     pub replication: Vec<(NodeId, crate::raft::ReplicationProgress)>,
@@ -107,7 +112,10 @@ pub struct StaticNodeConfig {
     pub heartbeat_interval: Duration,
     pub rpc_timeout: Duration,
     pub max_clients: u64,
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
     pub snapshot_threshold_entries: u64,
+    pub fault_file: Option<PathBuf>,
     pub peer_endpoints: BTreeMap<NodeId, String>,
     pub local_peer_endpoint: String,
     pub staging: bool,
@@ -123,6 +131,7 @@ pub struct RunningNode {
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
     peer_tls: Option<TlsMaterial>,
+    fault_file: Option<PathBuf>,
 }
 
 impl RunningNode {
@@ -132,9 +141,9 @@ impl RunningNode {
         let dispatcher_metrics = self.peer_service.metrics.clone();
         tokio::spawn(async move {
             while let Some(outbound) = self.outbound.recv().await {
-                let to = match &outbound {
-                    Outbound::Raft(envelope) => envelope.to,
-                    Outbound::Snapshot { to, .. } => *to,
+                let (from, to) = match &outbound {
+                    Outbound::Raft(envelope) => (envelope.from, envelope.to),
+                    Outbound::Snapshot { from, to, .. } => (*from, *to),
                 };
                 let Some(endpoint) = self
                     .endpoints
@@ -147,39 +156,65 @@ impl RunningNode {
                 };
                 let response_handle = response_handle.clone();
                 let cluster_id = self.peer_service.context.cluster_id;
+                let replicated_limits = self.peer_service.context.replicated_limits;
                 let timeout = self.rpc_timeout;
                 let peer_tls = self.peer_tls.clone();
+                let decision = match fault_decision(self.fault_file.as_deref(), from, to) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        warn!(%error, from = from.0, to = to.0, "invalid fault plan; dropping Raft RPC");
+                        continue;
+                    }
+                };
+                if decision.drop {
+                    warn!(from = from.0, to = to.0, "fault plan dropped Raft RPC");
+                    continue;
+                }
                 let metrics = dispatcher_metrics.clone();
                 tokio::spawn(async move {
                     let _replication_timer = metrics.time_replication();
-                    let result = match outbound {
-                        Outbound::Raft(envelope) => {
-                            dispatch(cluster_id, endpoint, envelope, timeout, peer_tls).await
-                        }
-                        Outbound::Snapshot {
-                            from,
-                            to,
-                            term,
-                            snapshot,
-                        } => {
-                            dispatch_snapshot(
-                                cluster_id,
-                                endpoint,
-                                (from, to, term),
-                                snapshot,
-                                timeout,
-                                peer_tls,
-                            )
-                            .await
-                        }
-                    };
-                    match result {
-                        Ok(response) => response_handle.receive_response(response),
-                        Err(error) => {
-                            if error.contains("timed out") {
-                                metrics.timed_out();
+                    if !decision.delay.is_zero() {
+                        tokio::time::sleep(decision.delay).await;
+                    }
+                    for attempt in 0..=decision.duplicates {
+                        let result = match outbound.clone() {
+                            Outbound::Raft(envelope) => {
+                                dispatch(
+                                    cluster_id,
+                                    replicated_limits,
+                                    endpoint.clone(),
+                                    envelope,
+                                    timeout,
+                                    peer_tls.clone(),
+                                )
+                                .await
                             }
-                            warn!(%error, "peer RPC failed");
+                            Outbound::Snapshot {
+                                from,
+                                to,
+                                term,
+                                snapshot,
+                            } => {
+                                dispatch_snapshot(
+                                    cluster_id,
+                                    replicated_limits,
+                                    endpoint.clone(),
+                                    (from, to, term),
+                                    snapshot,
+                                    timeout,
+                                    peer_tls.clone(),
+                                )
+                                .await
+                            }
+                        };
+                        match result {
+                            Ok(response) => response_handle.receive_response(response),
+                            Err(error) => {
+                                if error.contains("timed out") {
+                                    metrics.timed_out();
+                                }
+                                warn!(%error, attempt, "peer RPC failed");
+                            }
                         }
                     }
                 });
@@ -189,6 +224,7 @@ impl RunningNode {
     }
 }
 
+#[derive(Clone)]
 enum Outbound {
     Raft(Envelope),
     Snapshot {
@@ -203,10 +239,12 @@ enum Outbound {
 pub struct StaticNodeHandle {
     sender: SyncSender<NodeRequest>,
     cluster_id: ClusterId,
+    replicated_limits: StorageLimits,
     node_id: NodeId,
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
     peer_tls: Option<TlsMaterial>,
+    fault_file: Option<PathBuf>,
     request_queue_depth: Arc<AtomicUsize>,
     metrics: Metrics,
 }
@@ -318,12 +356,21 @@ impl StaticNodeHandle {
             .get(&leader)
             .cloned()
             .ok_or(MembershipError::Unavailable)?;
+        self.apply_forward_fault(leader)
+            .await
+            .map_err(|_| MembershipError::Unavailable)?;
         let channel = connect_peer(endpoint, self.rpc_timeout, self.peer_tls.clone())
             .await
             .map_err(|_| MembershipError::Unavailable)?;
-        let request =
-            encode_forward_membership(self.cluster_id, self.node_id, leader, term, operation)
-                .map_err(|_| MembershipError::Internal)?;
+        let request = encode_forward_membership(
+            self.cluster_id,
+            self.replicated_limits,
+            self.node_id,
+            leader,
+            term,
+            operation,
+        )
+        .map_err(|_| MembershipError::Internal)?;
         let response = tokio::time::timeout(
             self.rpc_timeout,
             peer_client(channel).forward_membership(request),
@@ -342,6 +389,7 @@ impl StaticNodeHandle {
             cluster_id: self.cluster_id,
             local_id: self.node_id,
             limits: PeerLimits::default(),
+            replicated_limits: self.replicated_limits,
         }
         .decode_forward_membership_response(response)
         .map_err(|_| MembershipError::Internal)?
@@ -370,12 +418,20 @@ impl StaticNodeHandle {
             .get(&leader)
             .cloned()
             .ok_or(ServiceError::Unavailable)?;
+        self.apply_forward_fault(leader).await?;
         let channel = connect_peer(endpoint, self.rpc_timeout, self.peer_tls.clone())
             .await
             .map_err(|_| ServiceError::Unavailable)?;
         let mut client = peer_client(channel);
-        let request = encode_forward_command(self.cluster_id, self.node_id, leader, term, &command)
-            .map_err(|_| ServiceError::Internal)?;
+        let request = encode_forward_command(
+            self.cluster_id,
+            self.replicated_limits,
+            self.node_id,
+            leader,
+            term,
+            &command,
+        )
+        .map_err(|_| ServiceError::Internal)?;
         let response = tokio::time::timeout(self.rpc_timeout, client.forward_command(request))
             .await
             .map_err(|_| ServiceError::Unavailable)?
@@ -391,6 +447,7 @@ impl StaticNodeHandle {
             cluster_id: self.cluster_id,
             local_id: self.node_id,
             limits: PeerLimits::default(),
+            replicated_limits: self.replicated_limits,
         }
         .decode_forward_response(response)
         .map_err(|_| ServiceError::Internal)
@@ -398,6 +455,18 @@ impl StaticNodeHandle {
 
     fn receive_response(&self, envelope: Envelope) {
         let _ = self.enqueue(NodeRequest::PeerResponse(envelope));
+    }
+
+    async fn apply_forward_fault(&self, to: NodeId) -> Result<(), ServiceError> {
+        let decision = fault_decision(self.fault_file.as_deref(), self.node_id, to)
+            .map_err(|_| ServiceError::Unavailable)?;
+        if decision.drop {
+            return Err(ServiceError::Unavailable);
+        }
+        if !decision.delay.is_zero() {
+            tokio::time::sleep(decision.delay).await;
+        }
+        Ok(())
     }
 
     async fn call(&self, envelope: Envelope) -> Result<Envelope, Status> {
@@ -425,12 +494,19 @@ impl StaticNodeHandle {
 
 pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String> {
     validate_config(&config)?;
+    let replicated_limits = StorageLimits {
+        max_clients: config.max_clients,
+        max_key_bytes: u64::try_from(config.max_key_bytes)
+            .map_err(|_| "max key bytes exceeds u64".to_owned())?,
+        max_value_bytes: u64::try_from(config.max_value_bytes)
+            .map_err(|_| "max value bytes exceeds u64".to_owned())?,
+    };
     if let Some(parent) = config.data_file.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let storage = SqliteStorage::open_with_max_clients(&config.data_file, config.max_clients)
+    let storage = SqliteStorage::open_with_limits(&config.data_file, replicated_limits)
         .map_err(|error| error.to_string())?;
     let members = config
         .voters
@@ -492,10 +568,12 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     let handle = StaticNodeHandle {
         sender,
         cluster_id: config.cluster_id,
+        replicated_limits,
         node_id: config.node_id,
         endpoints: endpoints.clone(),
         rpc_timeout: config.rpc_timeout,
         peer_tls: config.peer_tls.clone(),
+        fault_file: config.fault_file.clone(),
         request_queue_depth,
         metrics: config.metrics.clone(),
     };
@@ -505,6 +583,7 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
                 cluster_id: config.cluster_id,
                 local_id: config.node_id,
                 limits: PeerLimits::default(),
+                replicated_limits,
             },
             handle: handle.clone(),
             peer_certificates: Arc::new(config.peer_certificates.clone()),
@@ -516,6 +595,62 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
         endpoints,
         rpc_timeout: config.rpc_timeout,
         peer_tls: config.peer_tls,
+        fault_file: config.fault_file,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FaultDecision {
+    drop: bool,
+    delay: Duration,
+    duplicates: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FaultPlan {
+    #[serde(default)]
+    rules: Vec<FaultRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FaultRule {
+    from: u64,
+    to: u64,
+    #[serde(default)]
+    drop: bool,
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    duplicates: u8,
+}
+
+fn fault_decision(
+    path: Option<&std::path::Path>,
+    from: NodeId,
+    to: NodeId,
+) -> Result<FaultDecision, String> {
+    let Some(path) = path else {
+        return Ok(FaultDecision::default());
+    };
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let plan: FaultPlan = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let Some(rule) = plan
+        .rules
+        .iter()
+        .rev()
+        .find(|rule| rule.from == from.0 && rule.to == to.0)
+    else {
+        return Ok(FaultDecision::default());
+    };
+    if rule.delay_ms > 60_000 || rule.duplicates > 2 {
+        return Err("fault delay or duplicate count exceeds the safe harness bound".to_owned());
+    }
+    Ok(FaultDecision {
+        drop: rule.drop,
+        delay: Duration::from_millis(rule.delay_ms),
+        duplicates: rule.duplicates,
     })
 }
 
@@ -529,6 +664,10 @@ fn validate_config(config: &StaticNodeConfig) -> Result<(), String> {
         || config.heartbeat_interval >= config.election_timeout_min
         || config.rpc_timeout.is_zero()
         || config.max_clients == 0
+        || config.max_key_bytes == 0
+        || config.max_key_bytes > crate::kv::MAX_KEY_BYTES
+        || config.max_value_bytes == 0
+        || config.max_value_bytes > crate::kv::MAX_VALUE_BYTES
         || config.snapshot_threshold_entries == 0
     {
         return Err("invalid static Raft runtime configuration".to_owned());
@@ -856,7 +995,9 @@ impl NodeWorker {
             leader: self.raft.core().leader(),
             commit_index: self.raft.core().commit_index(),
             applied_index: self.raft.core().last_applied(),
+            last_log_index: self.raft.core().last_log_position().index,
             snapshot_index: self.raft.core().snapshot_position().index,
+            snapshot_term: self.raft.core().snapshot_position().term,
             active_membership,
             committed_membership,
             replication,
@@ -1166,7 +1307,7 @@ impl NodeWorker {
                         .storage()
                         .current_snapshot()
                         .map_err(|error| error.to_string())?
-                        .filter(|snapshot| snapshot.last_included == last_included)
+                        .filter(|snapshot| snapshot_covers(snapshot.last_included, last_included))
                         .ok_or_else(|| "core requested an unavailable snapshot".to_owned())?;
                     let _ = self.outbound.try_send(Outbound::Snapshot {
                         from: self.config.node_id,
@@ -1347,6 +1488,13 @@ fn random_election_timeout(config: &StaticNodeConfig) -> Duration {
     Duration::from_millis(u64::try_from(min + offset).unwrap_or(u64::MAX))
 }
 
+fn snapshot_covers(
+    available: crate::raft::LogPosition,
+    requested: crate::raft::LogPosition,
+) -> bool {
+    available == requested || available.index > requested.index
+}
+
 fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1449,6 +1597,7 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             .map_err(|_| Status::unavailable("Raft worker stopped"))?;
         encode_forward_membership_response(
             self.context.cluster_id,
+            self.context.replicated_limits,
             self.context.local_id,
             sender,
             term,
@@ -1483,9 +1632,8 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             .map_err(|_| Status::unavailable("Raft worker stopped"))??;
         encode_snapshot_response(
             self.context.cluster_id,
-            self.context.local_id,
-            sender,
-            progress.term,
+            self.context.replicated_limits,
+            (self.context.local_id, sender, progress.term),
             progress.snapshot_id,
             progress.next_offset,
             progress.installed,
@@ -1522,6 +1670,7 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             .map_err(|_| Status::unavailable("Raft worker stopped"))?;
         encode_forward_response(
             self.context.cluster_id,
+            self.context.replicated_limits,
             self.context.local_id,
             sender,
             term,
@@ -1544,9 +1693,13 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.authorize_sender(envelope.from, fingerprint).await?;
         let response = self.handle.call(envelope).await?;
-        encode_request_vote_response(self.context.cluster_id, &response)
-            .map(Response::new)
-            .map_err(|error| Status::internal(error.to_string()))
+        encode_request_vote_response(
+            self.context.cluster_id,
+            self.context.replicated_limits,
+            &response,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
     }
 
     async fn append_entries(
@@ -1562,14 +1715,19 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.authorize_sender(envelope.from, fingerprint).await?;
         let response = self.handle.call(envelope).await?;
-        encode_append_entries_response(self.context.cluster_id, &response)
-            .map(Response::new)
-            .map_err(|error| Status::internal(error.to_string()))
+        encode_append_entries_response(
+            self.context.cluster_id,
+            self.context.replicated_limits,
+            &response,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
     }
 }
 
 async fn dispatch(
     cluster: ClusterId,
+    replicated_limits: StorageLimits,
     endpoint: String,
     envelope: Envelope,
     timeout: Duration,
@@ -1581,11 +1739,12 @@ async fn dispatch(
         cluster_id: cluster,
         local_id: envelope.from,
         limits: PeerLimits::default(),
+        replicated_limits,
     };
     match envelope.message {
         Message::RequestVote { .. } => {
-            let request =
-                encode_request_vote(cluster, &envelope).map_err(|error| error.to_string())?;
+            let request = encode_request_vote(cluster, replicated_limits, &envelope)
+                .map_err(|error| error.to_string())?;
             let response = tokio::time::timeout(timeout, client.request_vote(request))
                 .await
                 .map_err(|_| "RequestVote timed out".to_owned())?
@@ -1596,8 +1755,8 @@ async fn dispatch(
                 .map_err(|error| error.to_string())
         }
         Message::AppendEntries { .. } => {
-            let request =
-                encode_append_entries(cluster, &envelope).map_err(|error| error.to_string())?;
+            let request = encode_append_entries(cluster, replicated_limits, &envelope)
+                .map_err(|error| error.to_string())?;
             let response = tokio::time::timeout(timeout, client.append_entries(request))
                 .await
                 .map_err(|_| "AppendEntries timed out".to_owned())?
@@ -1615,6 +1774,7 @@ async fn dispatch(
 
 async fn dispatch_snapshot(
     cluster: ClusterId,
+    replicated_limits: StorageLimits,
     endpoint: String,
     identity: (NodeId, NodeId, Term),
     snapshot: Snapshot,
@@ -1628,13 +1788,21 @@ async fn dispatch_snapshot(
         cluster_id: cluster,
         local_id: from,
         limits: PeerLimits::default(),
+        replicated_limits,
     };
     let chunk_size = context.limits.snapshot_chunk_bytes;
     let mut offset = 0_usize;
     let mut response_term = term;
     while offset < snapshot.payload.len() {
-        let request = encode_snapshot_chunk(cluster, from, to, term, &snapshot, offset, chunk_size)
-            .map_err(|error| error.to_string())?;
+        let request = encode_snapshot_chunk(
+            cluster,
+            replicated_limits,
+            (from, to, term),
+            &snapshot,
+            offset,
+            chunk_size,
+        )
+        .map_err(|error| error.to_string())?;
         let response = tokio::time::timeout(timeout, client.install_snapshot(request))
             .await
             .map_err(|_| "InstallSnapshot chunk timed out".to_owned())?
@@ -1766,6 +1934,66 @@ mod tests {
         listener.local_addr().expect("local address")
     }
 
+    #[test]
+    fn newer_snapshot_satisfies_a_stale_send_request() {
+        assert!(snapshot_covers(
+            crate::raft::LogPosition {
+                index: 12,
+                term: Term(3),
+            },
+            crate::raft::LogPosition {
+                index: 8,
+                term: Term(2),
+            },
+        ));
+        assert!(!snapshot_covers(
+            crate::raft::LogPosition {
+                index: 8,
+                term: Term(3),
+            },
+            crate::raft::LogPosition {
+                index: 8,
+                term: Term(2),
+            },
+        ));
+    }
+
+    #[test]
+    fn fault_plan_is_directional_bounded_and_fail_closed() {
+        assert!(
+            !fault_decision(None, NodeId(1), NodeId(2))
+                .expect("no plan means no fault")
+                .drop
+        );
+        let directory = temp_directory();
+        let path = directory.join("faults.json");
+        fs::write(
+            &path,
+            br#"{"rules":[
+                {"from":1,"to":2,"drop":true},
+                {"from":1,"to":2,"delay_ms":25,"duplicates":2}
+            ]}"#,
+        )
+        .expect("write fault plan");
+
+        let selected =
+            fault_decision(Some(&path), NodeId(1), NodeId(2)).expect("last matching rule wins");
+        assert!(!selected.drop);
+        assert_eq!(selected.delay, Duration::from_millis(25));
+        assert_eq!(selected.duplicates, 2);
+        let reverse = fault_decision(Some(&path), NodeId(2), NodeId(1))
+            .expect("direction without a rule is healthy");
+        assert!(!reverse.drop);
+        assert!(reverse.delay.is_zero());
+
+        fs::write(&path, br#"{"rules":[{"from":1,"to":2,"delay_ms":60001}]}"#)
+            .expect("write over-bound plan");
+        assert!(fault_decision(Some(&path), NodeId(1), NodeId(2)).is_err());
+        fs::write(&path, b"not-json").expect("write malformed plan");
+        assert!(fault_decision(Some(&path), NodeId(1), NodeId(2)).is_err());
+        fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
     #[tokio::test]
     async fn peer_certificate_identity_is_bound_to_active_membership() {
         let directory = temp_directory();
@@ -1792,7 +2020,10 @@ mod tests {
             heartbeat_interval: Duration::from_millis(30),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
+            max_key_bytes: crate::kv::MAX_KEY_BYTES,
+            max_value_bytes: crate::kv::MAX_VALUE_BYTES,
             snapshot_threshold_entries: 100,
+            fault_file: None,
             peer_endpoints: endpoints,
             local_peer_endpoint: "https://node-1:9080".to_owned(),
             staging: false,
@@ -1845,7 +2076,10 @@ mod tests {
             heartbeat_interval: Duration::from_millis(30),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
+            max_key_bytes: crate::kv::MAX_KEY_BYTES,
+            max_value_bytes: crate::kv::MAX_VALUE_BYTES,
             snapshot_threshold_entries: 100,
+            fault_file: None,
             peer_endpoints: BTreeMap::new(),
             local_peer_endpoint: "http://node-1:9080".to_owned(),
             staging: false,
@@ -1941,7 +2175,10 @@ mod tests {
                 heartbeat_interval: Duration::from_millis(40),
                 rpc_timeout: Duration::from_millis(300),
                 max_clients: 10_000,
+                max_key_bytes: crate::kv::MAX_KEY_BYTES,
+                max_value_bytes: crate::kv::MAX_VALUE_BYTES,
                 snapshot_threshold_entries: 100,
+                fault_file: None,
                 peer_endpoints,
                 local_peer_endpoint: endpoints[&node_id].clone(),
                 staging: node_id == NodeId(4),
@@ -2080,7 +2317,10 @@ mod tests {
                 heartbeat_interval: Duration::from_millis(30),
                 rpc_timeout: Duration::from_millis(100),
                 max_clients: 10_000,
+                max_key_bytes: crate::kv::MAX_KEY_BYTES,
+                max_value_bytes: crate::kv::MAX_VALUE_BYTES,
                 snapshot_threshold_entries: 2,
+                fault_file: None,
                 peer_endpoints,
                 local_peer_endpoint: endpoints[&node_id].clone(),
                 staging: false,
@@ -2194,7 +2434,10 @@ mod tests {
             heartbeat_interval: Duration::from_millis(30),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
+            max_key_bytes: crate::kv::MAX_KEY_BYTES,
+            max_value_bytes: crate::kv::MAX_VALUE_BYTES,
             snapshot_threshold_entries: 2,
+            fault_file: None,
             peer_endpoints,
             local_peer_endpoint: endpoints[&node_id].clone(),
             staging: false,

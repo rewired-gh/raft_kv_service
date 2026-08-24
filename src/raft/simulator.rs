@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    CoreError, Effect, EntryPayload, Envelope, Event, HardState, LogEntry, LogMutation, NodeId,
-    RaftCore, Role, Term, VoterSet,
+    CoreError, Effect, EntryPayload, Envelope, Event, HardState, LogEntry, LogMutation,
+    MembershipEntry, NodeId, RaftCore, Role, Term, VoterSet,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +29,7 @@ pub enum TraceEvent {
     SnapshotTransferStarted(NodeId, NodeId, super::LogPosition),
     SnapshotTransferInterrupted(NodeId, NodeId, super::LogPosition),
     SnapshotInstalled(NodeId, NodeId, super::LogPosition),
+    StorageFailed(NodeId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +51,27 @@ enum Scheduled {
         term: Term,
         position: super::LogPosition,
     },
+}
+
+impl Scheduled {
+    fn target(&self) -> NodeId {
+        match self {
+            Self::Persist { node, .. } | Self::PersistLog { node, .. } => *node,
+            Self::Deliver(envelope) => envelope.to,
+            Self::InstallSnapshot { to, .. } => *to,
+        }
+    }
+
+    fn is_storage(&self) -> bool {
+        matches!(
+            self,
+            Self::Persist { .. } | Self::PersistLog { .. } | Self::InstallSnapshot { .. }
+        )
+    }
+
+    fn is_message(&self, from: NodeId, to: NodeId) -> bool {
+        matches!(self, Self::Deliver(envelope) if envelope.from == from && envelope.to == to)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +96,8 @@ pub struct ClusterSimulator {
     election_timeout_max: u64,
     election_deadlines: BTreeMap<NodeId, Option<u64>>,
     blocked_links: BTreeSet<(NodeId, NodeId)>,
+    paused_nodes: BTreeSet<NodeId>,
+    fail_next_storage: BTreeSet<NodeId>,
 }
 
 impl ClusterSimulator {
@@ -131,6 +155,8 @@ impl ClusterSimulator {
             election_timeout_max,
             election_deadlines: BTreeMap::new(),
             blocked_links: BTreeSet::new(),
+            paused_nodes: BTreeSet::new(),
+            fail_next_storage: BTreeSet::new(),
         };
         let node_ids = simulator.nodes.keys().copied().collect::<Vec<_>>();
         for node in node_ids {
@@ -140,6 +166,9 @@ impl ClusterSimulator {
     }
 
     pub fn timeout(&mut self, node: NodeId) -> Result<(), SimError> {
+        if self.paused_nodes.contains(&node) {
+            return Err(SimError::NodePaused(node));
+        }
         if self.node(node)?.core.is_none() {
             return Err(SimError::NodeOffline(node));
         }
@@ -150,12 +179,31 @@ impl ClusterSimulator {
     }
 
     pub fn propose(&mut self, node: NodeId, payload: EntryPayload) -> Result<u64, SimError> {
+        if self.paused_nodes.contains(&node) {
+            return Err(SimError::NodePaused(node));
+        }
         let (index, effects) = self.core_mut(node)?.propose(payload)?;
         self.schedule_effects(node, effects)?;
         Ok(index)
     }
 
+    pub fn propose_membership(
+        &mut self,
+        node: NodeId,
+        membership: MembershipEntry,
+    ) -> Result<u64, SimError> {
+        if self.paused_nodes.contains(&node) {
+            return Err(SimError::NodePaused(node));
+        }
+        let (index, effects) = self.core_mut(node)?.propose_membership(membership)?;
+        self.schedule_effects(node, effects)?;
+        Ok(index)
+    }
+
     pub fn heartbeat(&mut self, node: NodeId) -> Result<(), SimError> {
+        if self.paused_nodes.contains(&node) {
+            return Err(SimError::NodePaused(node));
+        }
         let effects = self.core_mut(node)?.heartbeat()?;
         self.schedule_effects(node, effects)
     }
@@ -180,9 +228,23 @@ impl ClusterSimulator {
     }
 
     pub fn step(&mut self) -> Result<bool, SimError> {
-        let Some(scheduled) = self.scheduled.pop_front() else {
+        let Some(position) = self
+            .scheduled
+            .iter()
+            .position(|scheduled| !self.paused_nodes.contains(&scheduled.target()))
+        else {
             return Ok(false);
         };
+        let scheduled = self
+            .scheduled
+            .remove(position)
+            .ok_or(SimError::ScheduledEventMissing)?;
+
+        if scheduled.is_storage() && self.fail_next_storage.remove(&scheduled.target()) {
+            let node = scheduled.target();
+            self.trace.push(TraceEvent::StorageFailed(node));
+            return Err(SimError::InjectedStorageFailure(node));
+        }
 
         match scheduled {
             Scheduled::Persist {
@@ -225,6 +287,8 @@ impl ClusterSimulator {
             return Err(SimError::NodeOffline(node));
         }
         sim_node.core = None;
+        self.paused_nodes.remove(&node);
+        self.fail_next_storage.remove(&node);
         self.election_deadlines.insert(node, None);
         self.trace.push(TraceEvent::NodeCrashed(node));
         Ok(())
@@ -250,6 +314,59 @@ impl ClusterSimulator {
         )?);
         self.reset_election_deadline(node)?;
         self.trace.push(TraceEvent::NodeRestarted(node));
+        Ok(())
+    }
+
+    pub fn pause(&mut self, node: NodeId) -> Result<(), SimError> {
+        if self.node(node)?.core.is_none() {
+            return Err(SimError::NodeOffline(node));
+        }
+        self.paused_nodes.insert(node);
+        self.election_deadlines.insert(node, None);
+        Ok(())
+    }
+
+    pub fn resume(&mut self, node: NodeId) -> Result<(), SimError> {
+        if !self.paused_nodes.remove(&node) {
+            return Err(SimError::NodeNotPaused(node));
+        }
+        self.reset_election_deadline(node)
+    }
+
+    pub fn fail_next_storage(&mut self, node: NodeId) -> Result<(), SimError> {
+        if self.node(node)?.core.is_none() {
+            return Err(SimError::NodeOffline(node));
+        }
+        self.fail_next_storage.insert(node);
+        Ok(())
+    }
+
+    pub fn duplicate_next_message(&mut self, from: NodeId, to: NodeId) -> Result<(), SimError> {
+        let position = self
+            .scheduled
+            .iter()
+            .position(|scheduled| scheduled.is_message(from, to))
+            .ok_or(SimError::NoMatchingMessage { from, to })?;
+        let duplicate = self
+            .scheduled
+            .get(position)
+            .cloned()
+            .ok_or(SimError::ScheduledEventMissing)?;
+        self.scheduled.insert(position + 1, duplicate);
+        Ok(())
+    }
+
+    pub fn delay_next_message(&mut self, from: NodeId, to: NodeId) -> Result<(), SimError> {
+        let position = self
+            .scheduled
+            .iter()
+            .position(|scheduled| scheduled.is_message(from, to))
+            .ok_or(SimError::NoMatchingMessage { from, to })?;
+        let delayed = self
+            .scheduled
+            .remove(position)
+            .ok_or(SimError::ScheduledEventMissing)?;
+        self.scheduled.push_back(delayed);
         Ok(())
     }
 
@@ -674,6 +791,8 @@ pub enum SimError {
     UnknownNode(NodeId),
     NodeOffline(NodeId),
     NodeAlreadyOnline(NodeId),
+    NodePaused(NodeId),
+    NodeNotPaused(NodeId),
     GenerationExhausted(NodeId),
     StepLimitExceeded(usize),
     StorageLogMismatch(NodeId),
@@ -681,6 +800,9 @@ pub enum SimError {
     InvalidElectionTimeoutRange { min: u64, max: u64 },
     NoElectionDeadline,
     TimeExhausted,
+    InjectedStorageFailure(NodeId),
+    NoMatchingMessage { from: NodeId, to: NodeId },
+    ScheduledEventMissing,
 }
 
 impl From<CoreError> for SimError {
@@ -697,6 +819,10 @@ impl Display for SimError {
             Self::NodeOffline(node) => write!(formatter, "simulated node {} is offline", node.0),
             Self::NodeAlreadyOnline(node) => {
                 write!(formatter, "simulated node {} is already online", node.0)
+            }
+            Self::NodePaused(node) => write!(formatter, "simulated node {} is paused", node.0),
+            Self::NodeNotPaused(node) => {
+                write!(formatter, "simulated node {} is not paused", node.0)
             }
             Self::GenerationExhausted(node) => {
                 write!(formatter, "simulated node {} exhausted generations", node.0)
@@ -717,6 +843,15 @@ impl Display for SimError {
             }
             Self::NoElectionDeadline => formatter.write_str("no election deadline is armed"),
             Self::TimeExhausted => formatter.write_str("simulated logical time exhausted"),
+            Self::InjectedStorageFailure(node) => {
+                write!(formatter, "injected storage failure on node {}", node.0)
+            }
+            Self::NoMatchingMessage { from, to } => write!(
+                formatter,
+                "no scheduled message from node {} to node {}",
+                from.0, to.0
+            ),
+            Self::ScheduledEventMissing => formatter.write_str("scheduled event disappeared"),
         }
     }
 }
@@ -726,7 +861,7 @@ impl Error for SimError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{Message, Term};
+    use crate::raft::{ClusterConfiguration, ConfigurationPhase, Message, Term};
 
     fn three_nodes() -> ClusterSimulator {
         ClusterSimulator::new([NodeId(1), NodeId(2), NodeId(3)])
@@ -990,6 +1125,153 @@ mod tests {
         assert_eq!(
             simulation.role(NodeId(1)).expect("node exists"),
             Some(Role::Candidate)
+        );
+    }
+
+    #[test]
+    fn duplicated_and_reordered_requests_and_responses_remain_safe() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("start election");
+        simulation.step().expect("persist candidate state");
+        simulation
+            .duplicate_next_message(NodeId(1), NodeId(2))
+            .expect("duplicate RequestVote");
+        simulation
+            .delay_next_message(NodeId(1), NodeId(2))
+            .expect("reorder RequestVote");
+
+        let mut duplicated_response = false;
+        for _ in 0..32 {
+            if simulation
+                .duplicate_next_message(NodeId(2), NodeId(1))
+                .is_ok()
+            {
+                simulation
+                    .delay_next_message(NodeId(2), NodeId(1))
+                    .expect("reorder RequestVoteResponse");
+                duplicated_response = true;
+                break;
+            }
+            assert!(simulation.step().expect("advance deterministic event"));
+        }
+        assert!(duplicated_response, "a response must become schedulable");
+        simulation.run_until_idle(128).expect("settle election");
+        let leaders = [NodeId(1), NodeId(2), NodeId(3)]
+            .into_iter()
+            .filter(|node| simulation.role(*node).expect("known node") == Some(Role::Leader))
+            .count();
+        assert_eq!(leaders, 1);
+    }
+
+    #[test]
+    fn paused_node_defers_its_events_until_resumed() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("start election");
+        simulation.step().expect("persist candidate state");
+        simulation.pause(NodeId(2)).expect("pause follower");
+        simulation
+            .run_until_idle(64)
+            .expect("other nodes continue deterministically");
+        assert!(
+            simulation.pending_events() > 0,
+            "paused delivery is retained"
+        );
+        assert_eq!(
+            simulation.timeout(NodeId(2)),
+            Err(SimError::NodePaused(NodeId(2)))
+        );
+        simulation.resume(NodeId(2)).expect("resume follower");
+        simulation
+            .run_until_idle(64)
+            .expect("deliver retained work");
+    }
+
+    #[test]
+    fn injected_storage_failure_loses_unacknowledged_transition_on_crash() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("start election");
+        simulation
+            .fail_next_storage(NodeId(1))
+            .expect("arm storage failure");
+        assert_eq!(
+            simulation.step(),
+            Err(SimError::InjectedStorageFailure(NodeId(1)))
+        );
+        assert_eq!(
+            simulation.hard_state(NodeId(1)).expect("durable state"),
+            HardState::default()
+        );
+        simulation.crash(NodeId(1)).expect("crash pending node");
+        simulation
+            .restart(NodeId(1))
+            .expect("recover durable state");
+        assert_eq!(
+            simulation.role(NodeId(1)).expect("role"),
+            Some(Role::Follower)
+        );
+        assert_eq!(
+            simulation.hard_state(NodeId(1)).expect("recovered state"),
+            HardState::default()
+        );
+    }
+
+    #[test]
+    fn joint_membership_commits_then_survives_leader_restart() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("start election");
+        simulation.run_until_idle(128).expect("elect leader");
+        let old = ClusterConfiguration::new([
+            (1, "node://1".to_owned()),
+            (2, "node://2".to_owned()),
+            (3, "node://3".to_owned()),
+        ])
+        .expect("old configuration");
+        let new =
+            ClusterConfiguration::new([(1, "node://1".to_owned()), (2, "node://2".to_owned())])
+                .expect("new configuration");
+        let operation_id = [7; 16];
+        simulation
+            .propose_membership(
+                NodeId(1),
+                MembershipEntry {
+                    operation_id,
+                    phase: ConfigurationPhase::Joint,
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            )
+            .expect("propose joint configuration");
+        simulation.run_until_idle(128).expect("commit joint entry");
+        simulation
+            .propose_membership(
+                NodeId(1),
+                MembershipEntry {
+                    operation_id,
+                    phase: ConfigurationPhase::Stable,
+                    old: new.clone(),
+                    new,
+                },
+            )
+            .expect("propose stable configuration");
+        simulation.run_until_idle(128).expect("commit stable entry");
+        let committed = simulation.commit_index(NodeId(1)).expect("commit index");
+        simulation.crash(NodeId(1)).expect("crash leader");
+        simulation.restart(NodeId(1)).expect("recover leader log");
+        assert_eq!(
+            simulation
+                .commit_index(NodeId(1))
+                .expect("recovered commit"),
+            committed
+        );
+        simulation
+            .timeout(NodeId(1))
+            .expect("removed peer is not required for a new election");
+        simulation
+            .run_until_idle(128)
+            .expect("new configuration elects safely");
+        assert_eq!(
+            simulation.role(NodeId(1)).expect("role"),
+            Some(Role::Leader)
         );
     }
 

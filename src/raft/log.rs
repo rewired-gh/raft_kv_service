@@ -231,3 +231,116 @@ pub struct LogEntry {
     pub term: Term,
     pub payload: EntryPayload,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configuration(ids: &[u64]) -> ClusterConfiguration {
+        ClusterConfiguration::new(ids.iter().map(|id| (*id, format!("node://{id}"))))
+            .expect("valid configuration")
+    }
+
+    #[test]
+    fn configuration_rejects_every_ambiguous_identity_boundary() {
+        assert_eq!(
+            ClusterConfiguration::new(Vec::<(u64, String)>::new()),
+            Err(ConfigurationError::Empty)
+        );
+        assert_eq!(
+            ClusterConfiguration::new([(0, "node://zero".to_owned())]),
+            Err(ConfigurationError::ZeroNodeId)
+        );
+        assert_eq!(
+            ClusterConfiguration::new([(1, String::new())]),
+            Err(ConfigurationError::InvalidEndpoint)
+        );
+        assert_eq!(
+            ClusterConfiguration::new([(1, "x".repeat(2_049))]),
+            Err(ConfigurationError::InvalidEndpoint)
+        );
+        assert_eq!(
+            ClusterConfiguration::new([(1, "node://a".to_owned()), (1, "node://b".to_owned())]),
+            Err(ConfigurationError::DuplicateNode(1))
+        );
+
+        let valid = configuration(&[2, 1]);
+        assert_eq!(valid.node_ids().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(valid.endpoint(2), Some("node://2"));
+        assert_eq!(valid.endpoint(9), None);
+    }
+
+    #[test]
+    fn membership_validation_distinguishes_joint_and_stable_transitions() {
+        let old = configuration(&[1, 2, 3]);
+        let new = configuration(&[2, 3, 4]);
+        assert_eq!(
+            MembershipEntry {
+                operation_id: [0; 16],
+                phase: ConfigurationPhase::Joint,
+                old: old.clone(),
+                new: new.clone(),
+            }
+            .validate(),
+            Err(ConfigurationError::ZeroOperationId)
+        );
+        assert_eq!(
+            MembershipEntry {
+                operation_id: [1; 16],
+                phase: ConfigurationPhase::Stable,
+                old: old.clone(),
+                new: new.clone(),
+            }
+            .validate(),
+            Err(ConfigurationError::InvalidStableTransition)
+        );
+        MembershipEntry {
+            operation_id: [1; 16],
+            phase: ConfigurationPhase::Joint,
+            old,
+            new,
+        }
+        .validate()
+        .expect("different configurations are valid while joint");
+    }
+
+    #[test]
+    fn membership_encoding_round_trips_and_rejects_noncanonical_bytes() {
+        let membership = MembershipEntry {
+            operation_id: [7; 16],
+            phase: ConfigurationPhase::Joint,
+            old: configuration(&[1, 2, 3]),
+            new: configuration(&[2, 3, 4]),
+        };
+        let encoded = encode_membership(&membership).expect("encode membership");
+        assert_eq!(
+            decode_membership(&encoded).expect("decode membership"),
+            membership
+        );
+
+        for malformed in [
+            Vec::new(),
+            b"WRONG001".to_vec(),
+            {
+                let mut bytes = encoded.clone();
+                bytes[8] = 9;
+                bytes
+            },
+            {
+                let mut bytes = encoded.clone();
+                bytes.push(0);
+                bytes
+            },
+            {
+                let mut bytes = encoded.clone();
+                bytes.truncate(bytes.len() - 1);
+                bytes
+            },
+        ] {
+            assert_eq!(
+                decode_membership(&malformed),
+                Err(ConfigurationError::InvalidEncoding)
+            );
+        }
+    }
+}

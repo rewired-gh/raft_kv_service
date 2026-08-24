@@ -38,6 +38,13 @@ format versions are explicit; startup validates identity, invariants, and
 integrity before serving. Raft unsigned identifiers are stored as fixed-width
 big-endian blobs, preserving their complete range and ordered byte comparison.
 
+Schema v6 persists the retained-client, key-size, and value-size limits beside
+`last_applied`. They are deterministic state-machine inputs: reopening with a
+different value fails before the node starts, and the same tuple is checked on
+every peer RPC and snapshot installation. There is deliberately no implicit
+migration from an older schema; the first complete release requires an
+operator-controlled export or fresh cluster for an incompatible format change.
+
 The runtime gives each Raft instance exclusive ownership of its database
 connection on a dedicated blocking execution boundary. Async protocol tasks do
 not call SQLite directly.
@@ -71,4 +78,5 @@ not call SQLite directly.
 - Canonical command and result encodings are explicitly versioned. Application
   rejects an entry that does not byte-for-byte match the durable Raft log.
 - Tests cover conflicting suffix replacement, monotonic hard state, atomic
-  application, disk-full/error mapping, and reopen recovery.
+  application, injected disk-full/read/write/transaction/publication failures,
+  limit drift, and reopen recovery.
