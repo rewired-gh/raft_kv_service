@@ -3,7 +3,8 @@
 A production-shaped Rust microservice foundation. The current implementation
 provides HTTP lifecycle, configuration, observability, tests, containers, and
 CI. The M1 election milestone provides a deterministic election core,
-crash-aware seeded simulator, and bounded TLA+ model; replication, storage, and
+crash-aware seeded simulator, and bounded TLA+ model. M2 storage work provides
+the transactional SQLite hard-state and log contract; protocol replication and
 the client KV API are not implemented yet.
 
 The normative project goals, correctness claims, protocol scope, verification
@@ -57,12 +58,13 @@ Use `pretty` logs for development and `json` in deployed environments. Every HTT
 - `src/config.rs`: typed file and environment configuration
 - `src/http.rs`: HTTP routes, middleware, and health state
 - `src/raft/`: deterministic protocol core and simulator
+- `src/storage/`: transactional Raft persistence contract and SQLite backend
 - `src/telemetry.rs`: structured logging initialization
 - `src/lib.rs`: service lifecycle and graceful shutdown
 - `src/main.rs`: composition root
 - `formal/`: TLA+ models, finite configurations, and abstraction maps
 - `verification/`: machine-readable requirement, property, and evidence maps
 
-No datastore, consensus library, RPC protocol, metrics backend, or deployment
-platform is selected yet. Those choices follow the specification and accepted
-ADRs rather than boilerplate convention.
+No consensus library is used. Remaining RPC, metrics-backend, and deployment
+choices follow the specification and accepted ADRs rather than boilerplate
+convention.

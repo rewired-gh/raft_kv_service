@@ -28,8 +28,12 @@ evidence = [
 [[requirement]]
 id = "M2"
 spec_sections = ["10.2", "12.1", "19.M2"]
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "docs/adr/0002-sqlite-storage.md",
+  "src/storage/mod.rs",
+  "src/storage/sqlite.rs",
+]
 
 [[requirement]]
 id = "M3"
