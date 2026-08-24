@@ -1,0 +1,31 @@
+schema_version = 1
+property_set = "m3-durable-crud"
+recorded_at = "2026-08-24T11:29:57+08:00"
+tool = "TLC"
+tool_version = "2.19 (TLA+ tools 1.7.4)"
+command = "./scripts/tlc.sh check formal/KvStateMachine.cfg"
+model = "formal/KvStateMachine.tla"
+model_sha256 = "b3650241edbaa88402cb690cbb2d650e69d462f1407b62d73167967abf079d68"
+configuration = "formal/KvStateMachine.cfg"
+configuration_sha256 = "1297ce2b9ff07fc04d8e1cd39a0423798f5d13b149e320fc4b448c2ba6035327"
+generated_states = 92853
+distinct_states = 5376
+search_depth = 6
+result = "pass"
+
+[parameters]
+keys = 2
+clients = 1
+values = 1
+max_log_index = 3
+max_client_sequence = 2
+crash_restart_cycles = 1
+
+invariants = [
+  "TypeOK",
+  "AbsentStateIsCanonical",
+  "PresentRevisionIsSuccessful",
+  "LiveKeyRevisionsAreUnique",
+  "SessionStateIsComplete",
+  "DurableStateSurvivesCrash",
+]

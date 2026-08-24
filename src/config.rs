@@ -32,6 +32,7 @@ pub struct RaftConfig {
     pub election_timeout_max_ms: u64,
     pub heartbeat_interval_ms: u64,
     pub rpc_timeout_ms: u64,
+    pub max_clients: u64,
 }
 
 impl Default for RaftConfig {
@@ -48,6 +49,7 @@ impl Default for RaftConfig {
             election_timeout_max_ms: 600,
             heartbeat_interval_ms: 100,
             rpc_timeout_ms: 250,
+            max_clients: 10_000,
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod config;
+pub mod history;
 pub mod http;
 pub mod kv;
 pub mod peer;
@@ -42,6 +43,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         election_timeout_max: Duration::from_millis(config.raft.election_timeout_max_ms),
         heartbeat_interval: Duration::from_millis(config.raft.heartbeat_interval_ms),
         rpc_timeout: Duration::from_millis(config.raft.rpc_timeout_ms),
+        max_clients: config.raft.max_clients,
         peer_endpoints: endpoints,
     })
     .map_err(anyhow::Error::msg)

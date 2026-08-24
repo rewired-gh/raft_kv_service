@@ -1,0 +1,25 @@
+schema_version = 1
+property_set = "m3-runtime-api-and-history"
+recorded_at = "2026-08-24T11:29:57+08:00"
+command = "make check"
+result = "pass"
+rust_tests = 63
+property_cases_per_property = 128
+tlc_models = [
+  "formal/RaftElection.cfg",
+  "formal/Raft.cfg",
+  "formal/KvStateMachine.cfg",
+]
+openapi_sha256 = "a8055d509a1ec2129780ce35bfa732ce9f99bbdb950190a5d1d7c7a802d724dd"
+cargo_lock_sha256 = "d6d40fb2fa27e2dd7d797141acb38c329218f82e1553242de300c9288e9658de"
+
+evidence = [
+  "conditional CRUD and ambiguous retry HTTP contract",
+  "machine-read OpenAPI 3.1 operation and reference validation",
+  "generated command encoding and deterministic application properties",
+  "SQLite-to-memory-model generated storage conformance",
+  "abrupt-process-exit recovery of atomic state and deduplication",
+  "three-node real gRPC commit and follower forwarding",
+  "real-cluster history accepted by the linearizability checker",
+  "known non-linearizable and incomplete-operation history regressions",
+]

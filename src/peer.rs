@@ -32,7 +32,8 @@ impl Default for PeerLimits {
     fn default() -> Self {
         Self {
             max_entries_per_append: 256,
-            max_command_bytes: 1024 * 1024,
+            // The client value limit plus room for the canonical command envelope.
+            max_command_bytes: 1024 * 1024 + 1024,
         }
     }
 }
@@ -53,6 +54,9 @@ impl PeerContext {
         if request.hop_count > 1 {
             return Err(PeerError::ForwardingLoop);
         }
+        if request.command.len() > self.limits.max_command_bytes {
+            return Err(PeerError::CommandTooLarge);
+        }
         let command = decode_command(&request.command).map_err(|_| PeerError::InvalidCommand)?;
         Ok((identity.sender, command))
     }
@@ -62,6 +66,9 @@ impl PeerContext {
         response: proto::ForwardCommandResponse,
     ) -> Result<CommandResult, PeerError> {
         self.validate_identity(response.identity)?;
+        if response.result.len() > self.limits.max_command_bytes {
+            return Err(PeerError::CommandTooLarge);
+        }
         decode_command_result(&response.result).map_err(|_| PeerError::InvalidCommandResult)
     }
 

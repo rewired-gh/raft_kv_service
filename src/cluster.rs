@@ -43,6 +43,7 @@ pub struct StaticNodeConfig {
     pub election_timeout_max: Duration,
     pub heartbeat_interval: Duration,
     pub rpc_timeout: Duration,
+    pub max_clients: u64,
     pub peer_endpoints: BTreeMap<NodeId, String>,
 }
 
@@ -187,7 +188,8 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let storage = SqliteStorage::open(&config.data_file).map_err(|error| error.to_string())?;
+    let storage = SqliteStorage::open_with_max_clients(&config.data_file, config.max_clients)
+        .map_err(|error| error.to_string())?;
     let voters = VoterSet::new(config.voters.iter().copied()).map_err(|error| error.to_string())?;
     let raft =
         DurableRaft::recover(config.node_id, voters, storage).map_err(|error| error.to_string())?;
@@ -243,6 +245,7 @@ fn validate_config(config: &StaticNodeConfig) -> Result<(), String> {
         || config.heartbeat_interval.is_zero()
         || config.heartbeat_interval >= config.election_timeout_min
         || config.rpc_timeout.is_zero()
+        || config.max_clients == 0
     {
         return Err("invalid static Raft runtime configuration".to_owned());
     }
@@ -635,6 +638,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        history::{CheckOptions, Operation, is_linearizable},
         kv::{ClientId, Mutation, MutationCommand, ValueRecord},
         storage::StateMachineStorage,
     };
@@ -693,6 +697,7 @@ mod tests {
                 election_timeout_max: Duration::from_millis(240),
                 heartbeat_interval: Duration::from_millis(30),
                 rpc_timeout: Duration::from_millis(100),
+                max_clients: 10_000,
                 peer_endpoints,
             })
             .expect("start node");
@@ -743,19 +748,45 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(revision >= 2);
+        let create_result =
+            CommandResult::Mutation(crate::kv::MutationResult::Created { revision });
 
         let follower = &handles[(leader_index + 1) % handles.len()];
+        let read_command = Command::Read {
+            key: "distributed".into(),
+        };
+        let read_result = follower
+            .execute(read_command.clone())
+            .await
+            .expect("follower forwards a logged read");
         assert_eq!(
-            follower
-                .execute(Command::Read {
-                    key: "distributed".into(),
-                })
-                .await
-                .expect("follower forwards a logged read"),
+            read_result,
             CommandResult::Read(crate::kv::ReadResult::Found {
                 value: b"yes".to_vec(),
                 revision,
             })
+        );
+        assert!(
+            is_linearizable(
+                &[
+                    Operation {
+                        id: 1,
+                        invoked_at: 1,
+                        completed_at: Some(2),
+                        command,
+                        result: Some(create_result),
+                    },
+                    Operation {
+                        id: 2,
+                        invoked_at: 3,
+                        completed_at: Some(4),
+                        command: read_command,
+                        result: Some(read_result),
+                    },
+                ],
+                CheckOptions::default(),
+            )
+            .expect("check collected cluster history")
         );
 
         tokio::time::sleep(Duration::from_millis(250)).await;

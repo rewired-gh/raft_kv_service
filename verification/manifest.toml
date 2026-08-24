@@ -110,7 +110,12 @@ evidence = []
 [[property]]
 id = "crud-linearizability"
 spec_section = "12.2.1"
-model = "verification/history-model"
+model = "src/history.rs"
 invariant = "Linearizable"
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "src/history.rs",
+  "src/cluster.rs",
+  "tests/storage_contract.rs",
+  "verification/evidence/m3-runtime.toml",
+]

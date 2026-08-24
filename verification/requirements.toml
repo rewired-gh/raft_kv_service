@@ -44,7 +44,7 @@ evidence = [
 [[requirement]]
 id = "M3"
 spec_sections = ["6", "7", "8", "12.2", "19.M3"]
-status = "partial"
+status = "verified"
 evidence = [
   "src/kv/mod.rs",
   "src/storage/sqlite.rs",
@@ -52,6 +52,13 @@ evidence = [
   "docs/openapi.yaml",
   "src/cluster.rs",
   "tests/http_api.rs",
+  "tests/openapi_contract.rs",
+  "tests/properties.rs",
+  "tests/storage_contract.rs",
+  "src/history.rs",
+  "formal/KvStateMachine.tla",
+  "verification/evidence/m3-fast-tlc.toml",
+  "verification/evidence/m3-runtime.toml",
 ]
 
 [[requirement]]

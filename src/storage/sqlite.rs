@@ -21,6 +21,7 @@ use crate::{
 
 const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -28,20 +29,34 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_max_clients(path, DEFAULT_MAX_CLIENTS)
+    }
+
+    pub fn open_with_max_clients(
+        path: impl AsRef<Path>,
+        max_clients: u64,
+    ) -> Result<Self, StorageError> {
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Self::initialize(connection, true)
+        Self::initialize(connection, true, max_clients)
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
-        Self::initialize(Connection::open_in_memory()?, false)
+        Self::initialize(Connection::open_in_memory()?, false, DEFAULT_MAX_CLIENTS)
     }
 
-    fn initialize(connection: Connection, file_backed: bool) -> Result<Self, StorageError> {
+    fn initialize(
+        connection: Connection,
+        file_backed: bool,
+        max_clients: u64,
+    ) -> Result<Self, StorageError> {
+        if max_clients == 0 {
+            return Err(StorageError::InvalidMaxClients(max_clients));
+        }
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "trusted_schema", false)?;
@@ -99,10 +114,12 @@ impl SqliteStorage {
 
             INSERT OR IGNORE INTO hard_state(singleton, current_term, voted_for)
             VALUES (1, X'0000000000000000', NULL);
-
-            INSERT OR IGNORE INTO state_machine_meta(singleton, last_applied, max_clients)
-            VALUES (1, X'0000000000000000', X'0000000000002710');
             ",
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO state_machine_meta(singleton, last_applied, max_clients)
+             VALUES (1, ?1, ?2)",
+            params![encode_u64(0).as_slice(), encode_u64(max_clients).as_slice()],
         )?;
 
         let user_version: i64 =
@@ -120,6 +137,13 @@ impl SqliteStorage {
 
         let storage = Self { connection };
         storage.validate()?;
+        let (_, persisted_max_clients) = load_state_machine_meta(&storage.connection)?;
+        if persisted_max_clients != max_clients {
+            return Err(StorageError::MaxClientsMismatch {
+                configured: max_clients,
+                persisted: persisted_max_clients,
+            });
+        }
         Ok(storage)
     }
 
@@ -777,6 +801,8 @@ pub enum StorageError {
     InvalidIntegerEncoding { field: &'static str, length: usize },
     InvalidFingerprintEncoding(usize),
     InvalidClientCount(i64),
+    InvalidMaxClients(u64),
+    MaxClientsMismatch { configured: u64, persisted: u64 },
     Command(CommandError),
     HardStateRegression { current: HardState, next: HardState },
     InvalidLogEntry { index: u64, term: Term },
@@ -814,6 +840,19 @@ impl Display for StorageError {
             Self::InvalidClientCount(count) => {
                 write!(formatter, "invalid persisted client count {count}")
             }
+            Self::InvalidMaxClients(value) => {
+                write!(
+                    formatter,
+                    "maximum client count must be positive, got {value}"
+                )
+            }
+            Self::MaxClientsMismatch {
+                configured,
+                persisted,
+            } => write!(
+                formatter,
+                "configured maximum client count {configured} does not match persisted value {persisted}"
+            ),
             Self::Command(error) => Display::fmt(error, formatter),
             Self::HardStateRegression { current, next } => {
                 write!(
@@ -1177,5 +1216,26 @@ mod tests {
                 .expect("query result")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn persisted_client_capacity_rejects_configuration_drift() {
+        let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "raft-kv-capacity-test-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create temporary directory");
+        let path = directory.join("capacity.sqlite3");
+        drop(SqliteStorage::open_with_max_clients(&path, 7).expect("create storage"));
+        assert!(matches!(
+            SqliteStorage::open_with_max_clients(&path, 8),
+            Err(StorageError::MaxClientsMismatch {
+                configured: 8,
+                persisted: 7,
+            })
+        ));
+        SqliteStorage::open_with_max_clients(&path, 7).expect("matching capacity reopens");
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 }
