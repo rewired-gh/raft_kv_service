@@ -1,31 +1,68 @@
 # raft-kv-service
 
-A production-shaped Rust microservice foundation. The current implementation
-provides HTTP lifecycle, configuration, observability, tests, containers, and
-CI. The completed M1 through M6 milestones provide a deterministic Raft election
-and static-cluster replication core, explicit persistence and ordered-
-application barriers, transactional SQLite storage, a crash/partition-aware
-simulator, versioned protocol traces, bounded TLA+ models, transactional CRUD,
-deduplicated retries, follower forwarding, external linearizability checks,
-atomic logical snapshots with resumable lagging-follower installation, and
-dynamic membership through staged joint consensus, bounded resource handling,
-authenticated diagnostics and metrics, TLS/mTLS trust boundaries, and a
-reproducible supply-chain policy.
+[English](README.en.md) | 简体中文
 
-The normative project goals, correctness claims, protocol scope, verification
-strategy, and milestone gates are defined in
-[`docs/specification.md`](docs/specification.md).
-Delivery sequencing and evidence status are tracked in
-[`docs/roadmap.md`](docs/roadmap.md) and `verification/`.
+一个以“把 Raft 真正学明白”为目标、用 Rust 从零实现的分布式持久化 KV 微服务。
+它的产品范围刻意保持很小：只提供线性一致的 Create、Read、Update、Delete；但在共识、
+持久化、故障恢复、形式化验证、测试和运维方面，尽量做到完整、严谨且可复现。
 
-## Prerequisites
+这个仓库主要面向两类开发者：
 
-- Rust 1.98.0 through [rustup](https://rustup.rs/) (the repository toolchain file selects it automatically)
-- Docker Engine 28+ with Docker Compose v2
-- Java 25, `curl`, and OpenSSL for checksum-pinned TLA+ model checking
-- GNU or BSD Make (optional command shortcuts)
+- 想系统学习 Raft、复制状态机、快照、成员变更和工程化验证的人；
+- 想快速启动真实多节点服务，亲手验证选举、故障转移、恢复和线性一致性的人。
 
-## Start locally
+> 这是一个玩具项目，但不是一份玩具实现。它不追求成为通用数据库，而是用尽可能清晰
+> 的边界，展示一个分布式系统如何从规范、模型一路走到可运行的软件和证据。
+
+## 项目背景
+
+这个项目带有一点特殊的 hackathon 色彩：从需求讨论、规格设计、Raft 与存储实现，
+到形式化模型、模糊测试、容器和文档，几乎全部工作都在少于 24 小时内完成。
+
+更特别的是，整个过程几乎全程由作者通过手机远程控制电脑上的 Codex 推进。作者负责
+提出目标、审视取舍和持续反馈，Codex 负责在真实工作区中设计、编码、运行验证、发现
+反例并迭代修正。它既是一个 Raft 学习项目，也是一次关于“人如何通过移动端与编码
+智能体高强度协作”的实验。
+
+“短时间完成”并不代表省略正确性工作。仓库保留了规范、ADR、模型、测试分层和机器
+可读的验证证据；所有验证声明也明确写出适用范围，不把有限状态模型检查描述成对全部
+Rust 执行的数学证明。
+
+## 与众不同的地方
+
+- **不使用现成 Raft 库**：选举、日志复制、持久化屏障、快照和联合共识均自行实现。
+- **规范先行且证据闭环**：已接受的 1.0 规范与 M0–M7 需求，通过 `verification/`
+  映射到代码、模型、测试和证据；另有测试防止清单悄悄失效。
+- **有限但诚实的形式化验证**：TLA+/TLC 覆盖选举、日志、CRUD、快照、成员变更与公平
+  活性实例；Apalache 检查归纳不变量的初始化、保持和安全蕴含义务。
+- **模型与实现之间有可检查的桥梁**：确定性 Raft 核心不依赖 socket、磁盘、线程或
+  墙上时钟；协议 trace 检查持久化顺序、消息因果和快照边界。
+- **真实进程故障模糊测试**：自动运行 3/5 节点、并发 CRUD、分区、延迟、丢包、重复、
+  崩溃、重启和快照传输中断，再用精确线性一致性检查器验证历史。
+- **可精确重放输入**：campaign schema 2 保存工作负载和类型化故障/进程调度，同时
+  明确不声称能够决定性复现 OS 线程与网络调度。
+- **持久化语义属于协议本身**：SQLite 事务、hard state/log 单调性、原子应用、请求
+  去重、快照发布和进程独占都有契约与崩溃测试。
+- **生产形态但保持最小化**：独立 client/operational/peer 监听器、TLS/mTLS、容量
+  边界、OpenMetrics、非 root 镜像、SBOM/provenance 和供应链策略均已具备。
+
+## 能力与边界
+
+服务提供单一 KV 命名空间及线性一致的 CRUD，支持：
+
+- 静态 1/3/5 节点部署与 leader 转发；
+- 持久化日志、崩溃恢复、逻辑快照与落后 follower 安装快照；
+- staging 节点及 Raft joint consensus 动态成员变更；
+- 基于 client ID 与单调 sequence 的持久化去重；
+- 结构化日志、运行状态、指标、TLS/mTLS 和兼容性拒绝规则。
+
+它有意不支持多键事务、扫描、watch、TTL、分片/Multi-Raft、拜占庭容错或永久丢失
+多数派数据后的自动恢复。完整边界见 [`docs/specification.md`](docs/specification.md)。
+
+## 快速开始
+
+前置条件：Rust 1.98.0、Docker Engine 28+ 与 Compose v2、Java 25、`curl`、
+OpenSSL，以及可选的 GNU/BSD Make。
 
 ```sh
 cp .env.example .env
@@ -33,10 +70,9 @@ make setup
 make run
 ```
 
-The service listens on `http://localhost:8080`:
+默认 client API 为 `http://localhost:8080`：
 
 ```sh
-curl --fail http://localhost:8080/health/live
 curl --fail http://localhost:8080/health/ready
 
 CLIENT_ID=018f47a7-48c1-7d9a-9db6-4d143ba4c273
@@ -48,106 +84,63 @@ curl --fail-with-body -X PUT \
   --data-binary 'hello' \
   http://localhost:8080/v1/keys/greeting
 curl --fail-with-body http://localhost:8080/v1/keys/greeting
-
-curl --fail-with-body \
-  -H 'Authorization: Bearer local-development-only' \
-  http://localhost:8088/operational/v1/status
-curl --fail-with-body \
-  -H 'Authorization: Bearer local-development-only' \
-  http://localhost:8088/metrics
 ```
 
-Run all quality gates, including the fast formal model, with `make check`.
-The first `make setup` or `make formal` downloads the stable TLA+ tools JAR and
-verifies its pinned SHA-256 digest under the ignored `.tools/` directory.
-
-## Start with Docker
-
-`docker compose up --build` starts the default three-voter experiment. Client
-listeners are published on `localhost:8081`, `:8082`, and `:8083`; authenticated
-operational listeners use `:8181`, `:8182`, and `:8183`; peer gRPC stays on the
-private Compose network. Any node accepts client requests and
-forwards them once to its known leader; a node without a usable leader returns
-a retryable `503`.
-
-For a single local process, `make run` uses the one-node defaults on
-`localhost:8080` and persists state in `data/node-1.sqlite3`.
-
-Membership changes use `PUT /operational/v1/membership` with a stable UUID and
-the complete target member list. A joining process starts with
-`raft.staging = true`, the current voters/endpoints, a fresh node ID and empty
-data directory. The leader admits it only after zero-lag catch-up. Retrying the
-same operation ID and target is safe; reusing an ID for another target returns
-`409`. See the OpenAPI document for the exact body and response.
-
-Useful experiment commands are:
+运行三节点 Docker 实验：
 
 ```sh
-docker compose restart node2              # preserve node2 data
-curl -H 'Authorization: Bearer local-development-only' \
-  http://localhost:8181/operational/v1/status
-make reset-local NODE=node2 CONFIRM=yes   # explicit destructive reset
-make formal                               # deterministic finite model checks
-make fuzz                                 # retained real-process fault campaign
-make check                                # ordinary local gate
-make supply-chain                         # advisories, licenses, and sources
+docker compose up --build
 ```
 
-Build the production image with `make image`. Its runtime process uses numeric
-UID/GID 10001, has no package-manager-installed runtime tools, and uses the
-binary's liveness probe. Deploy it with a read-only root filesystem, a writable
-`/var/lib/raft-kv` volume, and read-only secret mounts.
+client listener 位于 `localhost:8081`、`:8082`、`:8083`；带认证的 operational
+listener 位于 `:8181`、`:8182`、`:8183`；peer gRPC 只在 Compose 私有网络中。
 
-## Configuration
+```sh
+docker compose restart node2              # 保留数据并重启
+curl -H 'Authorization: Bearer local-development-only' \
+  http://localhost:8181/operational/v1/status
+make reset-local NODE=node2 CONFIRM=yes   # 显式销毁 node2 本地卷
+```
 
-Defaults live in `config/default.toml`. Environment variables override them using the `RAFT_KV__SECTION__FIELD` convention; `.env.example` lists every setting. The application does not load `.env` itself—Compose does, while local shells can use their preferred environment loader.
+## 如何学习和验证
 
-Use `pretty` logs for development and `json` in deployed environments. Every HTTP request receives an `x-request-id`, and authorization values are redacted from tracing.
+建议按以下顺序阅读：
 
-`raft.max_clients`, `raft.max_key_bytes`, and `raft.max_value_bytes` are
-cluster-scoped replicated-behavior settings. Configure the same values on
-every voter before bootstrap or join. They are persisted in SQLite, carried by
-snapshots, and negotiated on every peer RPC; changing them in place is rejected
-rather than risking divergent state-machine application.
+1. [`docs/specification.md`](docs/specification.md)：行为、安全性质和完成定义；
+2. [`docs/roadmap.md`](docs/roadmap.md)：M0–M7 交付路径；
+3. [`docs/adr/`](docs/adr/)：关键架构决策；
+4. `src/raft/`：纯核心、runtime、simulator 和 trace；
+5. `formal/`：对应各里程碑的 TLA+ 模型；
+6. `verification/`：需求到代码、模型、测试和运行证据的映射。
 
-Plaintext is for loopback or isolated Compose experiments only. Distributed
-deployments configure client TLS, operational mTLS, and peer mTLS from mounted
-certificate/key files. Each peer certificate SHA-256 fingerprint maps to one
-node ID. A new node additionally needs a future
-`staging_expires_unix_seconds` admission in its node TOML configuration; a
-certificate alone never grants membership. The operational bearer token is
-defense in depth and must come from secret injection. Do not expose the client
-API to an untrusted network without an external authentication and
-authorization layer.
+```sh
+make check          # fmt + Clippy + 测试 + 快速形式化检查
+make formal-full    # 完整 TLC 矩阵 + Apalache 归纳义务
+make fuzz           # 真实多进程故障 campaign，保留可重放产物
+make mutation       # Raft 与存储 mutation testing
+make coverage       # 行/分支覆盖率及真实进程 campaign
+make supply-chain   # RustSec、许可证和依赖来源策略
+```
 
-Operational status and bounded-label OpenMetrics are available only on the
-separate operational listener. The service bounds HTTP/gRPC messages and
-concurrency, append and snapshot batches, queues, pending proposals, retained
-client sessions, and file ownership. See
-[`docs/supply-chain-policy.md`](docs/supply-chain-policy.md) for immutable build,
-upgrade, SBOM, provenance, and vulnerability rules.
+发布覆盖率门槛为：普通非生成 Rust 代码至少 80% line / 70% branch，关键共识和持久化
+代码至少 90% line / 80% branch。形式化声明边界见
+[`docs/adr/0007-verification-closure.md`](docs/adr/0007-verification-closure.md)；故障
+campaign 与重放见 [`docs/fuzzing.md`](docs/fuzzing.md)；HTTP 契约见
+[`docs/openapi.yaml`](docs/openapi.yaml)。
 
-## Project boundaries
+## 配置与部署
 
-- `src/config.rs`: typed file and environment configuration
-- `src/http.rs`: HTTP routes, middleware, and health state
-- `src/history.rs`: bounded exact linearizability checker
-- `src/kv/`: deterministic CRUD and deduplication state machine
-- `src/cluster.rs`: cluster actor, gRPC dispatch, forwarding, and membership control
-- `src/raft/`: deterministic protocol core and simulator
-- `src/storage/`: transactional Raft persistence contract and SQLite backend
-- `src/telemetry.rs`: structured logging initialization
-- `src/tls.rs`: TLS material parsing and mutual-authentication configuration
-- `src/metrics.rs`: bounded-label OpenMetrics instruments
-- `src/lib.rs`: service lifecycle and graceful shutdown
-- `src/main.rs`: composition root
-- `formal/`: TLA+ models, finite configurations, and abstraction maps
-- `verification/`: machine-readable requirement, property, and evidence maps
+默认配置位于 `config/default.toml`，环境变量采用 `RAFT_KV__SECTION__FIELD` 覆盖；
+完整示例见 `.env.example`。影响复制状态机行为的容量设置必须在所有 voter 上一致，
+并会写入 SQLite、进入快照及在 peer RPC 中协商。
 
-See [`docs/fuzzing.md`](docs/fuzzing.md) for campaign artifacts, exact input
-replay, shrinking, and the boundary between deterministic inputs and OS
-scheduling.
+明文模式只用于 loopback 或隔离实验。分布式部署应配置 client TLS、operational mTLS、
+peer mTLS，并使用外部认证授权层保护 client API。生产镜像以 UID/GID 10001 运行；
+建议使用只读根文件系统、可写 `/var/lib/raft-kv` 数据卷和只读 secret mount。详见
+[`docs/supply-chain-policy.md`](docs/supply-chain-policy.md)。
 
-No consensus library is used. The trusted computing base and the deliberately
-limited formal claim are documented in the specification and verification
-manifest; M7 closes the adversarial and formal-evidence gates.
+## 项目状态
+
+规范 1.0 的 M0–M7 已完成。项目适合学习、演示和受控环境实验；真实业务部署仍应根据
+自身威胁模型、容量目标、备份策略和平台进行独立评审。最受欢迎的贡献，是把发现的
+反例转化为可复现 trace、测试或形式化 counterexample。
