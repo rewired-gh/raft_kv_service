@@ -10,6 +10,6 @@ pub mod simulator;
 
 pub use election::{
     CoreError, Effect, Envelope, Event, HardState, LogMutation, LogPosition, Message, NodeId,
-    RaftCore, Role, Term, VoterSet,
+    RaftCore, ReplicationProgress, Role, Term, VoterSet,
 };
 pub use log::{EntryPayload, LogEntry};

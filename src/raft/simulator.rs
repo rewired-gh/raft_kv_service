@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    CoreError, Effect, Envelope, Event, HardState, LogEntry, LogMutation, NodeId, RaftCore, Role,
-    Term, VoterSet,
+    CoreError, Effect, EntryPayload, Envelope, Event, HardState, LogEntry, LogMutation, NodeId,
+    RaftCore, Role, Term, VoterSet,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +129,17 @@ impl ClusterSimulator {
         self.election_deadlines.insert(node, None);
         self.trace.push(TraceEvent::ElectionTimeout(node));
         let effects = self.core_mut(node)?.handle(Event::ElectionTimeout)?;
+        self.schedule_effects(node, effects)
+    }
+
+    pub fn propose(&mut self, node: NodeId, payload: EntryPayload) -> Result<u64, SimError> {
+        let (index, effects) = self.core_mut(node)?.propose(payload)?;
+        self.schedule_effects(node, effects)?;
+        Ok(index)
+    }
+
+    pub fn heartbeat(&mut self, node: NodeId) -> Result<(), SimError> {
+        let effects = self.core_mut(node)?.heartbeat()?;
         self.schedule_effects(node, effects)
     }
 
@@ -256,6 +267,23 @@ impl ClusterSimulator {
 
     pub fn hard_state(&self, node: NodeId) -> Result<HardState, SimError> {
         Ok(self.node(node)?.durable)
+    }
+
+    pub fn last_log_position(&self, node: NodeId) -> Result<crate::raft::LogPosition, SimError> {
+        Ok(self
+            .node(node)?
+            .log
+            .last()
+            .map_or_else(crate::raft::LogPosition::default, |entry| {
+                crate::raft::LogPosition {
+                    index: entry.index,
+                    term: entry.term,
+                }
+            }))
+    }
+
+    pub fn commit_index(&self, node: NodeId) -> Result<Option<u64>, SimError> {
+        Ok(self.node(node)?.core.as_ref().map(RaftCore::commit_index))
     }
 
     pub fn pending_events(&self) -> usize {
@@ -520,6 +548,85 @@ mod tests {
         assert_eq!(
             simulation.role(NodeId(3)).expect("node exists"),
             Some(Role::Follower)
+        );
+        for node in [NodeId(1), NodeId(2), NodeId(3)] {
+            assert_eq!(
+                simulation.last_log_position(node).expect("node exists"),
+                crate::raft::LogPosition {
+                    index: 1,
+                    term: Term(1)
+                }
+            );
+            assert_eq!(simulation.commit_index(node).expect("node exists"), Some(1));
+        }
+    }
+
+    #[test]
+    fn leader_proposal_replicates_and_commits_on_all_nodes() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("timeout is accepted");
+        simulation
+            .run_until_idle(64)
+            .expect("election reaches quiescence");
+
+        let index = simulation
+            .propose(NodeId(1), EntryPayload::Command(vec![4, 2]))
+            .expect("ready leader accepts proposal");
+        assert_eq!(index, 2);
+        simulation
+            .run_until_idle(64)
+            .expect("replication reaches quiescence");
+
+        for node in [NodeId(1), NodeId(2), NodeId(3)] {
+            assert_eq!(
+                simulation
+                    .last_log_position(node)
+                    .expect("node exists")
+                    .index,
+                2
+            );
+            assert_eq!(simulation.commit_index(node).expect("node exists"), Some(2));
+        }
+    }
+
+    #[test]
+    fn restarted_lagging_follower_catches_up_from_heartbeat() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("timeout is accepted");
+        simulation
+            .run_until_idle(64)
+            .expect("election reaches quiescence");
+        simulation.crash(NodeId(3)).expect("follower crashes");
+
+        simulation
+            .propose(NodeId(1), EntryPayload::Command(vec![9]))
+            .expect("leader accepts proposal");
+        simulation
+            .run_until_idle(64)
+            .expect("available quorum commits proposal");
+        assert_eq!(
+            simulation
+                .last_log_position(NodeId(3))
+                .expect("node exists")
+                .index,
+            1
+        );
+
+        simulation.restart(NodeId(3)).expect("follower restarts");
+        simulation
+            .heartbeat(NodeId(1))
+            .expect("leader emits replication heartbeat");
+        simulation.run_until_idle(64).expect("follower catches up");
+        assert_eq!(
+            simulation
+                .last_log_position(NodeId(3))
+                .expect("node exists")
+                .index,
+            2
+        );
+        assert_eq!(
+            simulation.commit_index(NodeId(3)).expect("node exists"),
+            Some(2)
         );
     }
 

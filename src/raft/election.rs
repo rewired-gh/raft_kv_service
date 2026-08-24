@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{self, Display, Formatter},
 };
@@ -101,6 +101,7 @@ pub enum Message {
         term: Term,
         accepted: bool,
         match_index: u64,
+        request_previous_index: u64,
     },
 }
 
@@ -152,6 +153,16 @@ pub enum CoreError {
     InvalidAppendEntriesTerm {
         index: u64,
     },
+    InvalidAppendResponse {
+        match_index: u64,
+        last_index: u64,
+    },
+    CommittedLogConflict {
+        index: u64,
+        commit_index: u64,
+    },
+    NotLeader,
+    LeaderNotReady,
     InvalidRecoveredLog {
         expected: u64,
         found: u64,
@@ -194,6 +205,24 @@ impl Display for CoreError {
             Self::InvalidAppendEntriesTerm { index } => {
                 write!(formatter, "AppendEntries entry {index} has term zero")
             }
+            Self::InvalidAppendResponse {
+                match_index,
+                last_index,
+            } => write!(
+                formatter,
+                "invalid AppendEntries response match index {match_index}; leader last index is {last_index}"
+            ),
+            Self::CommittedLogConflict {
+                index,
+                commit_index,
+            } => write!(
+                formatter,
+                "AppendEntries would replace committed index {index} at commit index {commit_index}"
+            ),
+            Self::NotLeader => formatter.write_str("node is not the Raft leader"),
+            Self::LeaderNotReady => {
+                formatter.write_str("leader has not committed its current-term no-op")
+            }
             Self::InvalidRecoveredLog { expected, found } => write!(
                 formatter,
                 "invalid recovered log: expected index {expected}, found {found}"
@@ -231,7 +260,19 @@ struct AppendRequest {
 #[derive(Clone, Debug)]
 struct PendingLogPersistence {
     mutation: LogMutation,
-    request: AppendRequest,
+    continuation: PendingLogContinuation,
+}
+
+#[derive(Clone, Debug)]
+enum PendingLogContinuation {
+    FollowerAppend(AppendRequest),
+    LeaderEntry,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplicationProgress {
+    pub next_index: u64,
+    pub match_index: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +288,8 @@ pub struct RaftCore {
     append_after_hard_state: Option<AppendRequest>,
     pending_log: Option<PendingLogPersistence>,
     commit_index: u64,
+    replication: BTreeMap<NodeId, ReplicationProgress>,
+    leader_noop_index: Option<u64>,
 }
 
 impl RaftCore {
@@ -277,6 +320,8 @@ impl RaftCore {
             append_after_hard_state: None,
             pending_log: None,
             commit_index: 0,
+            replication: BTreeMap::new(),
+            leader_noop_index: None,
         })
     }
 
@@ -313,6 +358,17 @@ impl RaftCore {
         self.commit_index
     }
 
+    pub fn replication_progress(&self, peer: NodeId) -> Option<ReplicationProgress> {
+        self.replication.get(&peer).copied()
+    }
+
+    pub fn leader_ready(&self) -> bool {
+        self.role == Role::Leader
+            && self
+                .leader_noop_index
+                .is_some_and(|index| self.commit_index >= index)
+    }
+
     pub fn handle(&mut self, event: Event) -> Result<Vec<Effect>, CoreError> {
         if self.persistence_pending() {
             return Err(CoreError::PersistencePending);
@@ -323,6 +379,54 @@ impl RaftCore {
             Event::Receive(envelope) if envelope.to == self.id => self.handle_message(envelope),
             Event::Receive(_) => Ok(Vec::new()),
         }
+    }
+
+    pub fn propose(
+        &mut self,
+        payload: super::EntryPayload,
+    ) -> Result<(u64, Vec<Effect>), CoreError> {
+        if self.persistence_pending() {
+            return Err(CoreError::PersistencePending);
+        }
+        if self.role != Role::Leader {
+            return Err(CoreError::NotLeader);
+        }
+        if !self.leader_ready() {
+            return Err(CoreError::LeaderNotReady);
+        }
+
+        let previous = self.last_log_position();
+        let index = previous
+            .index
+            .checked_add(1)
+            .ok_or(CoreError::IndexExhausted)?;
+        let mutation = LogMutation {
+            previous,
+            entries: vec![LogEntry {
+                index,
+                term: self.hard_state.current_term,
+                payload,
+            }],
+        };
+        self.pending_log = Some(PendingLogPersistence {
+            mutation: mutation.clone(),
+            continuation: PendingLogContinuation::LeaderEntry,
+        });
+        Ok((index, vec![Effect::PersistLog(mutation)]))
+    }
+
+    pub fn heartbeat(&self) -> Result<Vec<Effect>, CoreError> {
+        if self.persistence_pending() {
+            return Err(CoreError::PersistencePending);
+        }
+        if self.role != Role::Leader {
+            return Err(CoreError::NotLeader);
+        }
+        let mut effects = Vec::new();
+        for peer in self.voters.peers(self.id) {
+            effects.push(self.append_for_peer(peer)?);
+        }
+        Ok(effects)
     }
 
     pub fn acknowledge_persisted(&mut self, observed: HardState) -> Result<Vec<Effect>, CoreError> {
@@ -348,7 +452,7 @@ impl RaftCore {
         }
 
         let mut effects = pending.after_persist;
-        self.promote_if_quorum(&mut effects);
+        self.promote_if_quorum(&mut effects)?;
         Ok(effects)
     }
 
@@ -368,7 +472,10 @@ impl RaftCore {
             .take()
             .ok_or(CoreError::NoPersistencePending)?;
         reconcile_log(&mut self.log, &pending.mutation.entries)?;
-        Ok(self.finish_append(pending.request))
+        match pending.continuation {
+            PendingLogContinuation::FollowerAppend(request) => Ok(self.finish_append(request)),
+            PendingLogContinuation::LeaderEntry => self.finish_leader_entry(),
+        }
     }
 
     fn handle_election_timeout(&mut self) -> Result<Vec<Effect>, CoreError> {
@@ -433,7 +540,18 @@ impl RaftCore {
                 entries,
                 leader_commit,
             }),
-            Message::AppendEntriesResponse { term, .. } => self.observe_response_term(term),
+            Message::AppendEntriesResponse {
+                term,
+                accepted,
+                match_index,
+                request_previous_index,
+            } => self.handle_append_response(
+                envelope.from,
+                term,
+                accepted,
+                match_index,
+                request_previous_index,
+            ),
         }
     }
 
@@ -524,13 +642,17 @@ impl RaftCore {
 
         self.granted_votes.insert(voter);
         let mut effects = Vec::new();
-        self.promote_if_quorum(&mut effects);
+        self.promote_if_quorum(&mut effects)?;
         Ok(effects)
     }
 
     fn handle_append_entries(&mut self, request: AppendRequest) -> Result<Vec<Effect>, CoreError> {
         if request.sender != request.leader || request.term < self.hard_state.current_term {
-            return Ok(vec![self.append_response(request.sender, false)]);
+            return Ok(vec![self.append_response(
+                request.sender,
+                false,
+                request.previous.index,
+            )]);
         }
         validate_append_entries(request.previous.index, &request.entries)?;
 
@@ -561,8 +683,17 @@ impl RaftCore {
 
         let mut effects = vec![Effect::ResetElectionTimer];
         if self.term_at(request.previous.index) != Some(request.previous.term) {
-            effects.push(self.append_response(request.sender, false));
+            effects.push(self.append_response(request.sender, false, request.previous.index));
             return Ok(effects);
+        }
+
+        if let Some(conflict_index) = first_log_difference(&self.log, &request.entries)
+            && conflict_index <= self.commit_index
+        {
+            return Err(CoreError::CommittedLogConflict {
+                index: conflict_index,
+                commit_index: self.commit_index,
+            });
         }
 
         if log_requires_update(&self.log, &request.entries) {
@@ -572,7 +703,7 @@ impl RaftCore {
             };
             self.pending_log = Some(PendingLogPersistence {
                 mutation: mutation.clone(),
-                request,
+                continuation: PendingLogContinuation::FollowerAppend(request),
             });
             effects.push(Effect::PersistLog(mutation));
             return Ok(effects);
@@ -600,17 +731,72 @@ impl RaftCore {
                 term: self.hard_state.current_term,
                 accepted: true,
                 match_index,
+                request_previous_index: request.previous.index,
             },
         }));
         effects
     }
 
-    fn observe_response_term(&mut self, term: Term) -> Result<Vec<Effect>, CoreError> {
+    fn handle_append_response(
+        &mut self,
+        peer: NodeId,
+        term: Term,
+        accepted: bool,
+        match_index: u64,
+        request_previous_index: u64,
+    ) -> Result<Vec<Effect>, CoreError> {
         if term > self.hard_state.current_term {
-            self.persist_higher_term(term)
-        } else {
-            Ok(Vec::new())
+            return self.persist_higher_term(term);
         }
+        if term < self.hard_state.current_term || self.role != Role::Leader {
+            return Ok(Vec::new());
+        }
+
+        let last_index = self.last_log_position().index;
+        if accepted && (match_index < request_previous_index || match_index > last_index) {
+            return Err(CoreError::InvalidAppendResponse {
+                match_index,
+                last_index,
+            });
+        }
+
+        let mut retry = false;
+        {
+            let Some(progress) = self.replication.get_mut(&peer) else {
+                return Ok(Vec::new());
+            };
+            if accepted {
+                progress.match_index = progress.match_index.max(match_index);
+                progress.next_index = progress.next_index.max(
+                    match_index
+                        .checked_add(1)
+                        .ok_or(CoreError::IndexExhausted)?,
+                );
+            } else if request_previous_index.checked_add(1) == Some(progress.next_index)
+                && progress.match_index < progress.next_index
+            {
+                progress.next_index = progress
+                    .next_index
+                    .saturating_sub(1)
+                    .max(progress.match_index.saturating_add(1))
+                    .max(1);
+                retry = true;
+            }
+        }
+
+        let mut effects = Vec::new();
+        let previous_commit = self.commit_index;
+        self.advance_leader_commit(&mut effects);
+        if retry {
+            effects.push(self.append_for_peer(peer)?);
+        }
+        if self.commit_index > previous_commit {
+            let peers = self.voters.peers(self.id).collect::<Vec<_>>();
+            for voter in peers {
+                effects.push(self.append_for_peer(voter)?);
+            }
+        }
+        Ok(effects)
     }
 
     fn persist_higher_term(&mut self, term: Term) -> Result<Vec<Effect>, CoreError> {
@@ -635,27 +821,110 @@ impl RaftCore {
         Ok(vec![Effect::PersistHardState(hard_state)])
     }
 
-    fn promote_if_quorum(&mut self, effects: &mut Vec<Effect>) {
+    fn promote_if_quorum(&mut self, effects: &mut Vec<Effect>) -> Result<(), CoreError> {
         if self.role != Role::Candidate || !self.voters.has_quorum(&self.granted_votes) {
-            return;
+            return Ok(());
         }
 
         self.role = Role::Leader;
         self.leader = Some(self.id);
         self.granted_votes.clear();
-        effects.extend(self.voters.peers(self.id).map(|peer| {
-            Effect::Send(Envelope {
-                from: self.id,
-                to: peer,
-                message: Message::AppendEntries {
-                    term: self.hard_state.current_term,
-                    leader: self.id,
-                    previous: self.last_log_position(),
-                    entries: Vec::new(),
-                    leader_commit: 0,
-                },
+        let previous = self.last_log_position();
+        let noop_index = previous
+            .index
+            .checked_add(1)
+            .ok_or(CoreError::IndexExhausted)?;
+        self.replication = self
+            .voters
+            .peers(self.id)
+            .map(|peer| {
+                (
+                    peer,
+                    ReplicationProgress {
+                        next_index: noop_index,
+                        match_index: 0,
+                    },
+                )
             })
-        }));
+            .collect();
+        self.leader_noop_index = Some(noop_index);
+        let mutation = LogMutation {
+            previous,
+            entries: vec![LogEntry {
+                index: noop_index,
+                term: self.hard_state.current_term,
+                payload: super::EntryPayload::Noop,
+            }],
+        };
+        self.pending_log = Some(PendingLogPersistence {
+            mutation: mutation.clone(),
+            continuation: PendingLogContinuation::LeaderEntry,
+        });
+        effects.push(Effect::PersistLog(mutation));
+        Ok(())
+    }
+
+    fn finish_leader_entry(&mut self) -> Result<Vec<Effect>, CoreError> {
+        let mut effects = Vec::new();
+        self.advance_leader_commit(&mut effects);
+        let peers = self.voters.peers(self.id).collect::<Vec<_>>();
+        for peer in peers {
+            effects.push(self.append_for_peer(peer)?);
+        }
+        Ok(effects)
+    }
+
+    fn append_for_peer(&self, peer: NodeId) -> Result<Effect, CoreError> {
+        let progress = self
+            .replication
+            .get(&peer)
+            .ok_or(CoreError::LocalNodeIsNotVoter(peer))?;
+        let previous_index = progress
+            .next_index
+            .checked_sub(1)
+            .ok_or(CoreError::IndexExhausted)?;
+        let previous_term = self
+            .term_at(previous_index)
+            .ok_or(CoreError::InvalidRecoveredLog {
+                expected: previous_index,
+                found: self.last_log_position().index,
+            })?;
+        let start = usize::try_from(previous_index).map_err(|_| CoreError::IndexExhausted)?;
+        let entries = self.log.get(start..).unwrap_or_default().to_vec();
+        Ok(Effect::Send(Envelope {
+            from: self.id,
+            to: peer,
+            message: Message::AppendEntries {
+                term: self.hard_state.current_term,
+                leader: self.id,
+                previous: LogPosition {
+                    index: previous_index,
+                    term: previous_term,
+                },
+                entries,
+                leader_commit: self.commit_index,
+            },
+        }))
+    }
+
+    fn advance_leader_commit(&mut self, effects: &mut Vec<Effect>) {
+        let last = self.last_log_position().index;
+        let mut candidate = last;
+        while candidate > self.commit_index {
+            if self.term_at(candidate) == Some(self.hard_state.current_term) {
+                let replicated = 1 + self
+                    .replication
+                    .values()
+                    .filter(|progress| progress.match_index >= candidate)
+                    .count();
+                if replicated > self.voters.0.len() / 2 {
+                    self.commit_index = candidate;
+                    effects.push(Effect::CommitIndexAdvanced(candidate));
+                    break;
+                }
+            }
+            candidate -= 1;
+        }
     }
 
     fn vote_response(&self, recipient: NodeId, vote_granted: bool) -> Effect {
@@ -669,7 +938,12 @@ impl RaftCore {
         })
     }
 
-    fn append_response(&self, recipient: NodeId, accepted: bool) -> Effect {
+    fn append_response(
+        &self,
+        recipient: NodeId,
+        accepted: bool,
+        request_previous_index: u64,
+    ) -> Effect {
         Effect::Send(Envelope {
             from: self.id,
             to: recipient,
@@ -677,6 +951,7 @@ impl RaftCore {
                 term: self.hard_state.current_term,
                 accepted,
                 match_index: self.last_log_position().index,
+                request_previous_index,
             },
         })
     }
@@ -708,14 +983,18 @@ fn validate_append_entries(previous: u64, entries: &[LogEntry]) -> Result<(), Co
 }
 
 fn log_requires_update(log: &[LogEntry], incoming: &[LogEntry]) -> bool {
-    incoming.iter().any(|entry| {
+    first_log_difference(log, incoming).is_some()
+}
+
+fn first_log_difference(log: &[LogEntry], incoming: &[LogEntry]) -> Option<u64> {
+    incoming.iter().find_map(|entry| {
         let Some(offset) = entry.index.checked_sub(1) else {
-            return true;
+            return Some(entry.index);
         };
         let Ok(position) = usize::try_from(offset) else {
-            return true;
+            return Some(entry.index);
         };
-        log.get(position) != Some(entry)
+        (log.get(position) != Some(entry)).then_some(entry.index)
     })
 }
 
@@ -820,10 +1099,20 @@ mod tests {
         let effects = node
             .acknowledge_persisted(hard_state)
             .expect("matching persistence is accepted");
-        assert_eq!(effects, vec![Effect::ResetElectionTimer]);
+        let mutation = match effects.as_slice() {
+            [Effect::ResetElectionTimer, Effect::PersistLog(mutation)] => mutation.clone(),
+            other => panic!("expected leader no-op persistence, got {other:?}"),
+        };
         assert_eq!(node.role(), Role::Leader);
         assert_eq!(node.leader(), Some(NodeId(1)));
         assert_eq!(node.hard_state().current_term, Term(1));
+        assert!(!node.leader_ready());
+
+        let effects = node
+            .acknowledge_log_persisted(mutation)
+            .expect("leader no-op persists");
+        assert_eq!(effects, vec![Effect::CommitIndexAdvanced(1)]);
+        assert!(node.leader_ready());
     }
 
     #[test]
@@ -974,6 +1263,13 @@ mod tests {
             .handle(receive(3, 1, response))
             .expect("third distinct vote is accepted");
         assert_eq!(node.role(), Role::Leader);
+        let mutation = match effects.as_slice() {
+            [Effect::PersistLog(mutation)] => mutation.clone(),
+            other => panic!("expected leader no-op persistence, got {other:?}"),
+        };
+        let effects = node
+            .acknowledge_log_persisted(mutation)
+            .expect("leader no-op persists");
         assert_eq!(effects.len(), 4);
         assert!(effects.iter().all(|effect| matches!(
             effect,
@@ -1025,7 +1321,8 @@ mod tests {
                     message: Message::AppendEntriesResponse {
                         term: Term(2),
                         accepted: true,
-                        match_index: 0
+                        match_index: 0,
+                        ..
                     },
                     ..
                 })
@@ -1117,6 +1414,7 @@ mod tests {
                         term: Term(4),
                         accepted: true,
                         match_index: 1,
+                        request_previous_index: 0,
                     },
                 }),
             ]
@@ -1162,7 +1460,8 @@ mod tests {
                 message: Message::AppendEntriesResponse {
                     term: Term(2),
                     accepted: true,
-                    match_index: 1
+                    match_index: 1,
+                    ..
                 },
                 ..
             })]
@@ -1212,5 +1511,116 @@ mod tests {
         ));
         assert!(!node.persistence_pending());
         assert_eq!(node.last_log_position().term, Term(2));
+    }
+
+    #[test]
+    fn stale_failure_cannot_regress_replication_progress() {
+        let mut node = core(1, &[1, 2, 3]);
+        let hard_state = persist_from(
+            &node
+                .handle(Event::ElectionTimeout)
+                .expect("timeout starts persistence"),
+        );
+        node.acknowledge_persisted(hard_state)
+            .expect("candidate state persists");
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::RequestVoteResponse {
+                    term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("quorum elects leader");
+        let mutation = match effects.as_slice() {
+            [Effect::PersistLog(mutation)] => mutation.clone(),
+            other => panic!("expected leader no-op persistence, got {other:?}"),
+        };
+        node.acknowledge_log_persisted(mutation)
+            .expect("leader no-op persists");
+
+        node.handle(receive(
+            2,
+            1,
+            Message::AppendEntriesResponse {
+                term: Term(1),
+                accepted: true,
+                match_index: 1,
+                request_previous_index: 0,
+            },
+        ))
+        .expect("successful replication is recorded");
+        assert_eq!(
+            node.replication_progress(NodeId(2)),
+            Some(ReplicationProgress {
+                next_index: 2,
+                match_index: 1
+            })
+        );
+
+        node.handle(receive(
+            2,
+            1,
+            Message::AppendEntriesResponse {
+                term: Term(1),
+                accepted: false,
+                match_index: 0,
+                request_previous_index: 0,
+            },
+        ))
+        .expect("stale failure is ignored");
+        assert_eq!(
+            node.replication_progress(NodeId(2)),
+            Some(ReplicationProgress {
+                next_index: 2,
+                match_index: 1
+            })
+        );
+    }
+
+    #[test]
+    fn follower_refuses_to_replace_its_committed_prefix() {
+        let mut node = RaftCore::new(
+            NodeId(2),
+            voters(&[1, 2, 3]),
+            HardState {
+                current_term: Term(5),
+                voted_for: None,
+            },
+            Vec::new(),
+        )
+        .expect("core configuration is valid");
+        let first = command_entry(1, 5, 1);
+        let effects = node
+            .handle(receive(
+                1,
+                2,
+                append_request(5, LogPosition::default(), vec![first], 1),
+            ))
+            .expect("first append starts persistence");
+        let mutation = match effects.as_slice() {
+            [Effect::ResetElectionTimer, Effect::PersistLog(mutation)] => mutation.clone(),
+            other => panic!("expected log persistence, got {other:?}"),
+        };
+        node.acknowledge_log_persisted(mutation)
+            .expect("first append commits");
+        assert_eq!(node.commit_index(), 1);
+
+        let error = node
+            .handle(receive(
+                1,
+                2,
+                append_request(5, LogPosition::default(), vec![command_entry(1, 5, 9)], 1),
+            ))
+            .expect_err("committed conflict must fail closed");
+        assert_eq!(
+            error,
+            CoreError::CommittedLogConflict {
+                index: 1,
+                commit_index: 1
+            }
+        );
+        assert_eq!(node.last_log_position().index, 1);
     }
 }
