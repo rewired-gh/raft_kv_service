@@ -9,8 +9,8 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use super::{AppendOutcome, EntryPayload, LogEntry, RaftStorage};
-use crate::raft::{HardState, LogPosition, NodeId, Term};
+use super::{AppendOutcome, RaftStorage};
+use crate::raft::{EntryPayload, HardState, LogEntry, LogPosition, NodeId, Term};
 
 const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

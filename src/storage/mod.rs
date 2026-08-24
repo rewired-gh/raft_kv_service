@@ -4,22 +4,9 @@ mod sqlite;
 
 use std::{error::Error, fmt::Debug};
 
-use crate::raft::{HardState, LogPosition, Term};
+use crate::raft::{HardState, LogEntry, LogPosition, Term};
 
 pub use sqlite::SqliteStorage;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EntryPayload {
-    Noop,
-    Command(Vec<u8>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LogEntry {
-    pub index: u64,
-    pub term: Term,
-    pub payload: EntryPayload,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendOutcome {

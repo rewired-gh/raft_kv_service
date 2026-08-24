@@ -5,9 +5,11 @@
 //! explicit durable-state acknowledgement barrier.
 
 mod election;
+mod log;
 pub mod simulator;
 
 pub use election::{
-    CoreError, Effect, Envelope, Event, HardState, LogPosition, Message, NodeId, RaftCore, Role,
-    Term, VoterSet,
+    CoreError, Effect, Envelope, Event, HardState, LogMutation, LogPosition, Message, NodeId,
+    RaftCore, Role, Term, VoterSet,
 };
+pub use log::{EntryPayload, LogEntry};

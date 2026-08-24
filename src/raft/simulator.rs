@@ -7,13 +7,16 @@ use std::{
 };
 
 use super::{
-    CoreError, Effect, Envelope, Event, HardState, LogPosition, NodeId, RaftCore, Role, VoterSet,
+    CoreError, Effect, Envelope, Event, HardState, LogEntry, LogMutation, NodeId, RaftCore, Role,
+    Term, VoterSet,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraceEvent {
     ElectionTimeout(NodeId),
     HardStatePersisted(NodeId, HardState),
+    LogPersisted(NodeId, LogMutation),
+    CommitIndexAdvanced(NodeId, u64),
     MessageSent(Envelope),
     MessageDelivered(Envelope),
     MessageDropped(Envelope),
@@ -23,12 +26,17 @@ pub enum TraceEvent {
     StalePersistenceDiscarded(NodeId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Scheduled {
     Persist {
         node: NodeId,
         generation: u64,
         hard_state: HardState,
+    },
+    PersistLog {
+        node: NodeId,
+        generation: u64,
+        mutation: LogMutation,
     },
     Deliver(Envelope),
 }
@@ -37,7 +45,7 @@ enum Scheduled {
 struct SimNode {
     core: Option<RaftCore>,
     durable: HardState,
-    last_log: LogPosition,
+    log: Vec<LogEntry>,
     generation: u64,
 }
 
@@ -84,14 +92,14 @@ impl ClusterSimulator {
         let mut nodes = BTreeMap::new();
         for id in ids {
             let durable = HardState::default();
-            let last_log = LogPosition::default();
-            let core = RaftCore::new(id, voters.clone(), durable, last_log)?;
+            let log = Vec::new();
+            let core = RaftCore::new(id, voters.clone(), durable, log.clone())?;
             nodes.insert(
                 id,
                 SimNode {
                     core: Some(core),
                     durable,
-                    last_log,
+                    log,
                     generation: 0,
                 },
             );
@@ -154,6 +162,11 @@ impl ClusterSimulator {
                 generation,
                 hard_state,
             } => self.persist(node, generation, hard_state)?,
+            Scheduled::PersistLog {
+                node,
+                generation,
+                mutation,
+            } => self.persist_log(node, generation, mutation)?,
             Scheduled::Deliver(envelope) => self.deliver(envelope)?,
         }
         Ok(true)
@@ -197,7 +210,7 @@ impl ClusterSimulator {
             node,
             voters,
             sim_node.durable,
-            sim_node.last_log,
+            sim_node.log.clone(),
         )?);
         self.reset_election_deadline(node)?;
         self.trace.push(TraceEvent::NodeRestarted(node));
@@ -211,7 +224,7 @@ impl ClusterSimulator {
                 if (envelope.from == first && envelope.to == second)
                     || (envelope.from == second && envelope.to == first) =>
             {
-                dropped.push(*envelope);
+                dropped.push(envelope.clone());
                 false
             }
             _ => true,
@@ -226,10 +239,10 @@ impl ClusterSimulator {
         let mut dropped = Vec::new();
         self.scheduled.retain(|scheduled| match scheduled {
             Scheduled::Deliver(envelope) => {
-                dropped.push(*envelope);
+                dropped.push(envelope.clone());
                 false
             }
-            Scheduled::Persist { .. } => true,
+            Scheduled::Persist { .. } | Scheduled::PersistLog { .. } => true,
         });
         let count = dropped.len();
         self.trace
@@ -285,15 +298,39 @@ impl ClusterSimulator {
     }
 
     fn deliver(&mut self, envelope: Envelope) -> Result<(), SimError> {
-        if self.node(envelope.to)?.core.is_none() {
+        let recipient = envelope.to;
+        if self.node(recipient)?.core.is_none() {
             self.trace.push(TraceEvent::MessageDropped(envelope));
             return Ok(());
         }
-        self.trace.push(TraceEvent::MessageDelivered(envelope));
-        let effects = self
-            .core_mut(envelope.to)?
-            .handle(Event::Receive(envelope))?;
-        self.schedule_effects(envelope.to, effects)
+        self.trace
+            .push(TraceEvent::MessageDelivered(envelope.clone()));
+        let effects = self.core_mut(recipient)?.handle(Event::Receive(envelope))?;
+        self.schedule_effects(recipient, effects)
+    }
+
+    fn persist_log(
+        &mut self,
+        node: NodeId,
+        generation: u64,
+        mutation: LogMutation,
+    ) -> Result<(), SimError> {
+        let sim_node = self.node_mut(node)?;
+        if sim_node.generation != generation || sim_node.core.is_none() {
+            self.trace.push(TraceEvent::StalePersistenceDiscarded(node));
+            return Ok(());
+        }
+        if term_at(&sim_node.log, mutation.previous.index) != Some(mutation.previous.term) {
+            return Err(SimError::StorageLogMismatch(node));
+        }
+        apply_log_mutation(&mut sim_node.log, &mutation.entries)?;
+        let effects = sim_node
+            .core
+            .as_mut()
+            .ok_or(SimError::NodeOffline(node))?
+            .acknowledge_log_persisted(mutation.clone())?;
+        self.trace.push(TraceEvent::LogPersisted(node, mutation));
+        self.schedule_effects(node, effects)
     }
 
     fn schedule_effects(&mut self, node: NodeId, effects: Vec<Effect>) -> Result<(), SimError> {
@@ -307,13 +344,25 @@ impl ClusterSimulator {
                         hard_state,
                     });
                 }
+                Effect::PersistLog(mutation) => {
+                    let generation = self.node(node)?.generation;
+                    self.scheduled.push_front(Scheduled::PersistLog {
+                        node,
+                        generation,
+                        mutation,
+                    });
+                }
                 Effect::Send(envelope) => {
-                    self.trace.push(TraceEvent::MessageSent(envelope));
+                    self.trace.push(TraceEvent::MessageSent(envelope.clone()));
                     self.scheduled.push_back(Scheduled::Deliver(envelope));
                 }
                 Effect::ResetElectionTimer => {
                     self.trace.push(TraceEvent::ElectionTimerReset(node));
                     self.reset_election_deadline(node)?;
+                }
+                Effect::CommitIndexAdvanced(index) => {
+                    self.trace
+                        .push(TraceEvent::CommitIndexAdvanced(node, index));
                 }
             }
         }
@@ -362,6 +411,31 @@ impl ClusterSimulator {
     }
 }
 
+fn term_at(log: &[LogEntry], index: u64) -> Option<Term> {
+    if index == 0 {
+        return Some(Term(0));
+    }
+    let position = usize::try_from(index.checked_sub(1)?).ok()?;
+    log.get(position).map(|entry| entry.term)
+}
+
+fn apply_log_mutation(log: &mut Vec<LogEntry>, entries: &[LogEntry]) -> Result<(), SimError> {
+    for (incoming_position, entry) in entries.iter().enumerate() {
+        let offset = entry
+            .index
+            .checked_sub(1)
+            .ok_or(SimError::LogIndexExhausted)?;
+        let position = usize::try_from(offset).map_err(|_| SimError::LogIndexExhausted)?;
+        if log.get(position) == Some(entry) {
+            continue;
+        }
+        log.truncate(position);
+        log.extend_from_slice(&entries[incoming_position..]);
+        break;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimError {
     Core(CoreError),
@@ -370,6 +444,8 @@ pub enum SimError {
     NodeAlreadyOnline(NodeId),
     GenerationExhausted(NodeId),
     StepLimitExceeded(usize),
+    StorageLogMismatch(NodeId),
+    LogIndexExhausted,
     InvalidElectionTimeoutRange { min: u64, max: u64 },
     NoElectionDeadline,
     TimeExhausted,
@@ -396,6 +472,14 @@ impl Display for SimError {
             Self::StepLimitExceeded(limit) => {
                 write!(formatter, "simulation exceeded {limit} deterministic steps")
             }
+            Self::StorageLogMismatch(node) => {
+                write!(
+                    formatter,
+                    "simulated durable log mismatch on node {}",
+                    node.0
+                )
+            }
+            Self::LogIndexExhausted => formatter.write_str("simulated Raft log index exhausted"),
             Self::InvalidElectionTimeoutRange { min, max } => {
                 write!(formatter, "invalid election timeout range {min}..={max}")
             }
