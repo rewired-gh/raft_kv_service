@@ -1,0 +1,66 @@
+schema_version = 1
+
+[toolchain]
+rust = "1.98.0"
+tla_tools = "1.7.4"
+tla_tools_sha256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+apalache = "0.58.3"
+
+[policy]
+version_strategy = "reviewed latest-stable updates with immutable lock files and release digests"
+pull_request_checks = ["format", "clippy", "unit", "integration"]
+scheduled_checks = ["extended-model", "fuzz", "mutation", "supply-chain"]
+
+[[property]]
+id = "election-safety"
+spec_section = "12.1.1"
+model = "formal/RaftElection.tla"
+invariant = "ElectionSafety"
+status = "partial"
+evidence = [
+  "formal/RaftElection.cfg",
+  "verification/evidence/m1-fast-tlc.toml",
+]
+
+[[property]]
+id = "vote-persistence-ordering"
+spec_section = "11"
+model = "formal/RaftElection.tla"
+invariant = "MessagesUseDurableTermAndVote"
+status = "partial"
+evidence = [
+  "formal/RaftElection.cfg",
+  "verification/evidence/m1-fast-tlc.toml",
+]
+
+[[property]]
+id = "log-matching"
+spec_section = "12.1.2"
+model = "formal/Raft.tla"
+invariant = "LogMatching"
+status = "planned"
+evidence = []
+
+[[property]]
+id = "state-machine-safety"
+spec_section = "12.1.5"
+model = "formal/Raft.tla"
+invariant = "StateMachineSafety"
+status = "planned"
+evidence = []
+
+[[property]]
+id = "configuration-safety"
+spec_section = "12.1.7"
+model = "formal/RaftMembership.tla"
+invariant = "ConfigurationSafety"
+status = "planned"
+evidence = []
+
+[[property]]
+id = "crud-linearizability"
+spec_section = "12.2.1"
+model = "verification/history-model"
+invariant = "Linearizable"
+status = "planned"
+evidence = []

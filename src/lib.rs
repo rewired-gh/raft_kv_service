@@ -1,5 +1,6 @@
 pub mod config;
 pub mod http;
+pub mod raft;
 pub mod telemetry;
 
 use std::net::SocketAddr;

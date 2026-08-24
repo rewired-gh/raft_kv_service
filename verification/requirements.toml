@@ -1,0 +1,62 @@
+schema_version = 1
+specification = "docs/specification.md"
+
+# Status is one of: planned, partial, verified.
+
+[[requirement]]
+id = "M0"
+spec_sections = ["19.M0"]
+status = "verified"
+evidence = [
+  "docs/roadmap.md",
+  "docs/adr/README.md",
+  "verification/manifest.toml",
+  ".github/workflows/ci.yaml",
+]
+
+[[requirement]]
+id = "M1"
+spec_sections = ["10.1", "11", "13", "14.1", "14.3", "19.M1"]
+status = "partial"
+evidence = [
+  "src/raft/election.rs",
+  "src/raft/simulator.rs",
+  "formal/RaftElection.tla",
+  "verification/evidence/m1-fast-tlc.toml",
+]
+
+[[requirement]]
+id = "M2"
+spec_sections = ["10.2", "12.1", "19.M2"]
+status = "planned"
+evidence = []
+
+[[requirement]]
+id = "M3"
+spec_sections = ["6", "7", "8", "12.2", "19.M3"]
+status = "planned"
+evidence = []
+
+[[requirement]]
+id = "M4"
+spec_sections = ["10.4", "19.M4"]
+status = "planned"
+evidence = []
+
+[[requirement]]
+id = "M5"
+spec_sections = ["10.5", "19.M5"]
+status = "planned"
+evidence = []
+
+[[requirement]]
+id = "M6"
+spec_sections = ["15", "16", "17", "18", "19.M6"]
+status = "planned"
+evidence = []
+
+[[requirement]]
+id = "M7"
+spec_sections = ["13", "14", "19.M7", "20"]
+status = "planned"
+evidence = []
