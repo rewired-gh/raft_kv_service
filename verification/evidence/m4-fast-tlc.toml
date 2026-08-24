@@ -1,0 +1,32 @@
+schema_version = 1
+property_set = "m4-snapshot-compaction"
+recorded_at = "2026-08-24T11:57:48+08:00"
+tool = "TLC"
+tool_version = "2.19 (TLA+ tools 1.7.4)"
+command = "./scripts/tlc.sh check formal/RaftSnapshot.cfg"
+model = "formal/RaftSnapshot.tla"
+model_sha256 = "697f11da6a0b28fc74ba0fb8e0cbbc76da3fd3c400a9e2f71a4da17a5f0e2fca"
+configuration = "formal/RaftSnapshot.cfg"
+configuration_sha256 = "72dc716815f7afbb9dd8dcce42d126322eec35541843beba9a9da293b4a67756"
+generated_states = 311651
+distinct_states = 39134
+search_depth = 26
+result = "pass"
+
+[parameters]
+nodes = 2
+max_log_index = 2
+terms = 1
+transfer_chunks = 2
+transfer_retries = 1
+symmetry_reduction = true
+
+invariants = [
+  "TypeOK",
+  "IndexOrder",
+  "ApplicationImageConsistent",
+  "VirtualPrefixValid",
+  "RetainedSuffixContiguous",
+  "PublishedOrigin",
+  "TransferBounded",
+]

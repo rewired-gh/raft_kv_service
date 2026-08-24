@@ -1,0 +1,24 @@
+schema_version = 1
+property_set = "m4-runtime-snapshot-and-recovery"
+recorded_at = "2026-08-24T11:57:48+08:00"
+command = "make check"
+result = "pass"
+rust_tests = 70
+tlc_models = [
+  "formal/RaftElection.cfg",
+  "formal/Raft.cfg",
+  "formal/KvStateMachine.cfg",
+  "formal/RaftSnapshot.cfg",
+]
+
+evidence = [
+  "atomic logical snapshot publication and covered-log compaction",
+  "KV and client-deduplication snapshot equivalence under generated workloads",
+  "wrong-cluster, unsupported-format, malformed, stale, and digest rejection",
+  "abrupt-exit recovery after snapshot publication",
+  "virtual-prefix core recovery and subsequent log consistency",
+  "bounded chunk identity, offset, total-size, and digest validation",
+  "interrupted deterministic transfer and protocol-driven retry",
+  "late real gRPC follower catch-up exclusively through snapshot installation",
+  "versioned payload-redacted M4 trace validation",
+]

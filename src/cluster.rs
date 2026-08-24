@@ -628,6 +628,28 @@ impl NodeWorker {
             payload: staging.bytes,
             digest: staging.snapshot_id,
         };
+        if snapshot.voters != self.raft.core().voters().members().collect::<Vec<_>>() {
+            return Err(Status::invalid_argument(
+                "snapshot voter set does not match the node",
+            ));
+        }
+        if snapshot.last_included.index < self.raft.core().last_applied() {
+            return Err(Status::failed_precondition(
+                "snapshot is older than applied state",
+            ));
+        }
+        if let Some(current) = self
+            .raft
+            .storage()
+            .current_snapshot()
+            .map_err(|error| Status::internal(error.to_string()))?
+            && current.last_included.index == snapshot.last_included.index
+            && current.digest != snapshot.digest
+        {
+            return Err(Status::invalid_argument(
+                "snapshot conflicts at the included index",
+            ));
+        }
         self.raft
             .storage()
             .validate_snapshot_for_cluster(self.config.cluster_id.0, &snapshot)

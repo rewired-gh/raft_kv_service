@@ -2,11 +2,12 @@
 
 A production-shaped Rust microservice foundation. The current implementation
 provides HTTP lifecycle, configuration, observability, tests, containers, and
-CI. The completed M1 through M3 milestones provide a deterministic Raft election
+CI. The completed M1 through M4 milestones provide a deterministic Raft election
 and static-cluster replication core, explicit persistence and ordered-
 application barriers, transactional SQLite storage, a crash/partition-aware
 simulator, versioned protocol traces, bounded TLA+ models, transactional CRUD,
-deduplicated retries, follower forwarding, and external linearizability checks.
+deduplicated retries, follower forwarding, external linearizability checks,
+and atomic logical snapshots with resumable lagging-follower installation.
 
 The normative project goals, correctness claims, protocol scope, verification
 strategy, and milestone gates are defined in

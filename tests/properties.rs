@@ -4,8 +4,8 @@ use raft_kv_service::{
         ClientId, Command, KvStateMachine, Mutation, MutationCommand, decode_command,
         encode_command,
     },
-    raft::{EntryPayload, LogEntry, Term},
-    storage::{RaftStorage, SqliteStorage, StateMachineStorage},
+    raft::{EntryPayload, LogEntry, NodeId, Term},
+    storage::{RaftStorage, SnapshotStorage, SqliteStorage, StateMachineStorage},
 };
 
 fn command_strategy() -> impl Strategy<Value = Command> {
@@ -75,8 +75,16 @@ proptest! {
     ) {
         let mut model = KvStateMachine::new(10_000).expect("state machine");
         let mut storage = SqliteStorage::open_in_memory().expect("storage");
+        let noop = LogEntry {
+            index: 1,
+            term: Term(1),
+            payload: EntryPayload::Noop,
+        };
+        storage.append_local(&noop).expect("append noop");
+        storage.apply_committed(&[noop]).expect("apply noop");
+        let mut last_command = None;
         for (offset, (key, value, expected_revision, kind)) in actions.iter().enumerate() {
-            let index = u64::try_from(offset + 1).expect("bounded index");
+            let index = u64::try_from(offset + 2).expect("bounded index");
             let mutation = match kind {
                 0 => Mutation::Create { key: key.clone(), value: value.clone() },
                 1 => Mutation::Update {
@@ -94,6 +102,7 @@ proptest! {
                 sequence: 1,
                 mutation,
             });
+            last_command = Some(command.clone());
             let expected = model.apply(index, &command).expect("model application");
             let entry = LogEntry {
                 index,
@@ -104,6 +113,33 @@ proptest! {
             let applied = storage.apply_committed(&[entry]).expect("apply");
             prop_assert_eq!(applied[0].result.as_ref(), Some(&expected));
             prop_assert_eq!(storage.value(key).expect("stored value"), model.get(key).cloned());
+        }
+
+        let snapshot = storage
+            .create_snapshot([3; 16], &[NodeId(1)])
+            .expect("create generated snapshot");
+        let mut restored = SqliteStorage::open_in_memory().expect("restored storage");
+        restored
+            .install_snapshot([3; 16], &snapshot)
+            .expect("install generated snapshot");
+        for (key, ..) in &actions {
+            prop_assert_eq!(restored.value(key).expect("restored value"), model.get(key).cloned());
+        }
+        if let Some(command) = last_command {
+            let index = u64::try_from(actions.len() + 2).expect("bounded retry index");
+            let retry = LogEntry {
+                index,
+                term: Term(1),
+                payload: EntryPayload::Command(encode_command(&command).expect("encode retry")),
+            };
+            storage.append_local(&retry).expect("append source retry");
+            restored.append_local(&retry).expect("append restored retry");
+            prop_assert_eq!(
+                storage
+                    .apply_committed(std::slice::from_ref(&retry))
+                    .expect("source retry"),
+                restored.apply_committed(&[retry]).expect("restored retry"),
+            );
         }
     }
 }

@@ -64,8 +64,20 @@ evidence = [
 [[requirement]]
 id = "M4"
 spec_sections = ["10.4", "19.M4"]
-status = "planned"
-evidence = []
+status = "verified"
+evidence = [
+  "docs/adr/0004-snapshot-format.md",
+  "src/storage/sqlite.rs",
+  "src/raft/election.rs",
+  "src/cluster.rs",
+  "src/raft/simulator.rs",
+  "src/raft/trace.rs",
+  "formal/RaftSnapshot.tla",
+  "tests/properties.rs",
+  "tests/storage_contract.rs",
+  "verification/evidence/m4-fast-tlc.toml",
+  "verification/evidence/m4-runtime.toml",
+]
 
 [[requirement]]
 id = "M5"

@@ -1,4 +1,4 @@
-//! Stable, payload-redacted protocol traces and M2 abstraction validation.
+//! Stable, payload-redacted protocol traces and abstraction validation.
 
 use std::{
     collections::BTreeMap,
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Envelope, Message, simulator::TraceEvent};
 
-pub const TRACE_SCHEMA_VERSION: u16 = 1;
+pub const TRACE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +27,10 @@ pub enum TraceAction {
     NodeCrashed,
     NodeRestarted,
     StalePersistenceDiscarded,
+    SnapshotPublished,
+    SnapshotTransferStarted,
+    SnapshotTransferInterrupted,
+    SnapshotInstalled,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,6 +141,12 @@ impl ProtocolTrace {
                     }
                     *known_applied = index;
                 }
+                TraceAction::SnapshotInstalled => {
+                    let index = required(record.index, record.sequence, "index")?;
+                    *known_log = (*known_log).max(index);
+                    *known_commit = (*known_commit).max(index);
+                    *known_applied = (*known_applied).max(index);
+                }
                 TraceAction::MessageSent => validate_send(record, *known_term, *known_log)?,
                 TraceAction::ElectionTimeout
                 | TraceAction::MessageDelivered
@@ -144,7 +154,73 @@ impl ProtocolTrace {
                 | TraceAction::ElectionTimerReset
                 | TraceAction::NodeCrashed
                 | TraceAction::NodeRestarted
-                | TraceAction::StalePersistenceDiscarded => {}
+                | TraceAction::StalePersistenceDiscarded
+                | TraceAction::SnapshotPublished
+                | TraceAction::SnapshotTransferStarted
+                | TraceAction::SnapshotTransferInterrupted => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_m4_abstraction(&self) -> Result<(), TraceError> {
+        self.validate_m2_abstraction()?;
+        let mut applied = BTreeMap::<u64, u64>::new();
+        let mut snapshots = BTreeMap::<u64, (u64, u64)>::new();
+        let mut transfers = BTreeMap::<u64, (u64, u64, u64)>::new();
+        for record in &self.records {
+            match record.action {
+                TraceAction::EntriesApplied => {
+                    applied.insert(
+                        record.node,
+                        required(record.index, record.sequence, "index")?,
+                    );
+                }
+                TraceAction::SnapshotPublished => {
+                    let index = required(record.index, record.sequence, "index")?;
+                    let term = required(record.term, record.sequence, "term")?;
+                    if index == 0 || term == 0 || index > *applied.entry(record.node).or_default() {
+                        return Err(TraceError::InvalidSnapshotPublication(record.sequence));
+                    }
+                    if snapshots
+                        .get(&record.node)
+                        .is_some_and(|(previous, _)| index <= *previous)
+                    {
+                        return Err(TraceError::SnapshotRegression(record.sequence));
+                    }
+                    snapshots.insert(record.node, (index, term));
+                }
+                TraceAction::SnapshotTransferStarted => {
+                    let peer = required(record.peer, record.sequence, "peer")?;
+                    let index = required(record.index, record.sequence, "index")?;
+                    let term = required(record.term, record.sequence, "term")?;
+                    if snapshots.get(&record.node) != Some(&(index, term)) {
+                        return Err(TraceError::UnknownSnapshotTransfer(record.sequence));
+                    }
+                    transfers.insert(peer, (record.node, index, term));
+                }
+                TraceAction::SnapshotTransferInterrupted => {
+                    let peer = required(record.peer, record.sequence, "peer")?;
+                    transfers.remove(&peer);
+                }
+                TraceAction::SnapshotInstalled => {
+                    let source = required(record.peer, record.sequence, "peer")?;
+                    let index = required(record.index, record.sequence, "index")?;
+                    let term = required(record.term, record.sequence, "term")?;
+                    if transfers.get(&record.node) != Some(&(source, index, term)) {
+                        return Err(TraceError::InstallWithoutTransfer(record.sequence));
+                    }
+                    if snapshots
+                        .get(&record.node)
+                        .is_some_and(|(previous, _)| index < *previous)
+                    {
+                        return Err(TraceError::SnapshotRegression(record.sequence));
+                    }
+                    snapshots.insert(record.node, (index, term));
+                    applied.insert(record.node, index);
+                    transfers.remove(&record.node);
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -249,6 +325,33 @@ fn record(sequence: u64, event: &TraceEvent) -> TraceRecord {
             record.action = TraceAction::StalePersistenceDiscarded;
             record.node = node.0;
         }
+        TraceEvent::SnapshotPublished(node, position) => {
+            record.action = TraceAction::SnapshotPublished;
+            record.node = node.0;
+            record.index = Some(position.index);
+            record.term = Some(position.term.0);
+        }
+        TraceEvent::SnapshotTransferStarted(node, peer, position) => {
+            record.action = TraceAction::SnapshotTransferStarted;
+            record.node = node.0;
+            record.peer = Some(peer.0);
+            record.index = Some(position.index);
+            record.term = Some(position.term.0);
+        }
+        TraceEvent::SnapshotTransferInterrupted(node, peer, position) => {
+            record.action = TraceAction::SnapshotTransferInterrupted;
+            record.node = node.0;
+            record.peer = Some(peer.0);
+            record.index = Some(position.index);
+            record.term = Some(position.term.0);
+        }
+        TraceEvent::SnapshotInstalled(node, source, position) => {
+            record.action = TraceAction::SnapshotInstalled;
+            record.node = node.0;
+            record.peer = Some(source.0);
+            record.index = Some(position.index);
+            record.term = Some(position.term.0);
+        }
     }
     record
 }
@@ -314,6 +417,10 @@ pub enum TraceError {
     MessageBeforeHardState(u64),
     AppendBeforeDurableLog(u64),
     AcknowledgementBeforeDurableLog(u64),
+    InvalidSnapshotPublication(u64),
+    SnapshotRegression(u64),
+    UnknownSnapshotTransfer(u64),
+    InstallWithoutTransfer(u64),
 }
 
 impl Display for TraceError {

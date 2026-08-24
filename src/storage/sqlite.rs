@@ -693,6 +693,12 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
     for _ in 0..key_count {
         let key = String::from_utf8(input.bytes()?).map_err(|_| StorageError::SnapshotEncoding)?;
         validate_key(&key).map_err(StorageError::Command)?;
+        if keys
+            .last()
+            .is_some_and(|previous: &SnapshotKey| previous.key.as_str() >= key.as_str())
+        {
+            return Err(StorageError::SnapshotEncoding);
+        }
         let value = input.bytes()?;
         let revision = input.u64()?;
         if revision == 0 || revision > position.index {
@@ -718,7 +724,11 @@ fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError>
             .map_err(|_| StorageError::SnapshotEncoding)?;
         let result = input.bytes()?;
         decode_mutation_result(&result).map_err(StorageError::Command)?;
-        if sequence == 0 {
+        if sequence == 0
+            || clients
+                .last()
+                .is_some_and(|previous: &SnapshotClient| previous.client_id >= client_id)
+        {
             return Err(StorageError::SnapshotEncoding);
         }
         clients.push(SnapshotClient {

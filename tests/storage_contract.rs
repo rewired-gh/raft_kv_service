@@ -10,7 +10,7 @@ use raft_kv_service::{
         encode_command,
     },
     raft::{EntryPayload, HardState, LogEntry, LogPosition, NodeId, Term},
-    storage::{AppendOutcome, RaftStorage, SqliteStorage, StateMachineStorage},
+    storage::{AppendOutcome, RaftStorage, SnapshotStorage, SqliteStorage, StateMachineStorage},
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -122,12 +122,63 @@ fn abrupt_exit_after_commit_recovers_atomic_state_and_deduplication() {
 }
 
 #[test]
+fn abrupt_exit_after_snapshot_publication_recovers_compacted_state() {
+    let database = temp_database("snapshot-crash-contract");
+    let status = ProcessCommand::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "snapshot_crash_writer_process", "--nocapture"])
+        .env("RAFT_KV_SNAPSHOT_CRASH_DATABASE", &database)
+        .status()
+        .expect("run snapshot crash writer");
+    assert_eq!(
+        status.code(),
+        Some(92),
+        "writer must exit without destructors"
+    );
+
+    let storage = SqliteStorage::open(&database).expect("recover snapshotted storage");
+    let snapshot = storage
+        .current_snapshot()
+        .expect("load snapshot")
+        .expect("published snapshot");
+    assert_eq!(snapshot.last_included.index, 2);
+    assert_eq!(storage.last_applied().expect("last applied"), 2);
+    assert!(
+        storage
+            .entries_from(1, 10)
+            .expect("compacted log")
+            .is_empty()
+    );
+    assert_eq!(
+        storage.value("durable").expect("recovered value"),
+        Some(ValueRecord {
+            value: b"state".to_vec(),
+            revision: 2,
+        })
+    );
+    std::fs::remove_dir_all(database.parent().expect("database directory"))
+        .expect("remove exact test directory");
+}
+
+#[test]
 fn crash_writer_process() {
     let Ok(database) = std::env::var("RAFT_KV_CRASH_TEST_DATABASE") else {
         return;
     };
     write_committed_state(Path::new(&database));
     std::process::exit(91);
+}
+
+#[test]
+fn snapshot_crash_writer_process() {
+    let Ok(database) = std::env::var("RAFT_KV_SNAPSHOT_CRASH_DATABASE") else {
+        return;
+    };
+    write_committed_state(Path::new(&database));
+    let mut storage = SqliteStorage::open(&database).expect("reopen crash database");
+    storage
+        .create_snapshot([1; 16], &[NodeId(1)])
+        .expect("publish snapshot");
+    std::process::exit(92);
 }
 
 fn write_committed_state(database: &Path) {

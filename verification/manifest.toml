@@ -108,6 +108,18 @@ status = "planned"
 evidence = []
 
 [[property]]
+id = "snapshot-safety"
+spec_section = "10.4"
+model = "formal/RaftSnapshot.tla"
+invariant = "VirtualPrefixValid /\\ PublishedOrigin"
+status = "partial"
+evidence = [
+  "formal/RaftSnapshot.cfg",
+  "verification/evidence/m4-fast-tlc.toml",
+  "verification/evidence/m4-runtime.toml",
+]
+
+[[property]]
 id = "crud-linearizability"
 spec_section = "12.2.1"
 model = "src/history.rs"

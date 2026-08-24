@@ -25,6 +25,10 @@ pub enum TraceEvent {
     NodeCrashed(NodeId),
     NodeRestarted(NodeId),
     StalePersistenceDiscarded(NodeId),
+    SnapshotPublished(NodeId, super::LogPosition),
+    SnapshotTransferStarted(NodeId, NodeId, super::LogPosition),
+    SnapshotTransferInterrupted(NodeId, NodeId, super::LogPosition),
+    SnapshotInstalled(NodeId, NodeId, super::LogPosition),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +44,12 @@ enum Scheduled {
         mutation: LogMutation,
     },
     Deliver(Envelope),
+    InstallSnapshot {
+        from: NodeId,
+        to: NodeId,
+        term: Term,
+        position: super::LogPosition,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +57,8 @@ struct SimNode {
     core: Option<RaftCore>,
     durable: HardState,
     log: Vec<LogEntry>,
+    snapshot_position: super::LogPosition,
+    last_applied: u64,
     generation: u64,
 }
 
@@ -102,6 +114,8 @@ impl ClusterSimulator {
                     core: Some(core),
                     durable,
                     log,
+                    snapshot_position: super::LogPosition::default(),
+                    last_applied: 0,
                     generation: 0,
                 },
             );
@@ -182,6 +196,12 @@ impl ClusterSimulator {
                 mutation,
             } => self.persist_log(node, generation, mutation)?,
             Scheduled::Deliver(envelope) => self.deliver(envelope)?,
+            Scheduled::InstallSnapshot {
+                from,
+                to,
+                term,
+                position,
+            } => self.install_snapshot(from, to, term, position)?,
         }
         Ok(true)
     }
@@ -220,11 +240,13 @@ impl ClusterSimulator {
             .generation
             .checked_add(1)
             .ok_or(SimError::GenerationExhausted(node))?;
-        sim_node.core = Some(RaftCore::new(
+        sim_node.core = Some(RaftCore::recover_compacted(
             node,
             voters,
             sim_node.durable,
+            sim_node.snapshot_position,
             sim_node.log.clone(),
+            sim_node.last_applied,
         )?);
         self.reset_election_deadline(node)?;
         self.trace.push(TraceEvent::NodeRestarted(node));
@@ -233,6 +255,7 @@ impl ClusterSimulator {
 
     pub fn drop_messages_between(&mut self, first: NodeId, second: NodeId) -> usize {
         let mut dropped = Vec::new();
+        let mut interrupted = Vec::new();
         self.scheduled.retain(|scheduled| match scheduled {
             Scheduled::Deliver(envelope)
                 if (envelope.from == first && envelope.to == second)
@@ -241,11 +264,21 @@ impl ClusterSimulator {
                 dropped.push(envelope.clone());
                 false
             }
+            Scheduled::InstallSnapshot {
+                from, to, position, ..
+            } if (*from == first && *to == second) || (*from == second && *to == first) => {
+                interrupted.push((*from, *to, *position));
+                false
+            }
             _ => true,
         });
-        let count = dropped.len();
+        let count = dropped.len() + interrupted.len();
         self.trace
             .extend(dropped.into_iter().map(TraceEvent::MessageDropped));
+        self.trace
+            .extend(interrupted.into_iter().map(|(from, to, position)| {
+                TraceEvent::SnapshotTransferInterrupted(from, to, position)
+            }));
         count
     }
 
@@ -268,16 +301,27 @@ impl ClusterSimulator {
 
     pub fn drop_all_messages(&mut self) -> usize {
         let mut dropped = Vec::new();
+        let mut interrupted = Vec::new();
         self.scheduled.retain(|scheduled| match scheduled {
             Scheduled::Deliver(envelope) => {
                 dropped.push(envelope.clone());
                 false
             }
+            Scheduled::InstallSnapshot {
+                from, to, position, ..
+            } => {
+                interrupted.push((*from, *to, *position));
+                false
+            }
             Scheduled::Persist { .. } | Scheduled::PersistLog { .. } => true,
         });
-        let count = dropped.len();
+        let count = dropped.len() + interrupted.len();
         self.trace
             .extend(dropped.into_iter().map(TraceEvent::MessageDropped));
+        self.trace
+            .extend(interrupted.into_iter().map(|(from, to, position)| {
+                TraceEvent::SnapshotTransferInterrupted(from, to, position)
+            }));
         count
     }
 
@@ -290,15 +334,13 @@ impl ClusterSimulator {
     }
 
     pub fn last_log_position(&self, node: NodeId) -> Result<crate::raft::LogPosition, SimError> {
-        Ok(self
-            .node(node)?
+        let node = self.node(node)?;
+        Ok(node
             .log
             .last()
-            .map_or_else(crate::raft::LogPosition::default, |entry| {
-                crate::raft::LogPosition {
-                    index: entry.index,
-                    term: entry.term,
-                }
+            .map_or(node.snapshot_position, |entry| crate::raft::LogPosition {
+                index: entry.index,
+                term: entry.term,
             }))
     }
 
@@ -321,6 +363,30 @@ impl ClusterSimulator {
 
     pub fn trace(&self) -> &[TraceEvent] {
         &self.trace
+    }
+
+    pub fn compact(&mut self, node: NodeId) -> Result<super::LogPosition, SimError> {
+        let sim_node = self.node_mut(node)?;
+        let index = sim_node
+            .core
+            .as_ref()
+            .ok_or(SimError::NodeOffline(node))?
+            .last_applied();
+        let term = term_at(sim_node.snapshot_position, &sim_node.log, index)
+            .ok_or(SimError::StorageLogMismatch(node))?;
+        let position = super::LogPosition { index, term };
+        sim_node
+            .core
+            .as_mut()
+            .ok_or(SimError::NodeOffline(node))?
+            .compact_through(position)?;
+        let remove = usize::try_from(index - sim_node.snapshot_position.index)
+            .map_err(|_| SimError::LogIndexExhausted)?;
+        sim_node.log.drain(..remove);
+        sim_node.snapshot_position = position;
+        self.trace
+            .push(TraceEvent::SnapshotPublished(node, position));
+        Ok(position)
     }
 
     fn persist(
@@ -361,6 +427,68 @@ impl ClusterSimulator {
         self.schedule_effects(recipient, effects)
     }
 
+    fn install_snapshot(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        term: Term,
+        position: super::LogPosition,
+    ) -> Result<(), SimError> {
+        if self.node(to)?.core.is_none() || self.blocked_links.contains(&ordered_link(from, to)) {
+            self.trace
+                .push(TraceEvent::SnapshotTransferInterrupted(from, to, position));
+            return Ok(());
+        }
+        let voters = self.voters.clone();
+        let (response_term, persisted_state) = {
+            let target = self.node_mut(to)?;
+            let retains_suffix = term_at(target.snapshot_position, &target.log, position.index)
+                == Some(position.term);
+            if retains_suffix {
+                target.log.retain(|entry| entry.index > position.index);
+            } else {
+                target.log.clear();
+            }
+            let persisted_state = if term > target.durable.current_term {
+                target.durable = HardState {
+                    current_term: term,
+                    voted_for: None,
+                };
+                Some(target.durable)
+            } else {
+                None
+            };
+            target.snapshot_position = position;
+            target.last_applied = position.index;
+            target.core = Some(RaftCore::recover_compacted(
+                to,
+                voters,
+                target.durable,
+                position,
+                target.log.clone(),
+                position.index,
+            )?);
+            (target.durable.current_term, persisted_state)
+        };
+        if let Some(state) = persisted_state {
+            self.trace.push(TraceEvent::HardStatePersisted(to, state));
+        }
+        self.reset_election_deadline(to)?;
+        self.trace
+            .push(TraceEvent::SnapshotInstalled(to, from, position));
+        self.scheduled.push_back(Scheduled::Deliver(Envelope {
+            from: to,
+            to: from,
+            message: super::Message::AppendEntriesResponse {
+                term: response_term,
+                accepted: true,
+                match_index: position.index,
+                request_previous_index: position.index,
+            },
+        }));
+        Ok(())
+    }
+
     fn persist_log(
         &mut self,
         node: NodeId,
@@ -372,10 +500,19 @@ impl ClusterSimulator {
             self.trace.push(TraceEvent::StalePersistenceDiscarded(node));
             return Ok(());
         }
-        if term_at(&sim_node.log, mutation.previous.index) != Some(mutation.previous.term) {
+        if term_at(
+            sim_node.snapshot_position,
+            &sim_node.log,
+            mutation.previous.index,
+        ) != Some(mutation.previous.term)
+        {
             return Err(SimError::StorageLogMismatch(node));
         }
-        apply_log_mutation(&mut sim_node.log, &mutation.entries)?;
+        apply_log_mutation(
+            sim_node.snapshot_position.index,
+            &mut sim_node.log,
+            &mutation.entries,
+        )?;
         let effects = sim_node
             .core
             .as_mut()
@@ -425,12 +562,23 @@ impl ClusterSimulator {
                 }
                 Effect::ApplyCommitted(entries) => {
                     let last_index = entries.last().map_or(0, |entry| entry.index);
+                    self.node_mut(node)?.last_applied = last_index;
                     self.trace
                         .push(TraceEvent::EntriesApplied(node, last_index));
                     let continuation = self.core_mut(node)?.acknowledge_applied(last_index)?;
                     self.schedule_effects(node, continuation)?;
                 }
-                Effect::SendSnapshot { .. } => {}
+                Effect::SendSnapshot { to, last_included } => {
+                    let term = self.core_mut(node)?.hard_state().current_term;
+                    self.trace
+                        .push(TraceEvent::SnapshotTransferStarted(node, to, last_included));
+                    self.scheduled.push_back(Scheduled::InstallSnapshot {
+                        from: node,
+                        to,
+                        term,
+                        position: last_included,
+                    });
+                }
             }
         }
         Ok(())
@@ -486,19 +634,28 @@ fn ordered_link(first: NodeId, second: NodeId) -> (NodeId, NodeId) {
     }
 }
 
-fn term_at(log: &[LogEntry], index: u64) -> Option<Term> {
+fn term_at(snapshot_position: super::LogPosition, log: &[LogEntry], index: u64) -> Option<Term> {
     if index == 0 {
         return Some(Term(0));
     }
-    let position = usize::try_from(index.checked_sub(1)?).ok()?;
+    if index == snapshot_position.index {
+        return Some(snapshot_position.term);
+    }
+    let position =
+        usize::try_from(index.checked_sub(snapshot_position.index)?.checked_sub(1)?).ok()?;
     log.get(position).map(|entry| entry.term)
 }
 
-fn apply_log_mutation(log: &mut Vec<LogEntry>, entries: &[LogEntry]) -> Result<(), SimError> {
+fn apply_log_mutation(
+    base_index: u64,
+    log: &mut Vec<LogEntry>,
+    entries: &[LogEntry],
+) -> Result<(), SimError> {
     for (incoming_position, entry) in entries.iter().enumerate() {
         let offset = entry
             .index
-            .checked_sub(1)
+            .checked_sub(base_index)
+            .and_then(|offset| offset.checked_sub(1))
             .ok_or(SimError::LogIndexExhausted)?;
         let position = usize::try_from(offset).map_err(|_| SimError::LogIndexExhausted)?;
         if log.get(position) == Some(entry) {
@@ -675,6 +832,49 @@ mod tests {
             simulation.commit_index(NodeId(3)).expect("node exists"),
             Some(2)
         );
+    }
+
+    #[test]
+    fn compacted_leader_installs_snapshot_on_lagging_follower() {
+        let mut simulation = three_nodes();
+        simulation
+            .partition(NodeId(1), NodeId(3))
+            .expect("isolate lagging follower");
+        simulation.timeout(NodeId(1)).expect("start election");
+        simulation.run_until_idle(64).expect("elect leader");
+        simulation
+            .propose(NodeId(1), EntryPayload::Command(vec![7]))
+            .expect("propose entry");
+        simulation.run_until_idle(64).expect("commit entry");
+        assert_eq!(simulation.commit_index(NodeId(1)).expect("leader"), Some(2));
+        assert_eq!(simulation.compact(NodeId(1)).expect("compact").index, 2);
+
+        simulation.heal(NodeId(1), NodeId(3)).expect("heal link");
+        simulation
+            .heartbeat(NodeId(1))
+            .expect("begin interrupted snapshot");
+        assert!(simulation.drop_messages_between(NodeId(1), NodeId(3)) >= 1);
+        simulation
+            .heartbeat(NodeId(1))
+            .expect("retry snapshot from protocol state");
+        simulation
+            .run_until_idle(128)
+            .expect("install and acknowledge snapshot");
+        assert_eq!(
+            simulation.last_log_position(NodeId(3)).expect("follower"),
+            crate::raft::LogPosition {
+                index: 2,
+                term: Term(1),
+            }
+        );
+        simulation.crash(NodeId(3)).expect("crash follower");
+        simulation.restart(NodeId(3)).expect("recover snapshot");
+
+        let trace = crate::raft::trace::ProtocolTrace::from_simulator(simulation.trace())
+            .expect("build trace");
+        trace
+            .validate_m4_abstraction()
+            .expect("snapshot trace refines the M4 abstraction");
     }
 
     #[test]
