@@ -1,0 +1,89 @@
+schema_version = 1
+property_set = "m7-formal-closure"
+recorded_at = "2026-08-24T16:12:00+08:00"
+source_commit = "283b861356b444d6ff543e130aa4754add929a0c"
+result = "pass"
+command = "RAFT_KV_FORMAL_OUTPUT=target/formal-release-2/tlc RAFT_KV_APALACHE_OUTPUT=target/formal-release-2/apalache make formal-full"
+manifest_schema_version = 2
+manifest_sha256 = "e34289da0f61b8c706ee1d24ad375259042969730f2ae81a2d8a4c9b6df240eb"
+tla_tools_release = "1.7.4"
+tlc_version = "2.19"
+tlc_revision = "5a47802"
+apalache_version = "0.62.1"
+apalache_sha256 = "93fef2f381d30465eff906a2d6afa3358cb2c9adf6a8aad3bec0ded4f45432bb"
+inductive_model_sha256 = "f83406d1485c1ca94bb275c515163a5e51447ea97056c91419f856f0e4b7ea7e"
+inductive_configuration_sha256 = "7d11f18f307f7b88c3fc08ee8f16b3cf536e5ba31eaec17c1223a13f086acb57"
+
+[[model]]
+configuration = "formal/RaftElection.cfg"
+generated_states = 95296
+distinct_states = 11839
+runtime_seconds = 2
+result = "pass"
+
+[[model]]
+configuration = "formal/RaftElection.extended.cfg"
+generated_states = 18851
+distinct_states = 3892
+runtime_seconds = 2
+result = "pass"
+
+[[model]]
+configuration = "formal/Raft.cfg"
+generated_states = 78944
+distinct_states = 12243
+runtime_seconds = 3
+result = "pass"
+
+[[model]]
+configuration = "formal/Raft.extended.cfg"
+generated_states = 16100869
+distinct_states = 2431259
+runtime_seconds = 131
+result = "pass"
+
+[[model]]
+configuration = "formal/KvStateMachine.cfg"
+generated_states = 92853
+distinct_states = 5376
+runtime_seconds = 2
+result = "pass"
+
+[[model]]
+configuration = "formal/RaftSnapshot.cfg"
+generated_states = 311651
+distinct_states = 39134
+runtime_seconds = 3
+result = "pass"
+
+[[model]]
+configuration = "formal/RaftMembership.cfg"
+generated_states = 68488
+distinct_states = 5082
+runtime_seconds = 2
+result = "pass"
+
+[[model]]
+configuration = "formal/RaftLiveness.cfg"
+generated_states = 8
+distinct_states = 7
+runtime_seconds = 1
+result = "pass"
+
+[[inductive_obligation]]
+name = "initialization"
+formula = "Init => InductiveInvariant"
+result = "pass"
+
+[[inductive_obligation]]
+name = "preservation"
+formula = "InductiveInvariant /\\ Next => InductiveInvariant'"
+result = "pass"
+
+[[inductive_obligation]]
+name = "safety-consequence"
+formula = "InductiveInvariant => CoreSafety"
+result = "pass"
+
+[claim_boundary]
+statement = "TLC exhaustively checks the published finite instances and Apalache discharges the three bounded symbolic inductive obligations. This is not an unbounded proof of the Rust implementation or of environmental liveness."

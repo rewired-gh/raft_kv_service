@@ -88,6 +88,7 @@ curl -H 'Authorization: Bearer local-development-only' \
   http://localhost:8181/operational/v1/status
 make reset-local NODE=node2 CONFIRM=yes   # explicit destructive reset
 make formal                               # deterministic finite model checks
+make fuzz                                 # retained real-process fault campaign
 make check                                # ordinary local gate
 make supply-chain                         # advisories, licenses, and sources
 ```
@@ -142,6 +143,10 @@ upgrade, SBOM, provenance, and vulnerability rules.
 - `src/main.rs`: composition root
 - `formal/`: TLA+ models, finite configurations, and abstraction maps
 - `verification/`: machine-readable requirement, property, and evidence maps
+
+See [`docs/fuzzing.md`](docs/fuzzing.md) for campaign artifacts, exact input
+replay, shrinking, and the boundary between deterministic inputs and OS
+scheduling.
 
 No consensus library is used. The trusted computing base and the deliberately
 limited formal claim are documented in the specification and verification

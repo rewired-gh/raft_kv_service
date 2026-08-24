@@ -21,8 +21,10 @@ M7 uses four mutually reinforcing evidence layers:
    snapshot boundaries during fault campaigns.
 3. A multi-process harness executes three- and five-node clusters, concurrent
    CRUD, directional loss/delay/duplication, crashes, restarts, failover, and
-   interrupted snapshot recovery. It retains exact replay artifacts and checks
-   histories with a bounded exact linearizability oracle.
+   interrupted snapshot recovery. Campaign schema 2 retains the typed workload
+   seed and absolute fault/process schedule for exact input replay, and checks
+   histories with a bounded exact linearizability oracle. OS scheduling remains
+   outside the deterministic replay claim.
 4. Stable and nightly-pinned test jobs enforce ordinary tests, line/branch
    coverage, and scheduled sharded mutation analysis. Nightly is verification
    tooling only; the product toolchain remains stable Rust.

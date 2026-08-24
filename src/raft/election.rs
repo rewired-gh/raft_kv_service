@@ -2377,6 +2377,10 @@ mod tests {
             .expect("joint entry persists");
         node.acknowledge_log_persisted(mutation)
             .expect("joint entry durable");
+        assert!(
+            node.membership_is_joint(),
+            "a durable joint entry must expose the in-progress configuration"
+        );
         assert_eq!(node.commit_index(), 1, "old quorum alone is insufficient");
 
         let stable = MembershipEntry {
@@ -2678,6 +2682,24 @@ mod tests {
         leader.unstage_peer(NodeId(4));
         assert!(leader.replication_progress(NodeId(4)).is_none());
         leader.unstage_peer(NodeId(1));
+
+        let untouched = NodeId(5);
+        leader.replication.insert(
+            untouched,
+            ReplicationProgress {
+                next_index: 1,
+                match_index: 0,
+            },
+        );
+        leader.unstage_peer(untouched);
+        assert_eq!(
+            leader.replication_progress(untouched),
+            Some(ReplicationProgress {
+                next_index: 1,
+                match_index: 0,
+            }),
+            "unstaging an untracked peer must not mutate replication state"
+        );
     }
 
     #[test]
@@ -2701,6 +2723,20 @@ mod tests {
         .expect("compacted state recovers");
 
         assert_eq!(
+            node.compact_through(position),
+            Ok(()),
+            "compacting through the existing snapshot is an idempotent no-op"
+        );
+        assert_eq!(node.snapshot_position(), position);
+        let wrong_term = LogPosition {
+            index: position.index,
+            term: Term(position.term.0 - 1),
+        };
+        assert_eq!(
+            node.compact_through(wrong_term),
+            Err(CoreError::InvalidSnapshotPosition(wrong_term))
+        );
+        assert_eq!(
             node.compact_through(LogPosition {
                 index: 1,
                 term: Term(3),
@@ -2721,6 +2757,14 @@ mod tests {
             node.restore_snapshot(LogPosition::default(), base.clone(), Vec::new()),
             Err(CoreError::InvalidSnapshotPosition(_))
         ));
+        let zero_term_at_applied = LogPosition {
+            index: node.last_applied(),
+            term: Term(0),
+        };
+        assert_eq!(
+            node.restore_snapshot(zero_term_at_applied, base.clone(), Vec::new()),
+            Err(CoreError::InvalidSnapshotPosition(zero_term_at_applied))
+        );
         assert_eq!(
             node.observe_snapshot_leader(Term(3), NodeId(9)),
             Err(CoreError::LocalNodeIsNotVoter(NodeId(9)))
@@ -2734,5 +2778,8 @@ mod tests {
             Ok(vec![Effect::ResetElectionTimer])
         );
         assert_eq!(node.leader(), Some(NodeId(1)));
+        node.restore_snapshot(position, base, vec![command_entry(3, 3, 7)])
+            .expect("reinstalling a snapshot at the applied boundary is valid");
+        assert_eq!(node.snapshot_position(), position);
     }
 }

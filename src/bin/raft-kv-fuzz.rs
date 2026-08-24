@@ -35,6 +35,8 @@ struct Campaign {
     final_status: Vec<String>,
     history: Vec<Operation>,
     faults: Vec<FaultEvent>,
+    #[serde(default)]
+    schedule: Vec<NemesisStep>,
     trace_files: Vec<String>,
     log_files: Vec<String>,
     metrics_files: Vec<String>,
@@ -80,11 +82,38 @@ struct FaultRule {
     duplicates: u8,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NemesisStep {
+    at_ms: u64,
+    action: NemesisAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NemesisAction {
+    ApplyFault {
+        description: String,
+        plan: FaultPlan,
+    },
+    StopNode {
+        description: String,
+        index: usize,
+        plan: FaultPlan,
+    },
+    StartNode {
+        description: String,
+        index: usize,
+        attempt: usize,
+        plan: FaultPlan,
+    },
+}
+
 struct Arguments {
     seed: u64,
     operations: usize,
     cluster_size: usize,
     artifact_dir: PathBuf,
+    replay_schedule: Option<Vec<NemesisStep>>,
 }
 
 struct ClusterProcess {
@@ -104,6 +133,7 @@ fn arguments() -> Result<Arguments> {
     let mut cluster_size = default_cluster_size();
     let mut artifact_dir = PathBuf::from("target/fuzz/latest");
     let mut replay = None;
+    let mut replay_schedule = None;
     let mut values = std::env::args().skip(1);
     while let Some(argument) = values.next() {
         match argument.as_str() {
@@ -136,9 +166,16 @@ fn arguments() -> Result<Arguments> {
     }
     if let Some(path) = replay {
         let campaign: Campaign = serde_json::from_slice(&std::fs::read(path)?)?;
+        if campaign.schema_version != 2 {
+            bail!(
+                "campaign schema {} cannot provide exact replay; expected schema 2",
+                campaign.schema_version
+            );
+        }
         seed = campaign.seed;
         operations = campaign.requested_operations;
         cluster_size = campaign.cluster_size;
+        replay_schedule = Some(campaign.schedule);
     }
     if operations == 0 || operations > 12 {
         bail!("--operations must be between 1 and 12");
@@ -151,6 +188,7 @@ fn arguments() -> Result<Arguments> {
         operations,
         cluster_size,
         artifact_dir,
+        replay_schedule,
     })
 }
 
@@ -163,7 +201,6 @@ fn run(arguments: Arguments) -> Result<()> {
         bail!("artifact directory already exists; choose a new path");
     }
     std::fs::create_dir_all(&arguments.artifact_dir)?;
-    let started = Instant::now();
     let fault_file = arguments.artifact_dir.join("fault-plan.json");
     write_fault_plan(&fault_file, &FaultPlan::default())?;
 
@@ -209,6 +246,7 @@ fn run(arguments: Arguments) -> Result<()> {
     let cleanup = ProcessCleanup(processes.clone());
     wait_for_cluster(&nodes, Duration::from_secs(12))?;
     wait_for_leader(&nodes, Duration::from_secs(5))?;
+    let started = Instant::now();
 
     let history = Arc::new(Mutex::new(Vec::<Operation>::new()));
     let clock = Arc::new(AtomicU64::new(1));
@@ -233,7 +271,13 @@ fn run(arguments: Arguments) -> Result<()> {
     }
 
     let faults = Arc::new(Mutex::new(Vec::<FaultEvent>::new()));
+    let schedule = arguments
+        .replay_schedule
+        .clone()
+        .unwrap_or_else(|| default_nemesis_schedule(arguments.cluster_size));
+    validate_schedule(&schedule, arguments.cluster_size)?;
     let nemesis = {
+        let schedule = schedule.clone();
         let fault_file = fault_file.clone();
         let processes = processes.clone();
         let service_binary = service_binary.clone();
@@ -241,116 +285,18 @@ fn run(arguments: Arguments) -> Result<()> {
         let trace_files = trace_files.clone();
         let log_files = log_files.clone();
         let faults = faults.clone();
-        let cluster_size = arguments.cluster_size;
         thread::spawn(move || -> Result<()> {
-            thread::sleep(Duration::from_millis(40));
-            apply_fault(
+            run_nemesis(
+                &schedule,
+                started,
                 &fault_file,
-                started,
-                "delay and duplicate node-3 traffic",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, false, 60, 1),
-                },
-                &faults,
-            )?;
-            thread::sleep(Duration::from_millis(80));
-            apply_fault(
-                &fault_file,
-                started,
-                "partition node 3",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, true, 0, 0),
-                },
-                &faults,
-            )?;
-            stop_node(2, &processes)?;
-            record_fault(
-                started,
-                "kill node 3 during lag/snapshot window",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, true, 0, 0),
-                },
-                &faults,
-            );
-            thread::sleep(Duration::from_millis(200));
-            apply_fault(
-                &fault_file,
-                started,
-                "delay node-3 recovery traffic",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, false, 100, 0),
-                },
-                &faults,
-            )?;
-            start_node(
-                2,
-                2,
                 &service_binary,
                 &artifact_dir,
                 &processes,
                 &trace_files,
                 &log_files,
-            )?;
-            record_fault(
-                started,
-                "restart node 3 into delayed snapshot recovery",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, false, 100, 0),
-                },
                 &faults,
-            );
-            thread::sleep(Duration::from_millis(70));
-            stop_node(2, &processes)?;
-            record_fault(
-                started,
-                "kill node 3 during delayed snapshot transfer",
-                FaultPlan {
-                    rules: bidirectional_rules(3, cluster_size, false, 100, 0),
-                },
-                &faults,
-            );
-            apply_fault(
-                &fault_file,
-                started,
-                "heal node-3 recovery traffic",
-                FaultPlan::default(),
-                &faults,
-            )?;
-            start_node(
-                2,
-                3,
-                &service_binary,
-                &artifact_dir,
-                &processes,
-                &trace_files,
-                &log_files,
-            )?;
-            record_fault(
-                started,
-                "restart node 3 after interrupted snapshot",
-                FaultPlan::default(),
-                &faults,
-            );
-            thread::sleep(Duration::from_millis(180));
-            stop_node(0, &processes)?;
-            record_fault(
-                started,
-                "kill node 1 to force failover",
-                FaultPlan::default(),
-                &faults,
-            );
-            thread::sleep(Duration::from_millis(220));
-            start_node(
-                0,
-                2,
-                &service_binary,
-                &artifact_dir,
-                &processes,
-                &trace_files,
-                &log_files,
-            )?;
-            record_fault(started, "restart node 1", FaultPlan::default(), &faults);
-            Ok(())
+            )
         })
     };
 
@@ -425,7 +371,7 @@ fn run(arguments: Arguments) -> Result<()> {
         trace.validate_m4_abstraction()?;
     }
     let campaign = Campaign {
-        schema_version: 1,
+        schema_version: 2,
         seed: arguments.seed,
         requested_operations: arguments.operations,
         cluster_size: arguments.cluster_size,
@@ -441,6 +387,7 @@ fn run(arguments: Arguments) -> Result<()> {
             .lock()
             .map_err(|_| anyhow::anyhow!("fault lock poisoned"))?
             .clone(),
+        schedule,
         trace_files,
         log_files: log_files
             .lock()
@@ -847,6 +794,184 @@ port = {operational_port}
     Ok(())
 }
 
+fn default_nemesis_schedule(cluster_size: usize) -> Vec<NemesisStep> {
+    let plan = |drop, delay_ms, duplicates| FaultPlan {
+        rules: bidirectional_rules(3, cluster_size, drop, delay_ms, duplicates),
+    };
+    vec![
+        NemesisStep {
+            at_ms: 40,
+            action: NemesisAction::ApplyFault {
+                description: "delay and duplicate node-3 traffic".to_owned(),
+                plan: plan(false, 60, 1),
+            },
+        },
+        NemesisStep {
+            at_ms: 120,
+            action: NemesisAction::ApplyFault {
+                description: "partition node 3".to_owned(),
+                plan: plan(true, 0, 0),
+            },
+        },
+        NemesisStep {
+            at_ms: 120,
+            action: NemesisAction::StopNode {
+                description: "kill node 3 during lag/snapshot window".to_owned(),
+                index: 2,
+                plan: plan(true, 0, 0),
+            },
+        },
+        NemesisStep {
+            at_ms: 320,
+            action: NemesisAction::ApplyFault {
+                description: "delay node-3 recovery traffic".to_owned(),
+                plan: plan(false, 100, 0),
+            },
+        },
+        NemesisStep {
+            at_ms: 320,
+            action: NemesisAction::StartNode {
+                description: "restart node 3 into delayed snapshot recovery".to_owned(),
+                index: 2,
+                attempt: 2,
+                plan: plan(false, 100, 0),
+            },
+        },
+        NemesisStep {
+            at_ms: 390,
+            action: NemesisAction::StopNode {
+                description: "kill node 3 during delayed snapshot transfer".to_owned(),
+                index: 2,
+                plan: plan(false, 100, 0),
+            },
+        },
+        NemesisStep {
+            at_ms: 390,
+            action: NemesisAction::ApplyFault {
+                description: "heal node-3 recovery traffic".to_owned(),
+                plan: FaultPlan::default(),
+            },
+        },
+        NemesisStep {
+            at_ms: 390,
+            action: NemesisAction::StartNode {
+                description: "restart node 3 after interrupted snapshot".to_owned(),
+                index: 2,
+                attempt: 3,
+                plan: FaultPlan::default(),
+            },
+        },
+        NemesisStep {
+            at_ms: 570,
+            action: NemesisAction::StopNode {
+                description: "kill node 1 to force failover".to_owned(),
+                index: 0,
+                plan: FaultPlan::default(),
+            },
+        },
+        NemesisStep {
+            at_ms: 790,
+            action: NemesisAction::StartNode {
+                description: "restart node 1".to_owned(),
+                index: 0,
+                attempt: 2,
+                plan: FaultPlan::default(),
+            },
+        },
+    ]
+}
+
+fn validate_schedule(schedule: &[NemesisStep], cluster_size: usize) -> Result<()> {
+    if schedule.is_empty() {
+        bail!("nemesis schedule must not be empty");
+    }
+    let mut previous = 0;
+    for step in schedule {
+        if step.at_ms < previous || step.at_ms > 60_000 {
+            bail!("nemesis schedule timestamps must be ordered and bounded");
+        }
+        previous = step.at_ms;
+        let (node, attempt, plan) = match &step.action {
+            NemesisAction::ApplyFault { plan, .. } => (None, None, plan),
+            NemesisAction::StopNode { index, plan, .. } => (Some(*index), None, plan),
+            NemesisAction::StartNode {
+                index,
+                attempt,
+                plan,
+                ..
+            } => (Some(*index), Some(*attempt), plan),
+        };
+        if node.is_some_and(|index| index >= cluster_size) || attempt == Some(0) {
+            bail!("nemesis schedule references an invalid node or attempt");
+        }
+        for rule in &plan.rules {
+            let maximum = u64::try_from(cluster_size).expect("bounded cluster size");
+            if rule.from == 0
+                || rule.to == 0
+                || rule.from > maximum
+                || rule.to > maximum
+                || rule.from == rule.to
+                || rule.delay_ms > 60_000
+                || rule.duplicates > 2
+            {
+                bail!("nemesis schedule contains an invalid fault rule");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_nemesis(
+    schedule: &[NemesisStep],
+    started: Instant,
+    fault_file: &Path,
+    service_binary: &Path,
+    artifact_dir: &Path,
+    processes: &Arc<Mutex<Vec<Option<ClusterProcess>>>>,
+    trace_files: &Arc<Mutex<Vec<String>>>,
+    log_files: &Arc<Mutex<Vec<String>>>,
+    faults: &Arc<Mutex<Vec<FaultEvent>>>,
+) -> Result<()> {
+    for step in schedule {
+        let target = Duration::from_millis(step.at_ms);
+        if let Some(remaining) = target.checked_sub(started.elapsed()) {
+            thread::sleep(remaining);
+        }
+        match &step.action {
+            NemesisAction::ApplyFault { description, plan } => {
+                apply_fault(fault_file, started, description, plan.clone(), faults)?;
+            }
+            NemesisAction::StopNode {
+                description,
+                index,
+                plan,
+            } => {
+                stop_node(*index, processes)?;
+                record_fault(started, description, plan.clone(), faults);
+            }
+            NemesisAction::StartNode {
+                description,
+                index,
+                attempt,
+                plan,
+            } => {
+                start_node(
+                    *index,
+                    *attempt,
+                    service_binary,
+                    artifact_dir,
+                    processes,
+                    trace_files,
+                    log_files,
+                )?;
+                record_fault(started, description, plan.clone(), faults);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_fault(
     path: &Path,
     started: Instant,
@@ -1026,4 +1151,53 @@ fn write_reproducer(artifact_dir: &Path) -> Result<()> {
         std::fs::set_permissions(path, permissions)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nemesis_schedule_is_canonical_valid_and_round_trips() {
+        for cluster_size in [3, 5] {
+            let schedule = default_nemesis_schedule(cluster_size);
+            validate_schedule(&schedule, cluster_size).expect("default schedule is valid");
+            let encoded = serde_json::to_vec(&schedule).expect("encode schedule");
+            let decoded: Vec<NemesisStep> =
+                serde_json::from_slice(&encoded).expect("decode schedule");
+            assert_eq!(decoded.len(), schedule.len());
+            assert_eq!(decoded.last().map(|step| step.at_ms), Some(790));
+        }
+    }
+
+    #[test]
+    fn nemesis_schedule_rejects_ambiguous_or_unbounded_inputs() {
+        assert!(validate_schedule(&[], 3).is_err());
+
+        let mut reversed = default_nemesis_schedule(3);
+        reversed[1].at_ms = 39;
+        assert!(validate_schedule(&reversed, 3).is_err());
+
+        let mut too_late = default_nemesis_schedule(3);
+        too_late[0].at_ms = 60_001;
+        assert!(validate_schedule(&too_late, 3).is_err());
+
+        let mut invalid_node = default_nemesis_schedule(3);
+        if let NemesisAction::StopNode { index, .. } = &mut invalid_node[2].action {
+            *index = 3;
+        }
+        assert!(validate_schedule(&invalid_node, 3).is_err());
+
+        let mut invalid_attempt = default_nemesis_schedule(3);
+        if let NemesisAction::StartNode { attempt, .. } = &mut invalid_attempt[4].action {
+            *attempt = 0;
+        }
+        assert!(validate_schedule(&invalid_attempt, 3).is_err());
+
+        let mut invalid_rule = default_nemesis_schedule(3);
+        if let NemesisAction::ApplyFault { plan, .. } = &mut invalid_rule[0].action {
+            plan.rules[0].duplicates = 3;
+        }
+        assert!(validate_schedule(&invalid_rule, 3).is_err());
+    }
 }

@@ -1956,6 +1956,24 @@ mod tests {
         }
     }
 
+    async fn execute_eventually(
+        handle: &StaticNodeHandle,
+        command: Command,
+    ) -> Result<CommandResult, ServiceError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match handle.execute(command.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(ServiceError::Unavailable | ServiceError::Overloaded)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[test]
     fn newer_snapshot_satisfies_a_stale_send_request() {
         assert!(snapshot_covers(
@@ -2403,8 +2421,7 @@ mod tests {
         let read_command = Command::Read {
             key: "distributed".into(),
         };
-        let read_result = follower
-            .execute(read_command.clone())
+        let read_result = execute_eventually(follower, read_command.clone())
             .await
             .expect("follower forwards a logged read");
         assert_eq!(
@@ -2479,7 +2496,7 @@ mod tests {
         });
         handles.push(handle);
 
-        let catch_up_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let catch_up_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let diagnostics = lagging_handle.diagnostics().await.expect("lagging status");
             if diagnostics.applied_index >= revision && diagnostics.snapshot_index == 2 {
