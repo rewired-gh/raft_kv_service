@@ -20,10 +20,13 @@ id = "election-safety"
 spec_section = "12.1.1"
 model = "formal/RaftElection.tla"
 invariant = "ElectionSafety"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/RaftElection.cfg",
   "verification/evidence/m1-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/election.rs",
+  "src/raft/simulator.rs",
 ]
 
 [[property]]
@@ -31,10 +34,13 @@ id = "vote-persistence-ordering"
 spec_section = "11"
 model = "formal/RaftElection.tla"
 invariant = "MessagesUseDurableTermAndVote"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/RaftElection.cfg",
   "verification/evidence/m1-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/trace.rs",
+  "verification/evidence/m7-coverage.toml",
 ]
 
 [[property]]
@@ -42,10 +48,13 @@ id = "log-matching"
 spec_section = "12.1.2"
 model = "formal/Raft.tla"
 invariant = "LogMatching"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/simulator.rs",
+  "src/raft/trace.rs",
 ]
 
 [[property]]
@@ -53,10 +62,13 @@ id = "leader-append-only"
 spec_section = "12.1.3"
 model = "formal/Raft.tla"
 invariant = "LeaderAppendOnly"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/election.rs",
+  ".github/workflows/deep-verification.yaml",
 ]
 
 [[property]]
@@ -64,10 +76,13 @@ id = "leader-completeness"
 spec_section = "12.1.4"
 model = "formal/Raft.tla"
 invariant = "LeaderCompleteness"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/simulator.rs",
+  "verification/evidence/m7-coverage.toml",
 ]
 
 [[property]]
@@ -75,10 +90,13 @@ id = "state-machine-safety"
 spec_section = "12.1.5"
 model = "formal/Raft.tla"
 invariant = "StateMachineSafety"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/trace.rs",
+  "verification/evidence/m7-fuzz-replay.toml",
 ]
 
 [[property]]
@@ -86,10 +104,13 @@ id = "committed-prefix-preservation"
 spec_section = "12.1.6"
 model = "formal/Raft.tla"
 invariant = "CommittedPrefixPreservation"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/election.rs",
+  "src/raft/simulator.rs",
 ]
 
 [[property]]
@@ -97,10 +118,14 @@ id = "log-persistence-ordering"
 spec_section = "11"
 model = "formal/Raft.tla"
 invariant = "NoAckBeforeDurability"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/Raft.cfg",
   "verification/evidence/m2-fast-tlc.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/runtime.rs",
+  "src/raft/trace.rs",
+  "verification/evidence/m7-fault-mutation.toml",
 ]
 
 [[property]]
@@ -108,11 +133,14 @@ id = "configuration-safety"
 spec_section = "12.1.7"
 model = "formal/RaftMembership.tla"
 invariant = "ConfigurationSafety"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/RaftMembership.cfg",
   "verification/evidence/m5-fast-tlc.toml",
   "verification/evidence/m5-runtime.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/simulator.rs",
+  "verification/evidence/m7-fuzz-replay.toml",
 ]
 
 [[property]]
@@ -120,11 +148,14 @@ id = "snapshot-safety"
 spec_section = "10.4"
 model = "formal/RaftSnapshot.tla"
 invariant = "VirtualPrefixValid /\\ PublishedOrigin"
-status = "partial"
+status = "verified"
 evidence = [
   "formal/RaftSnapshot.cfg",
   "verification/evidence/m4-fast-tlc.toml",
   "verification/evidence/m4-runtime.toml",
+  "verification/evidence/m7-formal.toml",
+  "src/raft/trace.rs",
+  "verification/evidence/m7-fuzz-replay.toml",
 ]
 
 [[property]]
@@ -132,10 +163,14 @@ id = "crud-linearizability"
 spec_section = "12.2.1"
 model = "src/history.rs"
 invariant = "Linearizable"
-status = "partial"
+status = "verified"
 evidence = [
   "src/history.rs",
   "src/cluster.rs",
   "tests/storage_contract.rs",
   "verification/evidence/m3-runtime.toml",
+  "formal/KvStateMachine.cfg",
+  "verification/evidence/m7-formal.toml",
+  "verification/evidence/m7-fuzz-replay.toml",
+  "verification/evidence/m7-coverage.toml",
 ]

@@ -1,6 +1,6 @@
 # Raft KV Service Specification
 
-- Status: Draft 0.2
+- Status: Accepted 1.0
 - Last updated: 2026-08-24
 
 ## 1. Purpose

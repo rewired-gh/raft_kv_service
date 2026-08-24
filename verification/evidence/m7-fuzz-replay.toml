@@ -1,0 +1,34 @@
+schema_version = 1
+property_set = "m7-exact-input-replay"
+recorded_at = "2026-08-24T16:52:00+08:00"
+source_commit = "212b14d"
+result = "pass"
+command = "target/fuzz/replay-bin/raft-kv-fuzz --seed 104729 --operations 12 --cluster-size 3 --artifact-dir target/fuzz/replay-proof-original-4; target/fuzz/replay-bin/raft-kv-fuzz --replay target/fuzz/replay-proof-original-4/campaign.json --artifact-dir target/fuzz/replay-proof-replayed-4"
+harness_version = "0.1.0"
+rustc = "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+operating_system = "macos"
+campaign_schema_version = 2
+seed = 104729
+cluster_size = 3
+requested_operations = 12
+schedule_steps = 10
+schedule_equal = true
+
+[original]
+result = "pass"
+linearizable = true
+fault_events = 10
+history_operations = 11
+trace_files = 6
+campaign_sha256 = "b6705c6796cb5bee2f25acde693ff096c47607afeffb75e248ed3702cbf6c239"
+
+[replay]
+result = "pass"
+linearizable = true
+fault_events = 10
+history_operations = 15
+trace_files = 6
+campaign_sha256 = "dddb6f12a40fe63f4b0c8920fde6d065086bb1a482e45bd43c365dc2494adc3c"
+
+[claim_boundary]
+statement = "Schema 2 replays the exact seed, workload parameters, typed fault rules, process targets, attempt numbers, and absolute schedule offsets. Both executions independently passed trace validation and linearizability. OS process, socket, and thread scheduling is outside the deterministic claim, so observed histories may differ."

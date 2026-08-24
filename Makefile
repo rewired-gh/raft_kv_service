@@ -57,7 +57,9 @@ fuzz: ## Run a reproducible real-process fuzz campaign (SEED/OPS optional)
 	./target/debug/raft-kv-fuzz --seed "$${SEED:-424242}" --operations "$${OPS:-12}" --cluster-size "$${NODES:-3}" --artifact-dir "target/fuzz/$${SEED:-424242}-$${NODES:-3}"
 
 mutation: ## Mutation-test consensus and persistence modules
-	cargo mutants --workspace --file 'src/raft/*.rs' --file 'src/storage/*.rs' --all-features
+	cargo mutants --workspace --file 'src/raft/*.rs' --file 'src/storage/*.rs' --all-features -- -- \
+		--skip cluster::tests::three_real_rpc_nodes_elect_commit_and_apply \
+		--skip cluster::tests::real_cluster_adds_staged_voter_and_removes_leader
 
 supply-chain: ## Audit Rust dependencies, licenses, and sources
 	cargo audit

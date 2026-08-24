@@ -120,5 +120,18 @@ evidence = [
 [[requirement]]
 id = "M7"
 spec_sections = ["13", "14", "19.M7", "20"]
-status = "planned"
-evidence = []
+status = "verified"
+evidence = [
+  "docs/adr/0007-verification-closure.md",
+  "docs/fuzzing.md",
+  "src/history.rs",
+  "src/raft/simulator.rs",
+  "src/raft/trace.rs",
+  "src/bin/raft-kv-fuzz.rs",
+  "tests/verification_evidence.rs",
+  "verification/evidence/m7-formal.toml",
+  "verification/evidence/m7-coverage.toml",
+  "verification/evidence/m7-fault-mutation.toml",
+  "verification/evidence/m7-fuzz-replay.toml",
+  ".github/workflows/deep-verification.yaml",
+]

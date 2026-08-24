@@ -1715,6 +1715,18 @@ mod tests {
         VoterSet::new(ids.iter().copied().map(NodeId)).expect("voter set is valid")
     }
 
+    #[test]
+    fn joint_voter_admission_is_the_union_of_both_configurations() {
+        let active = ActiveVoters::Joint {
+            old: voters(&[1, 2]),
+            new: voters(&[2, 3]),
+        };
+        assert!(active.contains(NodeId(1)));
+        assert!(active.contains(NodeId(2)));
+        assert!(active.contains(NodeId(3)));
+        assert!(!active.contains(NodeId(4)));
+    }
+
     fn core(id: u64, ids: &[u64]) -> RaftCore {
         RaftCore::new(NodeId(id), voters(ids), HardState::default(), Vec::new())
             .expect("core configuration is valid")
@@ -1928,6 +1940,50 @@ mod tests {
     }
 
     #[test]
+    fn current_term_stale_candidate_is_rejected_without_persistence() {
+        let hard_state = HardState {
+            current_term: Term(2),
+            voted_for: None,
+        };
+        let mut node = RaftCore::new(
+            NodeId(2),
+            voters(&[1, 2, 3]),
+            hard_state,
+            vec![LogEntry {
+                index: 1,
+                term: Term(2),
+                payload: EntryPayload::Noop,
+            }],
+        )
+        .expect("core configuration is valid");
+
+        assert_eq!(
+            node.handle(receive(
+                1,
+                2,
+                Message::RequestVote {
+                    term: Term(2),
+                    candidate: NodeId(1),
+                    last_log: LogPosition {
+                        index: 100,
+                        term: Term(1),
+                    },
+                },
+            )),
+            Ok(vec![Effect::Send(Envelope {
+                from: NodeId(2),
+                to: NodeId(1),
+                message: Message::RequestVoteResponse {
+                    term: Term(2),
+                    vote_granted: false,
+                },
+            })])
+        );
+        assert_eq!(node.hard_state(), hard_state);
+        assert!(!node.persistence_pending());
+    }
+
+    #[test]
     fn node_never_votes_for_two_candidates_in_one_term() {
         let mut node = core(3, &[1, 2, 3]);
         let first = Message::RequestVote {
@@ -1937,11 +1993,28 @@ mod tests {
         };
         let hard_state = persist_from(
             &node
-                .handle(receive(1, 3, first))
+                .handle(receive(1, 3, first.clone()))
                 .expect("first vote starts persistence"),
         );
         node.acknowledge_persisted(hard_state)
             .expect("first vote persists");
+
+        assert_eq!(
+            node.handle(receive(1, 3, first)),
+            Ok(vec![
+                Effect::ResetElectionTimer,
+                Effect::Send(Envelope {
+                    from: NodeId(3),
+                    to: NodeId(1),
+                    message: Message::RequestVoteResponse {
+                        term: Term(7),
+                        vote_granted: true,
+                    },
+                }),
+            ]),
+            "a duplicate request from the chosen candidate is granted without another write"
+        );
+        assert!(!node.persistence_pending());
 
         let second = Message::RequestVote {
             term: Term(7),
@@ -2305,6 +2378,38 @@ mod tests {
                 match_index: 1
             })
         );
+    }
+
+    #[test]
+    fn higher_term_append_response_forces_durable_step_down() {
+        let mut node = ready_single_node();
+        node.stage_peer(NodeId(2))
+            .expect("staged peer is admitted for replication responses");
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(2),
+                    accepted: false,
+                    match_index: 0,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("higher term starts persistence before changing role");
+        let hard_state = persist_from(&effects);
+        assert_eq!(
+            hard_state,
+            HardState {
+                current_term: Term(2),
+                voted_for: None,
+            }
+        );
+        assert_eq!(node.role(), Role::Leader);
+        node.acknowledge_persisted(hard_state)
+            .expect("higher term becomes visible after durability");
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.leader(), None);
     }
 
     #[test]
