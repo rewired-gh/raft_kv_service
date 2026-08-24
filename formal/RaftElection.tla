@@ -18,7 +18,7 @@ ASSUME /\ Nodes # {}
        /\ None \notin Nodes
 
 Roles == {"follower", "candidate", "leader"}
-PendingKinds == {"none", "candidate", "vote"}
+PendingKinds == {"none", "candidate", "vote", "term"}
 MessageKinds == {"requestVote", "requestVoteResponse"}
 
 Message(kind, from, to, term, grant) ==
@@ -93,6 +93,16 @@ BeginElection(n) ==
     /\ pendingKind' = [pendingKind EXCEPT ![n] = "candidate"]
     /\ pendingTerm' = [pendingTerm EXCEPT ![n] = durableTerm[n] + 1]
     /\ pendingVote' = [pendingVote EXCEPT ![n] = n]
+    /\ pendingReply' = [pendingReply EXCEPT ![n] = None]
+    /\ UNCHANGED <<durableTerm, durableVote, voteHistory, role, votes, messages, elected>>
+
+BeginHigherTerm(n, t) ==
+    /\ ~pending[n]
+    /\ t \in (durableTerm[n] + 1)..MaxTerm
+    /\ pending' = [pending EXCEPT ![n] = TRUE]
+    /\ pendingKind' = [pendingKind EXCEPT ![n] = "term"]
+    /\ pendingTerm' = [pendingTerm EXCEPT ![n] = t]
+    /\ pendingVote' = [pendingVote EXCEPT ![n] = None]
     /\ pendingReply' = [pendingReply EXCEPT ![n] = None]
     /\ UNCHANGED <<durableTerm, durableVote, voteHistory, role, votes, messages, elected>>
 
@@ -172,6 +182,27 @@ PersistVote(n) ==
     /\ messages' = messages \cup {VoteResponse(n, reply, t, TRUE)}
     /\ UNCHANGED <<pendingTerm, pendingVote, pendingReply, elected>>
 
+PersistHigherTerm(n) ==
+    LET t == pendingTerm[n] IN
+    /\ pending[n]
+    /\ pendingKind[n] = "term"
+    /\ durableTerm' = [durableTerm EXCEPT ![n] = t]
+    /\ durableVote' = [durableVote EXCEPT ![n] = None]
+    /\ role' = [role EXCEPT ![n] = "follower"]
+    /\ votes' = [votes EXCEPT ![n] = {}]
+    /\ pending' = [pending EXCEPT ![n] = FALSE]
+    /\ pendingKind' = [pendingKind EXCEPT ![n] = "none"]
+    /\ UNCHANGED <<voteHistory, pendingTerm, pendingVote, pendingReply,
+                    messages, elected>>
+
+AcceptCurrentTermLeader(n) ==
+    /\ ~pending[n]
+    /\ role[n] # "follower"
+    /\ role' = [role EXCEPT ![n] = "follower"]
+    /\ votes' = [votes EXCEPT ![n] = {}]
+    /\ UNCHANGED <<durableTerm, durableVote, voteHistory, pending, pendingKind,
+                    pendingTerm, pendingVote, pendingReply, messages, elected>>
+
 ReceiveGrantedVote(m) ==
     LET n == m.to IN
     /\ m \in messages
@@ -214,11 +245,14 @@ DropMessage(m) ==
 
 Next ==
     \/ \E n \in Nodes : BeginElection(n)
+    \/ \E n \in Nodes, t \in 0..MaxTerm : BeginHigherTerm(n, t)
     \/ \E n \in Nodes : PersistCandidate(n)
     \/ \E m \in messages : BeginGrantVote(m)
     \/ \E m \in messages : RepeatVote(m)
     \/ \E m \in messages : RejectVote(m)
     \/ \E n \in Nodes : PersistVote(n)
+    \/ \E n \in Nodes : PersistHigherTerm(n)
+    \/ \E n \in Nodes : AcceptCurrentTermLeader(n)
     \/ \E m \in messages : ReceiveGrantedVote(m)
     \/ \E m \in messages : IgnoreVoteResponse(m)
     \/ \E n \in Nodes : WinElection(n)

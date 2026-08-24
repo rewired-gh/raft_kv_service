@@ -11,11 +11,16 @@ This bounded M1 model corresponds to `src/raft/election.rs`.
 | repeated or rejected vote request | `RepeatVote` / `RejectVote` |
 | granted response handling | `ReceiveGrantedVote` |
 | quorum promotion | `WinElection` |
+| higher-term heartbeat or RPC response | `BeginHigherTerm` / `PersistHigherTerm` |
+| accepted current-term heartbeat | `AcceptCurrentTermLeader` |
 | network loss | `DropMessage` |
 
 The model deliberately abstracts all logs as equally up to date. The Rust core
 already enforces lexicographic last-log term/index ordering; M2 replaces this
 abstraction with an explicit log and integrates heartbeats with AppendEntries.
+`BeginHigherTerm` over-approximates authenticated higher-term RPC input by
+allowing the environment to select any higher bounded term; it cannot create a
+leader or vote without the same persistence barrier.
 Transport duplication is represented by repeated generation or delivery of
 semantically identical set elements; Rust separately retains duplicate-response
 regressions.

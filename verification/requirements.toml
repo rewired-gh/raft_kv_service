@@ -17,7 +17,7 @@ evidence = [
 [[requirement]]
 id = "M1"
 spec_sections = ["10.1", "11", "13", "14.1", "14.3", "19.M1"]
-status = "partial"
+status = "verified"
 evidence = [
   "src/raft/election.rs",
   "src/raft/simulator.rs",

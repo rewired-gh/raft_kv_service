@@ -1,16 +1,15 @@
 schema_version = 1
-recorded_at = "2026-08-24T09:47:36+08:00"
+recorded_at = "2026-08-24T09:57:04+08:00"
 model = "formal/RaftElection.tla"
 configuration = "formal/RaftElection.cfg"
-model_sha256 = "714c7745d2a44d9a5cfbf4cc3d9f246a02a9e774a63f88621f81f5df732cbd30"
+model_sha256 = "0ad058ed8a442d67f5d997d70e8fedd6dc2e943205ab92e937d225e2f6d863e7"
 configuration_sha256 = "91be10cf4cad7235c6162d695b2e8e09421f3c790d6f1563e265eb6e03cdf353"
 tla_tools_version = "1.7.4"
 tla_tools_revision = "5a47802"
 result = "pass"
-generated_states = 11140
-distinct_states = 1946
+generated_states = 95296
+distinct_states = 11839
 queue_remaining = 0
-graph_depth = 13
+graph_depth = 16
 invariants = ["TypeOK", "ElectionSafety", "MessagesUseDurableTermAndVote"]
 command = "make formal"
-

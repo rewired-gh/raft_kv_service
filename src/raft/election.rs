@@ -50,7 +50,13 @@ pub struct VoterSet(BTreeSet<NodeId>);
 
 impl VoterSet {
     pub fn new(voters: impl IntoIterator<Item = NodeId>) -> Result<Self, CoreError> {
-        let voters = voters.into_iter().collect::<BTreeSet<_>>();
+        let mut unique = BTreeSet::new();
+        for voter in voters {
+            if !unique.insert(voter) {
+                return Err(CoreError::DuplicateVoter(voter));
+            }
+        }
+        let voters = unique;
         if voters.is_empty() {
             return Err(CoreError::EmptyVoterSet);
         }
@@ -115,6 +121,7 @@ pub enum Effect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreError {
     EmptyVoterSet,
+    DuplicateVoter(NodeId),
     LocalNodeIsNotVoter(NodeId),
     InvalidRecoveredVote(NodeId),
     PersistencePending,
@@ -130,6 +137,9 @@ impl Display for CoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyVoterSet => formatter.write_str("voter set must not be empty"),
+            Self::DuplicateVoter(node) => {
+                write!(formatter, "duplicate voter {}", node.0)
+            }
             Self::LocalNodeIsNotVoter(node) => {
                 write!(formatter, "local node {} is not a voter", node.0)
             }
@@ -800,5 +810,13 @@ mod tests {
         );
         assert_eq!(node.hard_state(), hard_state);
         assert!(!node.persistence_pending());
+    }
+
+    #[test]
+    fn duplicate_voter_ids_are_rejected() {
+        assert_eq!(
+            VoterSet::new([NodeId(1), NodeId(1)]),
+            Err(CoreError::DuplicateVoter(NodeId(1)))
+        );
     }
 }

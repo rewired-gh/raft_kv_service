@@ -2,9 +2,9 @@
 
 A production-shaped Rust microservice foundation. The current implementation
 provides HTTP lifecycle, configuration, observability, tests, containers, and
-CI. The first verified Raft milestone is in progress: a deterministic election
-core, crash-aware simulator, and bounded TLA+ model are present; replication,
-storage, and the client KV API are not implemented yet.
+CI. The M1 election milestone provides a deterministic election core,
+crash-aware seeded simulator, and bounded TLA+ model; replication, storage, and
+the client KV API are not implemented yet.
 
 The normative project goals, correctness claims, protocol scope, verification
 strategy, and milestone gates are defined in

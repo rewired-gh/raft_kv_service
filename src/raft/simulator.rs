@@ -47,10 +47,38 @@ pub struct ClusterSimulator {
     nodes: BTreeMap<NodeId, SimNode>,
     scheduled: VecDeque<Scheduled>,
     trace: Vec<TraceEvent>,
+    now: u64,
+    random_state: u64,
+    election_timeout_min: u64,
+    election_timeout_max: u64,
+    election_deadlines: BTreeMap<NodeId, Option<u64>>,
 }
 
 impl ClusterSimulator {
     pub fn new(ids: impl IntoIterator<Item = NodeId>) -> Result<Self, SimError> {
+        Self::new_with_seed(ids, 0x7261_6674_2d6b_7621, 10, 20)
+    }
+
+    pub fn new_with_seed(
+        ids: impl IntoIterator<Item = NodeId>,
+        seed: u64,
+        election_timeout_min: u64,
+        election_timeout_max: u64,
+    ) -> Result<Self, SimError> {
+        if election_timeout_min == 0 || election_timeout_min > election_timeout_max {
+            return Err(SimError::InvalidElectionTimeoutRange {
+                min: election_timeout_min,
+                max: election_timeout_max,
+            });
+        }
+        election_timeout_max
+            .checked_sub(election_timeout_min)
+            .and_then(|width| width.checked_add(1))
+            .ok_or(SimError::InvalidElectionTimeoutRange {
+                min: election_timeout_min,
+                max: election_timeout_max,
+            })?;
+
         let ids = ids.into_iter().collect::<Vec<_>>();
         let voters = VoterSet::new(ids.iter().copied())?;
         let mut nodes = BTreeMap::new();
@@ -68,18 +96,51 @@ impl ClusterSimulator {
                 },
             );
         }
-        Ok(Self {
+        let mut simulator = Self {
             voters,
             nodes,
             scheduled: VecDeque::new(),
             trace: Vec::new(),
-        })
+            now: 0,
+            random_state: seed,
+            election_timeout_min,
+            election_timeout_max,
+            election_deadlines: BTreeMap::new(),
+        };
+        let node_ids = simulator.nodes.keys().copied().collect::<Vec<_>>();
+        for node in node_ids {
+            simulator.reset_election_deadline(node)?;
+        }
+        Ok(simulator)
     }
 
     pub fn timeout(&mut self, node: NodeId) -> Result<(), SimError> {
+        if self.node(node)?.core.is_none() {
+            return Err(SimError::NodeOffline(node));
+        }
+        self.election_deadlines.insert(node, None);
         self.trace.push(TraceEvent::ElectionTimeout(node));
         let effects = self.core_mut(node)?.handle(Event::ElectionTimeout)?;
         self.schedule_effects(node, effects)
+    }
+
+    pub fn advance_to_next_timeout(&mut self) -> Result<Vec<NodeId>, SimError> {
+        let next_deadline = self
+            .election_deadlines
+            .values()
+            .filter_map(|deadline| *deadline)
+            .min()
+            .ok_or(SimError::NoElectionDeadline)?;
+        self.now = next_deadline;
+        let due = self
+            .election_deadlines
+            .iter()
+            .filter_map(|(node, deadline)| (*deadline == Some(next_deadline)).then_some(*node))
+            .collect::<Vec<_>>();
+        for node in &due {
+            self.timeout(*node)?;
+        }
+        Ok(due)
     }
 
     pub fn step(&mut self) -> Result<bool, SimError> {
@@ -113,7 +174,11 @@ impl ClusterSimulator {
 
     pub fn crash(&mut self, node: NodeId) -> Result<(), SimError> {
         let sim_node = self.node_mut(node)?;
+        if sim_node.core.is_none() {
+            return Err(SimError::NodeOffline(node));
+        }
         sim_node.core = None;
+        self.election_deadlines.insert(node, None);
         self.trace.push(TraceEvent::NodeCrashed(node));
         Ok(())
     }
@@ -121,6 +186,9 @@ impl ClusterSimulator {
     pub fn restart(&mut self, node: NodeId) -> Result<(), SimError> {
         let voters = self.voters.clone();
         let sim_node = self.node_mut(node)?;
+        if sim_node.core.is_some() {
+            return Err(SimError::NodeAlreadyOnline(node));
+        }
         sim_node.generation = sim_node
             .generation
             .checked_add(1)
@@ -131,6 +199,7 @@ impl ClusterSimulator {
             sim_node.durable,
             sim_node.last_log,
         )?);
+        self.reset_election_deadline(node)?;
         self.trace.push(TraceEvent::NodeRestarted(node));
         Ok(())
     }
@@ -178,6 +247,15 @@ impl ClusterSimulator {
 
     pub fn pending_events(&self) -> usize {
         self.scheduled.len()
+    }
+
+    pub fn time(&self) -> u64 {
+        self.now
+    }
+
+    pub fn election_deadline(&self, node: NodeId) -> Result<Option<u64>, SimError> {
+        self.node(node)?;
+        Ok(self.election_deadlines.get(&node).copied().flatten())
     }
 
     pub fn trace(&self) -> &[TraceEvent] {
@@ -235,6 +313,7 @@ impl ClusterSimulator {
                 }
                 Effect::ResetElectionTimer => {
                     self.trace.push(TraceEvent::ElectionTimerReset(node));
+                    self.reset_election_deadline(node)?;
                 }
             }
         }
@@ -255,6 +334,32 @@ impl ClusterSimulator {
             .as_mut()
             .ok_or(SimError::NodeOffline(node))
     }
+
+    fn reset_election_deadline(&mut self, node: NodeId) -> Result<(), SimError> {
+        let width = self
+            .election_timeout_max
+            .checked_sub(self.election_timeout_min)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(SimError::InvalidElectionTimeoutRange {
+                min: self.election_timeout_min,
+                max: self.election_timeout_max,
+            })?;
+        let timeout = self.election_timeout_min + self.next_random() % width;
+        let deadline = self
+            .now
+            .checked_add(timeout)
+            .ok_or(SimError::TimeExhausted)?;
+        self.election_deadlines.insert(node, Some(deadline));
+        Ok(())
+    }
+
+    fn next_random(&mut self) -> u64 {
+        self.random_state = self.random_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.random_state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -262,8 +367,12 @@ pub enum SimError {
     Core(CoreError),
     UnknownNode(NodeId),
     NodeOffline(NodeId),
+    NodeAlreadyOnline(NodeId),
     GenerationExhausted(NodeId),
     StepLimitExceeded(usize),
+    InvalidElectionTimeoutRange { min: u64, max: u64 },
+    NoElectionDeadline,
+    TimeExhausted,
 }
 
 impl From<CoreError> for SimError {
@@ -278,12 +387,20 @@ impl Display for SimError {
             Self::Core(error) => Display::fmt(error, formatter),
             Self::UnknownNode(node) => write!(formatter, "unknown simulated node {}", node.0),
             Self::NodeOffline(node) => write!(formatter, "simulated node {} is offline", node.0),
+            Self::NodeAlreadyOnline(node) => {
+                write!(formatter, "simulated node {} is already online", node.0)
+            }
             Self::GenerationExhausted(node) => {
                 write!(formatter, "simulated node {} exhausted generations", node.0)
             }
             Self::StepLimitExceeded(limit) => {
                 write!(formatter, "simulation exceeded {limit} deterministic steps")
             }
+            Self::InvalidElectionTimeoutRange { min, max } => {
+                write!(formatter, "invalid election timeout range {min}..={max}")
+            }
+            Self::NoElectionDeadline => formatter.write_str("no election deadline is armed"),
+            Self::TimeExhausted => formatter.write_str("simulated logical time exhausted"),
         }
     }
 }
@@ -319,6 +436,33 @@ mod tests {
         assert_eq!(
             simulation.role(NodeId(3)).expect("node exists"),
             Some(Role::Follower)
+        );
+    }
+
+    #[test]
+    fn seeded_logical_clock_reproduces_timeout_order() {
+        let mut first =
+            ClusterSimulator::new_with_seed([NodeId(1), NodeId(2), NodeId(3)], 42, 10, 20)
+                .expect("simulator configuration is valid");
+        let mut second =
+            ClusterSimulator::new_with_seed([NodeId(1), NodeId(2), NodeId(3)], 42, 10, 20)
+                .expect("simulator configuration is valid");
+
+        let first_due = first.advance_to_next_timeout().expect("a timeout is armed");
+        let second_due = second
+            .advance_to_next_timeout()
+            .expect("a timeout is armed");
+        assert_eq!(first_due, second_due);
+        assert_eq!(first.time(), second.time());
+        assert_eq!(first.trace(), second.trace());
+
+        first
+            .run_until_idle(32)
+            .expect("timed election reaches quiescence");
+        let elected = first_due[0];
+        assert_eq!(
+            first.role(elected).expect("node exists"),
+            Some(Role::Leader)
         );
     }
 
