@@ -12,6 +12,7 @@ axum = "0.8.9"
 config = { version = "0.15.25", default-features = false, features = ["toml"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["catch-panic", "limit", "request-id", "sensitive-headers", "timeout", "trace"] }

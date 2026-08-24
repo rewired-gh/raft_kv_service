@@ -1,5 +1,6 @@
 pub mod config;
 pub mod http;
+pub mod kv;
 pub mod raft;
 pub mod storage;
 pub mod telemetry;
