@@ -130,6 +130,18 @@ impl<S: RaftStorage> DurableRaft<S> {
         &self.core
     }
 
+    pub fn transfer_leadership(
+        &mut self,
+        target: NodeId,
+    ) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let effects = self
+            .core
+            .transfer_leadership(target)
+            .map_err(RuntimeError::Core)?;
+        self.execute(effects)
+    }
+
     pub fn storage(&self) -> &S {
         &self.storage
     }

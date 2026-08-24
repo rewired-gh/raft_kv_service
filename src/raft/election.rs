@@ -43,6 +43,7 @@ pub struct HardState {
 pub enum Role {
     #[default]
     Follower,
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -121,6 +122,16 @@ impl ActiveVoters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
+    PreVote {
+        prospective_term: Term,
+        candidate: NodeId,
+        last_log: LogPosition,
+    },
+    PreVoteResponse {
+        current_term: Term,
+        prospective_term: Term,
+        vote_granted: bool,
+    },
     RequestVote {
         term: Term,
         candidate: NodeId,
@@ -143,6 +154,11 @@ pub enum Message {
         match_index: u64,
         request_previous_index: u64,
     },
+    TimeoutNow {
+        term: Term,
+        leader: NodeId,
+        fence_index: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +171,8 @@ pub struct Envelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     ElectionTimeout,
+    CheckQuorum,
+    AbortLeadershipTransfer,
     Receive(Envelope),
 }
 
@@ -235,6 +253,8 @@ pub enum CoreError {
     },
     InvalidConfiguration,
     ConfigurationChangeInProgress,
+    LeadershipTransferInProgress,
+    InvalidLeadershipTransferTarget(NodeId),
     IndexExhausted,
     TermExhausted,
 }
@@ -330,6 +350,16 @@ impl Display for CoreError {
             Self::ConfigurationChangeInProgress => {
                 formatter.write_str("a membership transition is already in progress")
             }
+            Self::LeadershipTransferInProgress => {
+                formatter.write_str("a leadership transfer is in progress")
+            }
+            Self::InvalidLeadershipTransferTarget(node) => {
+                write!(
+                    formatter,
+                    "node {} is not a valid leadership transfer target",
+                    node.0
+                )
+            }
             Self::IndexExhausted => formatter.write_str("Raft log index exhausted"),
             Self::TermExhausted => formatter.write_str("Raft term exhausted"),
         }
@@ -387,11 +417,15 @@ pub struct RaftCore {
     snapshot_position: LogPosition,
     log: Vec<LogEntry>,
     granted_votes: BTreeSet<NodeId>,
+    pre_votes: BTreeSet<NodeId>,
     pending: Option<PendingPersistence>,
     append_after_hard_state: Option<AppendRequest>,
     pending_log: Option<PendingLogPersistence>,
     commit_index: u64,
     replication: BTreeMap<NodeId, ReplicationProgress>,
+    recent_active: BTreeSet<NodeId>,
+    leadership_transfer: Option<NodeId>,
+    timeout_now_sent: bool,
     staging: BTreeSet<NodeId>,
     leader_noop_index: Option<u64>,
     last_applied: u64,
@@ -555,11 +589,15 @@ impl RaftCore {
             snapshot_position,
             log,
             granted_votes: BTreeSet::new(),
+            pre_votes: BTreeSet::new(),
             pending: None,
             append_after_hard_state: None,
             pending_log: None,
             commit_index: last_applied,
             replication: BTreeMap::new(),
+            recent_active: BTreeSet::new(),
+            leadership_transfer: None,
+            timeout_now_sent: false,
             staging: BTreeSet::new(),
             leader_noop_index: None,
             last_applied,
@@ -753,6 +791,11 @@ impl RaftCore {
 
         match event {
             Event::ElectionTimeout => self.handle_election_timeout(),
+            Event::CheckQuorum => self.handle_check_quorum(),
+            Event::AbortLeadershipTransfer => {
+                self.abort_leadership_transfer();
+                Ok(Vec::new())
+            }
             Event::Receive(envelope) if envelope.to == self.id => self.handle_message(envelope),
             Event::Receive(_) => Ok(Vec::new()),
         }
@@ -800,6 +843,9 @@ impl RaftCore {
         if self.role != Role::Leader {
             return Err(CoreError::NotLeader);
         }
+        if self.leadership_transfer.is_some() {
+            return Err(CoreError::LeadershipTransferInProgress);
+        }
         if !self.leader_ready() {
             return Err(CoreError::LeaderNotReady);
         }
@@ -838,6 +884,49 @@ impl RaftCore {
         Ok(effects)
     }
 
+    /// Begins a best-effort transfer. Client proposals remain fenced until the
+    /// transfer succeeds, is explicitly aborted, or this node steps down.
+    pub fn transfer_leadership(&mut self, target: NodeId) -> Result<Vec<Effect>, CoreError> {
+        if self.persistence_pending() {
+            return Err(CoreError::PersistencePending);
+        }
+        if self.role != Role::Leader {
+            return Err(CoreError::NotLeader);
+        }
+        if !self.leader_ready() {
+            return Err(CoreError::LeaderNotReady);
+        }
+        if self.membership_is_joint() {
+            return Err(CoreError::ConfigurationChangeInProgress);
+        }
+        if target == self.id || !self.active_voters.contains(target) {
+            return Err(CoreError::InvalidLeadershipTransferTarget(target));
+        }
+        if self.leadership_transfer.is_some() {
+            return Err(CoreError::LeadershipTransferInProgress);
+        }
+        self.leadership_transfer = Some(target);
+        self.timeout_now_sent = false;
+        if self
+            .replication
+            .get(&target)
+            .is_some_and(|progress| progress.match_index >= self.last_log_position().index)
+        {
+            self.timeout_now_sent = true;
+            return Ok(vec![self.timeout_now(target)]);
+        }
+        Ok(vec![self.append_for_peer(target)?])
+    }
+
+    pub fn abort_leadership_transfer(&mut self) {
+        self.leadership_transfer = None;
+        self.timeout_now_sent = false;
+    }
+
+    pub fn leadership_transfer_target(&self) -> Option<NodeId> {
+        self.leadership_transfer
+    }
+
     pub fn acknowledge_persisted(&mut self, observed: HardState) -> Result<Vec<Effect>, CoreError> {
         let pending = self
             .pending
@@ -855,6 +944,11 @@ impl RaftCore {
         self.role = pending.role;
         self.leader = pending.leader;
         self.granted_votes = pending.granted_votes;
+        if self.role == Role::Follower {
+            self.pre_votes.clear();
+            self.recent_active.clear();
+            self.abort_leadership_transfer();
+        }
 
         if let Some(request) = self.append_after_hard_state.take() {
             return self.handle_current_term_append(request);
@@ -917,7 +1011,32 @@ impl RaftCore {
             return Ok(Vec::new());
         }
 
-        let next_term = self.hard_state.current_term.checked_next()?;
+        let prospective_term = self.hard_state.current_term.checked_next()?;
+        self.role = Role::PreCandidate;
+        self.leader = None;
+        self.pre_votes.clear();
+        self.pre_votes.insert(self.id);
+        self.granted_votes.clear();
+
+        let mut effects = vec![Effect::ResetElectionTimer];
+        effects.extend(self.active_voters.peers(self.id).into_iter().map(|peer| {
+            Effect::Send(Envelope {
+                from: self.id,
+                to: peer,
+                message: Message::PreVote {
+                    prospective_term,
+                    candidate: self.id,
+                    last_log: self.last_log_position(),
+                },
+            })
+        }));
+        if self.active_voters.has_quorum(&self.pre_votes) {
+            return self.begin_real_election(prospective_term);
+        }
+        Ok(effects)
+    }
+
+    fn begin_real_election(&mut self, next_term: Term) -> Result<Vec<Effect>, CoreError> {
         let hard_state = HardState {
             current_term: next_term,
             voted_for: Some(self.id),
@@ -947,6 +1066,24 @@ impl RaftCore {
         })
     }
 
+    fn handle_check_quorum(&mut self) -> Result<Vec<Effect>, CoreError> {
+        if self.role != Role::Leader {
+            return Ok(Vec::new());
+        }
+        if !self.active_voters.has_quorum(&self.recent_active) {
+            self.role = Role::Follower;
+            self.leader = None;
+            self.granted_votes.clear();
+            self.pre_votes.clear();
+            self.recent_active.clear();
+            self.abort_leadership_transfer();
+            return Ok(vec![Effect::ResetElectionTimer]);
+        }
+        self.recent_active.clear();
+        self.recent_active.insert(self.id);
+        Ok(Vec::new())
+    }
+
     fn handle_message(&mut self, envelope: Envelope) -> Result<Vec<Effect>, CoreError> {
         let staged_replication_response = self.staging.contains(&envelope.from)
             && matches!(envelope.message, Message::AppendEntriesResponse { .. });
@@ -954,6 +1091,21 @@ impl RaftCore {
             return Ok(Vec::new());
         }
         match envelope.message {
+            Message::PreVote {
+                prospective_term,
+                candidate,
+                last_log,
+            } => self.handle_pre_vote(envelope.from, prospective_term, candidate, last_log),
+            Message::PreVoteResponse {
+                current_term,
+                prospective_term,
+                vote_granted,
+            } => self.handle_pre_vote_response(
+                envelope.from,
+                current_term,
+                prospective_term,
+                vote_granted,
+            ),
             Message::RequestVote {
                 term,
                 candidate,
@@ -988,7 +1140,79 @@ impl RaftCore {
                 match_index,
                 request_previous_index,
             ),
+            Message::TimeoutNow {
+                term,
+                leader,
+                fence_index,
+            } => self.handle_timeout_now(envelope.from, term, leader, fence_index),
         }
+    }
+
+    fn handle_pre_vote(
+        &self,
+        sender: NodeId,
+        prospective_term: Term,
+        candidate: NodeId,
+        candidate_last_log: LogPosition,
+    ) -> Result<Vec<Effect>, CoreError> {
+        let minimum_term = self.hard_state.current_term.checked_next()?;
+        let vote_granted = sender == candidate
+            && prospective_term >= minimum_term
+            && self.role != Role::Leader
+            && self.leader.is_none()
+            && candidate_last_log.is_at_least_as_up_to_date_as(self.last_log_position());
+        Ok(vec![Effect::Send(Envelope {
+            from: self.id,
+            to: sender,
+            message: Message::PreVoteResponse {
+                current_term: self.hard_state.current_term,
+                prospective_term,
+                vote_granted,
+            },
+        })])
+    }
+
+    fn handle_pre_vote_response(
+        &mut self,
+        voter: NodeId,
+        current_term: Term,
+        prospective_term: Term,
+        vote_granted: bool,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if current_term > self.hard_state.current_term {
+            return self.persist_higher_term(current_term);
+        }
+        let expected = self.hard_state.current_term.checked_next()?;
+        if self.role != Role::PreCandidate || prospective_term != expected || !vote_granted {
+            return Ok(Vec::new());
+        }
+        self.pre_votes.insert(voter);
+        if self.active_voters.has_quorum(&self.pre_votes) {
+            return self.begin_real_election(prospective_term);
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_timeout_now(
+        &mut self,
+        sender: NodeId,
+        term: Term,
+        leader: NodeId,
+        fence_index: u64,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if sender != leader
+            || term != self.hard_state.current_term
+            || self.leader != Some(leader)
+            || self.role == Role::Leader
+            || !self.active_voters.contains(self.id)
+            || self.last_log_position().index < fence_index
+        {
+            return Ok(Vec::new());
+        }
+        let next_term = term.checked_next()?;
+        self.leader = None;
+        self.pre_votes.clear();
+        self.begin_real_election(next_term)
     }
 
     fn handle_request_vote(
@@ -1116,6 +1340,9 @@ impl RaftCore {
         self.role = Role::Follower;
         self.leader = Some(request.leader);
         self.granted_votes.clear();
+        self.pre_votes.clear();
+        self.recent_active.clear();
+        self.abort_leadership_transfer();
 
         let mut effects = vec![Effect::ResetElectionTimer];
         if self.term_at(request.previous.index) != Some(request.previous.term) {
@@ -1197,6 +1424,7 @@ impl RaftCore {
         if term < self.hard_state.current_term || self.role != Role::Leader {
             return Ok(Vec::new());
         }
+        self.recent_active.insert(peer);
 
         let last_index = self.last_log_position().index;
         if accepted && (match_index < request_previous_index || match_index > last_index) {
@@ -1231,6 +1459,14 @@ impl RaftCore {
         }
 
         let mut effects = Vec::new();
+        if self.leadership_transfer == Some(peer)
+            && !self.timeout_now_sent
+            && accepted
+            && match_index >= last_index
+        {
+            self.timeout_now_sent = true;
+            effects.push(self.timeout_now(peer));
+        }
         let previous_commit = self.commit_index;
         self.advance_leader_commit(&mut effects);
         if self.role != Role::Leader {
@@ -1249,6 +1485,8 @@ impl RaftCore {
     }
 
     fn persist_higher_term(&mut self, term: Term) -> Result<Vec<Effect>, CoreError> {
+        self.abort_leadership_transfer();
+        self.pre_votes.clear();
         self.begin_persistence(PendingPersistence {
             hard_state: HardState {
                 current_term: term,
@@ -1278,6 +1516,9 @@ impl RaftCore {
         self.role = Role::Leader;
         self.leader = Some(self.id);
         self.granted_votes.clear();
+        self.pre_votes.clear();
+        self.recent_active.clear();
+        self.recent_active.insert(self.id);
         let previous = self.last_log_position();
         let noop_index = previous
             .index
@@ -1327,6 +1568,12 @@ impl RaftCore {
     fn refresh_active_voters(&mut self) -> Result<(), CoreError> {
         (self.active_voters, self.active_membership) =
             active_membership_from_log(&self.base_membership, &self.log)?;
+        if self
+            .leadership_transfer
+            .is_some_and(|target| !self.active_voters.contains(target))
+        {
+            self.abort_leadership_transfer();
+        }
         if self.role == Role::Leader {
             let next_index = self
                 .last_log_position()
@@ -1456,6 +1703,18 @@ impl RaftCore {
         })
     }
 
+    fn timeout_now(&self, recipient: NodeId) -> Effect {
+        Effect::Send(Envelope {
+            from: self.id,
+            to: recipient,
+            message: Message::TimeoutNow {
+                term: self.hard_state.current_term,
+                leader: self.id,
+                fence_index: self.last_log_position().index,
+            },
+        })
+    }
+
     fn append_response(
         &self,
         recipient: NodeId,
@@ -1534,6 +1793,9 @@ impl RaftCore {
             self.replication.clear();
             self.staging.clear();
             self.leader_noop_index = None;
+            self.pre_votes.clear();
+            self.recent_active.clear();
+            self.abort_leadership_transfer();
         }
     }
 }
@@ -1747,6 +2009,25 @@ mod tests {
         })
     }
 
+    fn begin_election(node: &mut RaftCore, granting_voter: u64) -> Vec<Effect> {
+        node.handle(Event::ElectionTimeout)
+            .expect("pre-vote starts");
+        node.handle(receive(
+            granting_voter,
+            node.id.0,
+            Message::PreVoteResponse {
+                current_term: node.hard_state.current_term,
+                prospective_term: node
+                    .hard_state
+                    .current_term
+                    .checked_next()
+                    .expect("test term available"),
+                vote_granted: true,
+            },
+        ))
+        .expect("pre-vote quorum starts election")
+    }
+
     fn append_request(
         term: u64,
         previous: LogPosition,
@@ -1814,7 +2095,7 @@ mod tests {
             .handle(Event::ElectionTimeout)
             .expect("timeout is accepted");
         let hard_state = persist_from(&effects);
-        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.role(), Role::PreCandidate);
         assert_eq!(node.hard_state(), HardState::default());
         assert!(node.persistence_pending());
 
@@ -2041,11 +2322,25 @@ mod tests {
     #[test]
     fn duplicate_votes_do_not_manufacture_a_quorum() {
         let mut node = core(1, &[1, 2, 3, 4, 5]);
-        let hard_state = persist_from(
-            &node
-                .handle(Event::ElectionTimeout)
-                .expect("timeout starts persistence"),
+        let pre_vote = begin_election(&mut node, 2);
+        assert_eq!(node.role(), Role::PreCandidate);
+        let effects = node
+            .handle(receive(
+                3,
+                1,
+                Message::PreVoteResponse {
+                    current_term: Term(0),
+                    prospective_term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("pre-vote quorum");
+        assert!(
+            !pre_vote
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistHardState(_)))
         );
+        let hard_state = persist_from(&effects);
         node.acknowledge_persisted(hard_state)
             .expect("candidate state persists");
 
@@ -2083,11 +2378,7 @@ mod tests {
     #[test]
     fn higher_term_heartbeat_steps_candidate_down_after_persistence() {
         let mut node = core(1, &[1, 2, 3]);
-        let candidate_state = persist_from(
-            &node
-                .handle(Event::ElectionTimeout)
-                .expect("timeout starts persistence"),
-        );
+        let candidate_state = persist_from(&begin_election(&mut node, 2));
         node.acknowledge_persisted(candidate_state)
             .expect("candidate state persists");
         assert_eq!(node.role(), Role::Candidate);
@@ -2144,7 +2435,7 @@ mod tests {
             CoreError::PersistenceAcknowledgementMismatch { .. }
         ));
         assert!(node.persistence_pending());
-        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.role(), Role::PreCandidate);
     }
 
     #[test]
@@ -2317,11 +2608,7 @@ mod tests {
     #[test]
     fn stale_failure_cannot_regress_replication_progress() {
         let mut node = core(1, &[1, 2, 3]);
-        let hard_state = persist_from(
-            &node
-                .handle(Event::ElectionTimeout)
-                .expect("timeout starts persistence"),
-        );
+        let hard_state = persist_from(&begin_election(&mut node, 2));
         node.acknowledge_persisted(hard_state)
             .expect("candidate state persists");
         let effects = node
@@ -2705,11 +2992,7 @@ mod tests {
             Err(CoreError::NoApplicationPending)
         );
 
-        let expected = persist_from(
-            &follower
-                .handle(Event::ElectionTimeout)
-                .expect("timeout requests persistence"),
-        );
+        let expected = persist_from(&begin_election(&mut follower, 2));
         assert_eq!(
             follower.handle(Event::ElectionTimeout),
             Err(CoreError::PersistencePending)
@@ -2729,11 +3012,7 @@ mod tests {
     #[test]
     fn leader_admission_distinguishes_active_staged_and_not_ready_peers() {
         let mut leader = core(1, &[1, 2, 3]);
-        let hard_state = persist_from(
-            &leader
-                .handle(Event::ElectionTimeout)
-                .expect("start election"),
-        );
+        let hard_state = persist_from(&begin_election(&mut leader, 2));
         let effects = leader
             .acknowledge_persisted(hard_state)
             .expect("persist candidacy");
@@ -2886,5 +3165,262 @@ mod tests {
         node.restore_snapshot(position, base, vec![command_entry(3, 3, 7)])
             .expect("reinstalling a snapshot at the applied boundary is valid");
         assert_eq!(node.snapshot_position(), position);
+    }
+
+    fn ready_three_node_leader() -> RaftCore {
+        let mut node = core(1, &[1, 2, 3]);
+        node.handle(Event::ElectionTimeout).expect("pre-vote");
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::PreVoteResponse {
+                    current_term: Term(0),
+                    prospective_term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("pre-vote quorum");
+        let hard_state = persist_from(&effects);
+        node.acknowledge_persisted(hard_state)
+            .expect("candidate state persists");
+        let effects = node
+            .handle(receive(
+                2,
+                1,
+                Message::RequestVoteResponse {
+                    term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("election quorum");
+        let mutation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistLog(mutation) => Some(mutation),
+                _ => None,
+            })
+            .expect("leader no-op");
+        node.acknowledge_log_persisted(mutation)
+            .expect("leader no-op persists");
+        node
+    }
+
+    #[test]
+    fn pre_vote_does_not_mutate_durable_state_and_requires_quorum() {
+        let mut node = core(1, &[1, 2, 3]);
+        let original = node.hard_state();
+        let effects = node
+            .handle(Event::ElectionTimeout)
+            .expect("pre-vote starts");
+        assert_eq!(node.role(), Role::PreCandidate);
+        assert_eq!(node.hard_state(), original);
+        assert!(!node.persistence_pending());
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    Effect::Send(Envelope {
+                        message: Message::PreVote { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            2
+        );
+
+        let persistence = node
+            .handle(receive(
+                2,
+                1,
+                Message::PreVoteResponse {
+                    current_term: Term(0),
+                    prospective_term: Term(1),
+                    vote_granted: true,
+                },
+            ))
+            .expect("pre-vote quorum starts real election");
+        assert_eq!(
+            persist_from(&persistence),
+            HardState {
+                current_term: Term(1),
+                voted_for: Some(NodeId(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn known_leader_suppresses_pre_vote_without_resetting_timer() {
+        let mut node = core(2, &[1, 2, 3]);
+        node.handle(receive(
+            1,
+            2,
+            append_request(0, LogPosition::default(), Vec::new(), 0),
+        ))
+        .expect("observe leader");
+        let effects = node
+            .handle(receive(
+                3,
+                2,
+                Message::PreVote {
+                    prospective_term: Term(1),
+                    candidate: NodeId(3),
+                    last_log: LogPosition::default(),
+                },
+            ))
+            .expect("pre-vote rejected");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Envelope {
+                message: Message::PreVoteResponse {
+                    vote_granted: false,
+                    ..
+                },
+                ..
+            })]
+        ));
+        assert!(!effects.contains(&Effect::ResetElectionTimer));
+        assert_eq!(node.hard_state(), HardState::default());
+    }
+
+    #[test]
+    fn check_quorum_uses_recent_activity_and_steps_down_without_majority() {
+        let mut leader = ready_three_node_leader();
+        leader
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("peer contact");
+        assert_eq!(leader.handle(Event::CheckQuorum), Ok(Vec::new()));
+        assert_eq!(leader.role(), Role::Leader);
+        assert_eq!(
+            leader.handle(Event::CheckQuorum),
+            Ok(vec![Effect::ResetElectionTimer])
+        );
+        assert_eq!(leader.role(), Role::Follower);
+    }
+
+    #[test]
+    fn check_quorum_requires_both_halves_of_a_joint_configuration() {
+        let mut leader = ready_three_node_leader();
+        leader.active_voters = ActiveVoters::Joint {
+            old: voters(&[1, 2, 3]),
+            new: voters(&[1, 3, 4]),
+        };
+        leader.recent_active = [NodeId(1), NodeId(2)].into_iter().collect();
+        assert_eq!(
+            leader.handle(Event::CheckQuorum),
+            Ok(vec![Effect::ResetElectionTimer]),
+            "an old-configuration majority is not a joint quorum"
+        );
+        assert_eq!(leader.role(), Role::Follower);
+
+        let mut leader = ready_three_node_leader();
+        leader.active_voters = ActiveVoters::Joint {
+            old: voters(&[1, 2, 3]),
+            new: voters(&[1, 3, 4]),
+        };
+        leader.recent_active = [NodeId(1), NodeId(3)].into_iter().collect();
+        assert_eq!(leader.handle(Event::CheckQuorum), Ok(Vec::new()));
+        assert_eq!(leader.role(), Role::Leader);
+    }
+
+    #[test]
+    fn leadership_transfer_fences_proposals_and_emits_timeout_now_once() {
+        let mut leader = ready_three_node_leader();
+        leader
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("target catches up");
+        let effects = leader.transfer_leadership(NodeId(2)).expect("transfer");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Envelope {
+                message: Message::TimeoutNow { fence_index: 1, .. },
+                ..
+            })]
+        ));
+        assert_eq!(
+            leader.propose(EntryPayload::Command(vec![1])),
+            Err(CoreError::LeadershipTransferInProgress)
+        );
+        let repeated = leader
+            .handle(receive(
+                2,
+                1,
+                Message::AppendEntriesResponse {
+                    term: Term(1),
+                    accepted: true,
+                    match_index: 1,
+                    request_previous_index: 0,
+                },
+            ))
+            .expect("duplicate acknowledgement");
+        assert!(!repeated.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(Envelope {
+                message: Message::TimeoutNow { .. },
+                ..
+            })
+        )));
+        assert_eq!(
+            leader.handle(Event::AbortLeadershipTransfer),
+            Ok(Vec::new())
+        );
+        assert!(leader.propose(EntryPayload::Command(vec![1])).is_ok());
+    }
+
+    #[test]
+    fn timeout_now_requires_the_transfer_fence_to_be_present() {
+        let mut follower = core(2, &[1, 2, 3]);
+        follower
+            .handle(receive(
+                1,
+                2,
+                append_request(0, LogPosition::default(), Vec::new(), 0),
+            ))
+            .expect("observe leader");
+        let stale = follower
+            .handle(receive(
+                1,
+                2,
+                Message::TimeoutNow {
+                    term: Term(0),
+                    leader: NodeId(1),
+                    fence_index: 1,
+                },
+            ))
+            .expect("missing fence ignored");
+        assert!(stale.is_empty());
+        assert_eq!(follower.role(), Role::Follower);
+
+        let effects = follower
+            .handle(receive(
+                1,
+                2,
+                Message::TimeoutNow {
+                    term: Term(0),
+                    leader: NodeId(1),
+                    fence_index: 0,
+                },
+            ))
+            .expect("caught-up target campaigns immediately");
+        assert!(matches!(effects.as_slice(), [Effect::PersistHardState(_)]));
     }
 }

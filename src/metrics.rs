@@ -59,6 +59,13 @@ struct MetricsInner {
     pub timed_out_operations: Counter,
     pub deduplicated_operations: Counter,
     pub raft_elections: Counter,
+    pub raft_pre_vote_campaigns: Counter,
+    pub raft_pre_vote_wins: Counter,
+    pub raft_check_quorum_stepdowns: Counter,
+    pub leadership_transfers_attempted: Counter,
+    pub leadership_transfers_completed: Counter,
+    pub leadership_transfers_failed: Counter,
+    pub leadership_transfers_timed_out: Counter,
     pub peer_rpcs: Counter,
     pub snapshots: Counter,
     pub request_latency: Histogram,
@@ -92,6 +99,13 @@ impl Metrics {
         let timed_out_operations = Counter::default();
         let deduplicated_operations = Counter::default();
         let raft_elections = Counter::default();
+        let raft_pre_vote_campaigns = Counter::default();
+        let raft_pre_vote_wins = Counter::default();
+        let raft_check_quorum_stepdowns = Counter::default();
+        let leadership_transfers_attempted = Counter::default();
+        let leadership_transfers_completed = Counter::default();
+        let leadership_transfers_failed = Counter::default();
+        let leadership_transfers_timed_out = Counter::default();
         let peer_rpcs = Counter::default();
         let snapshots = Counter::default();
         let latency_buckets =
@@ -145,6 +159,41 @@ impl Metrics {
             "raft_elections",
             "Election timeouts processed.",
             raft_elections.clone(),
+        );
+        registry.register(
+            "raft_pre_vote_campaigns",
+            "Pre-vote campaigns started.",
+            raft_pre_vote_campaigns.clone(),
+        );
+        registry.register(
+            "raft_pre_vote_wins",
+            "Pre-vote campaigns that reached quorum.",
+            raft_pre_vote_wins.clone(),
+        );
+        registry.register(
+            "raft_check_quorum_stepdowns",
+            "Leaders stepped down after losing quorum activity.",
+            raft_check_quorum_stepdowns.clone(),
+        );
+        registry.register(
+            "leadership_transfers_attempted",
+            "Leadership transfers accepted for processing.",
+            leadership_transfers_attempted.clone(),
+        );
+        registry.register(
+            "leadership_transfers_completed",
+            "Leadership transfers observed as completed.",
+            leadership_transfers_completed.clone(),
+        );
+        registry.register(
+            "leadership_transfers_failed",
+            "Leadership transfers that failed before completion.",
+            leadership_transfers_failed.clone(),
+        );
+        registry.register(
+            "leadership_transfers_timed_out",
+            "Leadership transfers that exceeded their bounded deadline.",
+            leadership_transfers_timed_out.clone(),
         );
         registry.register(
             "peer_rpcs",
@@ -232,6 +281,13 @@ impl Metrics {
                 timed_out_operations,
                 deduplicated_operations,
                 raft_elections,
+                raft_pre_vote_campaigns,
+                raft_pre_vote_wins,
+                raft_check_quorum_stepdowns,
+                leadership_transfers_attempted,
+                leadership_transfers_completed,
+                leadership_transfers_failed,
+                leadership_transfers_timed_out,
                 peer_rpcs,
                 snapshots,
                 request_latency,
@@ -279,6 +335,34 @@ impl Metrics {
 
     pub fn election(&self) {
         self.inner.raft_elections.inc();
+    }
+
+    pub fn pre_vote_campaign(&self) {
+        self.inner.raft_pre_vote_campaigns.inc();
+    }
+
+    pub fn pre_vote_won(&self) {
+        self.inner.raft_pre_vote_wins.inc();
+    }
+
+    pub fn check_quorum_stepdown(&self) {
+        self.inner.raft_check_quorum_stepdowns.inc();
+    }
+
+    pub fn leadership_transfer_attempted(&self) {
+        self.inner.leadership_transfers_attempted.inc();
+    }
+
+    pub fn leadership_transfer_completed(&self) {
+        self.inner.leadership_transfers_completed.inc();
+    }
+
+    pub fn leadership_transfer_failed(&self) {
+        self.inner.leadership_transfers_failed.inc();
+    }
+
+    pub fn leadership_transfer_timed_out(&self) {
+        self.inner.leadership_transfers_timed_out.inc();
     }
 
     pub fn peer_rpc(&self) {
@@ -358,5 +442,39 @@ impl Metrics {
             PEER_PROTOCOL_VERSION,
         ));
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_feature_counters_are_bounded_and_rendered() {
+        let metrics = Metrics::new();
+        metrics.pre_vote_campaign();
+        metrics.pre_vote_won();
+        metrics.check_quorum_stepdown();
+        metrics.leadership_transfer_attempted();
+        metrics.leadership_transfer_completed();
+        metrics.leadership_transfer_failed();
+        metrics.leadership_transfer_timed_out();
+
+        let rendered = metrics.render().expect("render metrics");
+        for name in [
+            "raft_pre_vote_campaigns_total",
+            "raft_pre_vote_wins_total",
+            "raft_check_quorum_stepdowns_total",
+            "leadership_transfers_attempted_total",
+            "leadership_transfers_completed_total",
+            "leadership_transfers_failed_total",
+            "leadership_transfers_timed_out_total",
+        ] {
+            assert!(rendered.contains(&format!("{name} 1")), "missing {name}");
+            assert!(
+                !rendered.contains(&format!("{name}{{")),
+                "{name} must not carry labels"
+            );
+        }
     }
 }

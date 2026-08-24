@@ -32,6 +32,8 @@ pub struct RaftConfig {
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub heartbeat_interval_ms: u64,
+    pub check_quorum: bool,
+    pub leadership_transfer_timeout_ms: u64,
     pub rpc_timeout_ms: u64,
     pub max_clients: u64,
     pub max_key_bytes: usize,
@@ -56,6 +58,8 @@ impl Default for RaftConfig {
             election_timeout_min_ms: 300,
             election_timeout_max_ms: 600,
             heartbeat_interval_ms: 100,
+            check_quorum: true,
+            leadership_transfer_timeout_ms: 1_200,
             rpc_timeout_ms: 250,
             max_clients: 10_000,
             max_key_bytes: crate::kv::MAX_KEY_BYTES,
@@ -66,6 +70,27 @@ impl Default for RaftConfig {
             staging: false,
             peer_certificates: Vec::new(),
         }
+    }
+}
+
+impl RaftConfig {
+    /// Validates timing relationships used by the bounded leader-health and
+    /// leadership-transfer mechanisms. Check-quorum uses
+    /// `election_timeout_min_ms` as its observation window.
+    pub fn validate(&self) -> Result<()> {
+        if self.election_timeout_min_ms == 0
+            || self.election_timeout_min_ms > self.election_timeout_max_ms
+        {
+            anyhow::bail!(
+                "raft election_timeout_min_ms must be nonzero and no greater than election_timeout_max_ms"
+            );
+        }
+        if self.leadership_transfer_timeout_ms < self.election_timeout_max_ms {
+            anyhow::bail!(
+                "raft leadership_transfer_timeout_ms must be at least election_timeout_max_ms"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -163,7 +188,7 @@ impl AppConfig {
         if let Ok(path) = std::env::var("RAFT_KV_CONFIG_FILE") {
             builder = builder.add_source(File::with_name(&path).required(true));
         }
-        builder
+        let config: Self = builder
             .add_source(
                 Environment::with_prefix("RAFT_KV")
                     .prefix_separator("__")
@@ -173,7 +198,9 @@ impl AppConfig {
             .build()
             .context("failed to build application configuration")?
             .try_deserialize()
-            .context("failed to deserialize application configuration")
+            .context("failed to deserialize application configuration")?;
+        config.raft.validate()?;
+        Ok(config)
     }
 }
 
@@ -285,5 +312,29 @@ mod tests {
         assert!(matches!(config.telemetry.log_format, LogFormat::Pretty));
         assert_eq!(PeerServerConfig::default().port, 9080);
         assert_eq!(OperationalServerConfig::default().port, 8088);
+        assert!(config.raft.check_quorum);
+        assert_eq!(config.raft.leadership_transfer_timeout_ms, 1_200);
+        config
+            .raft
+            .validate()
+            .expect("default Raft timing is valid");
+    }
+
+    #[test]
+    fn raft_timing_rejects_unbounded_or_impossibly_short_transfer() {
+        let mut config = RaftConfig {
+            election_timeout_min_ms: 0,
+            ..RaftConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.election_timeout_min_ms = 300;
+        config.leadership_transfer_timeout_ms = 599;
+        assert!(config.validate().is_err());
+
+        config.leadership_transfer_timeout_ms = 600;
+        config
+            .validate()
+            .expect("one maximum election window is sufficient");
     }
 }

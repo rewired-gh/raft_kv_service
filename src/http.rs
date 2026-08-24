@@ -19,7 +19,7 @@ use axum::{
         },
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
@@ -38,7 +38,10 @@ use crate::kv::{
     MutationResult, ReadResult, validate_key_with_limit,
 };
 use crate::{
-    cluster::{MembershipError, MembershipView, NodeDiagnostics},
+    cluster::{
+        LeadershipTransferError, LeadershipTransferResult, MembershipError, MembershipView,
+        NodeDiagnostics,
+    },
     metrics::{Metrics, RaftMetricsSnapshot},
     raft::{ClusterConfiguration, ConfigurationPhase, Role},
 };
@@ -59,6 +62,9 @@ type MembershipReader = Arc<dyn Fn() -> MembershipFuture + Send + Sync>;
 type DiagnosticsFuture =
     Pin<Box<dyn Future<Output = Result<NodeDiagnostics, MembershipError>> + Send>>;
 type DiagnosticsReader = Arc<dyn Fn() -> DiagnosticsFuture + Send + Sync>;
+type LeadershipTransferFuture =
+    Pin<Box<dyn Future<Output = Result<LeadershipTransferResult, LeadershipTransferError>> + Send>>;
+type LeadershipTransfer = Arc<dyn Fn(u64) -> LeadershipTransferFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,6 +75,7 @@ pub struct AppState {
     membership_reader: Option<MembershipReader>,
     operational_token: Option<Arc<str>>,
     diagnostics_reader: Option<DiagnosticsReader>,
+    leadership_transfer: Option<LeadershipTransfer>,
     metrics: Metrics,
     max_key_bytes: usize,
     max_value_bytes: usize,
@@ -84,6 +91,7 @@ impl AppState {
             membership_reader: None,
             operational_token: None,
             diagnostics_reader: None,
+            leadership_transfer: None,
             metrics: Metrics::new(),
             max_key_bytes: MAX_KEY_BYTES,
             max_value_bytes: MAX_VALUE_BYTES,
@@ -101,6 +109,17 @@ impl AppState {
 
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    pub fn with_leadership_transfer<F, Fut>(mut self, transfer: F) -> Self
+    where
+        F: Fn(u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<LeadershipTransferResult, LeadershipTransferError>>
+            + Send
+            + 'static,
+    {
+        self.leadership_transfer = Some(Arc::new(move |target| Box::pin(transfer(target))));
         self
     }
 
@@ -168,6 +187,10 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
                 get(get_membership).put(put_membership),
             )
             .route("/operational/v1/status", get(get_status))
+            .route(
+                "/operational/v1/leadership-transfer",
+                post(post_leadership_transfer),
+            )
             .route("/metrics", get(get_metrics))
             .fallback(not_found)
             .with_state(state),
@@ -201,6 +224,10 @@ pub fn operational_router(state: AppState, request_timeout: Duration) -> Router 
                 get(get_membership).put(put_membership),
             )
             .route("/operational/v1/status", get(get_status))
+            .route(
+                "/operational/v1/leadership-transfer",
+                post(post_leadership_transfer),
+            )
             .route("/metrics", get(get_metrics))
             .fallback(not_found)
             .with_state(state),
@@ -238,6 +265,98 @@ fn with_middleware(router: Router, request_timeout: Duration, max_body_bytes: us
 struct MembershipRequestBody {
     operation_id: Uuid,
     members: Vec<MemberBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeadershipTransferRequestBody {
+    target_node_id: u64,
+}
+
+#[derive(Serialize)]
+struct LeadershipTransferResponseBody {
+    target_node_id: u64,
+    term: u64,
+}
+
+async fn post_leadership_transfer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LeadershipTransferRequestBody>,
+) -> Response {
+    let _request_timer = state.metrics.http_request();
+    let request_id = request_id(&headers);
+    if !operational_authorized(&state, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "operational-unauthorized",
+            "Unauthorized",
+            "a valid operational bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    if body.target_node_id == 0 {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid-leadership-transfer-target",
+            "Invalid leadership transfer target",
+            "target_node_id must be nonzero",
+            request_id,
+        )
+        .into_response();
+    }
+    let Some(transfer) = &state.leadership_transfer else {
+        return service_problem(ServiceError::Unavailable, request_id).into_response();
+    };
+    match transfer(body.target_node_id).await {
+        Ok(result) => Json(LeadershipTransferResponseBody {
+            target_node_id: result.target.0,
+            term: result.term.0,
+        })
+        .into_response(),
+        Err(error) => {
+            let (status, kind, title, detail) = match error {
+                LeadershipTransferError::InvalidTarget => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid-leadership-transfer-target",
+                    "Invalid leadership transfer target",
+                    "the target must be a different active voter",
+                ),
+                LeadershipTransferError::Busy => (
+                    StatusCode::CONFLICT,
+                    "leadership-transfer-busy",
+                    "Leadership transfer busy",
+                    "the leader is not at a safe transfer boundary or another operation is active",
+                ),
+                LeadershipTransferError::TimedOut => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "leadership-transfer-timeout",
+                    "Leadership transfer timed out",
+                    "the target did not establish leadership before the bounded deadline",
+                ),
+                LeadershipTransferError::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "leadership-transfer-unavailable",
+                    "Leadership transfer unavailable",
+                    "this node is not the ready leader or lost leadership",
+                ),
+                LeadershipTransferError::Overloaded => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "leadership-transfer-overloaded",
+                    "Leadership transfer overloaded",
+                    "the bounded Raft request queue is full",
+                ),
+                LeadershipTransferError::Internal => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal-error",
+                    "Internal error",
+                    "the leadership transfer failed internally",
+                ),
+            };
+            problem(status, kind, title, detail, request_id).into_response()
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -349,6 +468,7 @@ fn status_body(status: NodeDiagnostics) -> StatusBody {
         node_id: status.node_id.0,
         role: match status.role {
             Role::Follower => "follower",
+            Role::PreCandidate => "pre_candidate",
             Role::Candidate => "candidate",
             Role::Leader => "leader",
         },
@@ -402,6 +522,7 @@ fn update_metrics(metrics: &Metrics, status: &NodeDiagnostics) {
     metrics.update_raft(&RaftMetricsSnapshot {
         role: match status.role {
             Role::Follower => 0,
+            Role::PreCandidate => 1,
             Role::Candidate => 1,
             Role::Leader => 2,
         },

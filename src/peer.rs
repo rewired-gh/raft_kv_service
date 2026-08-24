@@ -18,7 +18,7 @@ use crate::{
     storage::{SNAPSHOT_FORMAT_VERSION, Snapshot, StorageLimits},
 };
 
-pub const PEER_PROTOCOL_VERSION: u32 = 3;
+pub const PEER_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_PEER_MESSAGE_BYTES: usize = 6 * 1024 * 1024;
 pub type ForwardMembershipOperation = Option<([u8; 16], ClusterConfiguration)>;
 
@@ -58,6 +58,80 @@ pub struct PeerContext {
 }
 
 impl PeerContext {
+    pub fn decode_pre_vote(&self, request: proto::PreVoteRequest) -> Result<Envelope, PeerError> {
+        let identity = self.validate_identity(request.identity)?;
+        let prospective_term = valid_term(request.prospective_term)?;
+        if identity.term != prospective_term {
+            return Err(PeerError::TermMismatch);
+        }
+        let candidate = valid_node(request.candidate_id)?;
+        if candidate != identity.sender {
+            return Err(PeerError::SenderRoleMismatch);
+        }
+        Ok(Envelope {
+            from: identity.sender,
+            to: self.local_id,
+            message: Message::PreVote {
+                prospective_term,
+                candidate,
+                last_log: decode_position(request.last_log)?,
+            },
+        })
+    }
+
+    pub fn decode_pre_vote_response(
+        &self,
+        response: proto::PreVoteResponse,
+    ) -> Result<Envelope, PeerError> {
+        let identity = self.validate_identity(response.identity)?;
+        let current_term = Term(response.current_term);
+        let prospective_term = valid_term(response.prospective_term)?;
+        if identity.term != prospective_term {
+            return Err(PeerError::TermMismatch);
+        }
+        Ok(Envelope {
+            from: identity.sender,
+            to: self.local_id,
+            message: Message::PreVoteResponse {
+                current_term,
+                prospective_term,
+                vote_granted: response.vote_granted,
+            },
+        })
+    }
+
+    pub fn decode_timeout_now(
+        &self,
+        request: proto::TimeoutNowRequest,
+    ) -> Result<Envelope, PeerError> {
+        let identity = self.validate_identity(request.identity)?;
+        let leader = valid_node(request.leader_id)?;
+        if leader != identity.sender || request.fence_index == 0 {
+            return Err(if leader != identity.sender {
+                PeerError::SenderRoleMismatch
+            } else {
+                PeerError::InvalidFenceIndex
+            });
+        }
+        Ok(Envelope {
+            from: identity.sender,
+            to: self.local_id,
+            message: Message::TimeoutNow {
+                term: identity.term,
+                leader,
+                fence_index: request.fence_index,
+            },
+        })
+    }
+
+    pub fn decode_timeout_now_response(
+        &self,
+        response: proto::TimeoutNowResponse,
+    ) -> Result<(NodeId, Term, bool), PeerError> {
+        let identity = self.validate_identity(response.identity)?;
+        Ok((identity.sender, identity.term, response.accepted))
+    }
+
     pub fn decode_forward_membership(
         &self,
         request: proto::ForwardMembershipRequest,
@@ -550,6 +624,64 @@ struct Identity {
     term: Term,
 }
 
+pub fn encode_pre_vote(
+    cluster: ClusterId,
+    limits: StorageLimits,
+    envelope: &Envelope,
+) -> Result<proto::PreVoteRequest, PeerError> {
+    let Message::PreVote {
+        prospective_term,
+        candidate,
+        last_log,
+    } = &envelope.message
+    else {
+        return Err(PeerError::WrongMessageKind);
+    };
+    if *candidate != envelope.from {
+        return Err(PeerError::SenderRoleMismatch);
+    }
+    Ok(proto::PreVoteRequest {
+        identity: Some(encode_identity(
+            cluster,
+            limits,
+            envelope,
+            *prospective_term,
+        )?),
+        prospective_term: prospective_term.0,
+        candidate_id: candidate.0,
+        last_log: Some(encode_position(*last_log)),
+    })
+}
+
+pub fn encode_pre_vote_response(
+    cluster: ClusterId,
+    limits: StorageLimits,
+    envelope: &Envelope,
+) -> Result<proto::PreVoteResponse, PeerError> {
+    let Message::PreVoteResponse {
+        current_term,
+        prospective_term,
+        vote_granted,
+    } = &envelope.message
+    else {
+        return Err(PeerError::WrongMessageKind);
+    };
+    Ok(proto::PreVoteResponse {
+        // A fresh node may truthfully report current term zero. The non-zero
+        // prospective term therefore authenticates the RPC identity, while the
+        // explicitly carried current term remains the responder's observation.
+        identity: Some(encode_identity(
+            cluster,
+            limits,
+            envelope,
+            *prospective_term,
+        )?),
+        current_term: current_term.0,
+        prospective_term: prospective_term.0,
+        vote_granted: *vote_granted,
+    })
+}
+
 pub fn encode_request_vote(
     cluster: ClusterId,
     limits: StorageLimits,
@@ -627,6 +759,46 @@ pub fn encode_append_entries_response(
         accepted: *accepted,
         match_index: *match_index,
         request_previous_index: *request_previous_index,
+    })
+}
+
+pub fn encode_timeout_now(
+    cluster: ClusterId,
+    limits: StorageLimits,
+    envelope: &Envelope,
+) -> Result<proto::TimeoutNowRequest, PeerError> {
+    let Message::TimeoutNow {
+        term,
+        leader,
+        fence_index,
+    } = &envelope.message
+    else {
+        return Err(PeerError::WrongMessageKind);
+    };
+    if *leader != envelope.from {
+        return Err(PeerError::SenderRoleMismatch);
+    }
+    if *fence_index == 0 {
+        return Err(PeerError::InvalidFenceIndex);
+    }
+    Ok(proto::TimeoutNowRequest {
+        identity: Some(encode_identity(cluster, limits, envelope, *term)?),
+        leader_id: leader.0,
+        fence_index: *fence_index,
+    })
+}
+
+pub fn encode_timeout_now_response(
+    cluster: ClusterId,
+    limits: StorageLimits,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    accepted: bool,
+) -> Result<proto::TimeoutNowResponse, PeerError> {
+    Ok(proto::TimeoutNowResponse {
+        identity: Some(encode_rpc_identity(cluster, limits, from, to, term)?),
+        accepted,
     })
 }
 
@@ -731,6 +903,14 @@ fn valid_node(node: u64) -> Result<NodeId, PeerError> {
     }
 }
 
+fn valid_term(term: u64) -> Result<Term, PeerError> {
+    if term == 0 {
+        Err(PeerError::ZeroTerm)
+    } else {
+        Ok(Term(term))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerError {
     MissingIdentity,
@@ -743,6 +923,7 @@ pub enum PeerError {
     RecipientMismatch,
     ZeroNodeId,
     ZeroTerm,
+    TermMismatch,
     SenderRoleMismatch,
     MissingLogPosition,
     InvalidLogPosition,
@@ -762,6 +943,7 @@ pub enum PeerError {
     SnapshotTooLarge,
     InvalidSnapshotChunk,
     InvalidConfiguration,
+    InvalidFenceIndex,
 }
 
 impl Display for PeerError {
@@ -787,6 +969,163 @@ mod tests {
             limits: PeerLimits::default(),
             replicated_limits: replicated_limits(),
         }
+    }
+
+    #[test]
+    fn pre_vote_round_trips_without_advancing_the_durable_term() {
+        let request = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::PreVote {
+                prospective_term: Term(4),
+                candidate: NodeId(1),
+                last_log: LogPosition {
+                    index: 9,
+                    term: Term(3),
+                },
+            },
+        };
+        let encoded = encode_pre_vote(ClusterId([4; 16]), replicated_limits(), &request)
+            .expect("encode pre-vote");
+        assert_eq!(
+            context().decode_pre_vote(encoded).expect("decode pre-vote"),
+            request
+        );
+
+        let response = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::PreVoteResponse {
+                current_term: Term(0),
+                prospective_term: Term(1),
+                vote_granted: true,
+            },
+        };
+        let encoded = encode_pre_vote_response(ClusterId([4; 16]), replicated_limits(), &response)
+            .expect("encode pre-vote response");
+        assert_eq!(encoded.identity.as_ref().expect("identity").term, 1);
+        assert_eq!(
+            context()
+                .decode_pre_vote_response(encoded)
+                .expect("decode pre-vote response"),
+            response
+        );
+    }
+
+    #[test]
+    fn pre_vote_rejects_ambiguous_identity_and_term_bindings() {
+        let envelope = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::PreVote {
+                prospective_term: Term(4),
+                candidate: NodeId(1),
+                last_log: LogPosition::default(),
+            },
+        };
+        let valid = encode_pre_vote(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode pre-vote");
+
+        let mut mismatched_term = valid.clone();
+        mismatched_term.prospective_term = 5;
+        assert_eq!(
+            context().decode_pre_vote(mismatched_term),
+            Err(PeerError::TermMismatch)
+        );
+        let mut zero_term = valid.clone();
+        zero_term.prospective_term = 0;
+        assert_eq!(
+            context().decode_pre_vote(zero_term),
+            Err(PeerError::ZeroTerm)
+        );
+        let mut wrong_candidate = valid;
+        wrong_candidate.candidate_id = 3;
+        assert_eq!(
+            context().decode_pre_vote(wrong_candidate),
+            Err(PeerError::SenderRoleMismatch)
+        );
+
+        let response = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::PreVoteResponse {
+                current_term: Term(3),
+                prospective_term: Term(4),
+                vote_granted: false,
+            },
+        };
+        let mut encoded =
+            encode_pre_vote_response(ClusterId([4; 16]), replicated_limits(), &response)
+                .expect("encode response");
+        encoded.prospective_term = 5;
+        assert_eq!(
+            context().decode_pre_vote_response(encoded),
+            Err(PeerError::TermMismatch)
+        );
+    }
+
+    #[test]
+    fn timeout_now_round_trips_with_a_nonzero_fence() {
+        let envelope = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::TimeoutNow {
+                term: Term(7),
+                leader: NodeId(1),
+                fence_index: 42,
+            },
+        };
+        let encoded = encode_timeout_now(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode timeout-now");
+        assert_eq!(
+            context()
+                .decode_timeout_now(encoded)
+                .expect("decode timeout-now"),
+            envelope
+        );
+
+        let response = encode_timeout_now_response(
+            ClusterId([4; 16]),
+            replicated_limits(),
+            NodeId(1),
+            NodeId(2),
+            Term(7),
+            true,
+        )
+        .expect("encode timeout-now response");
+        assert_eq!(
+            context()
+                .decode_timeout_now_response(response)
+                .expect("decode timeout-now response"),
+            (NodeId(1), Term(7), true)
+        );
+    }
+
+    #[test]
+    fn timeout_now_rejects_sender_role_and_zero_fence() {
+        let envelope = Envelope {
+            from: NodeId(1),
+            to: NodeId(2),
+            message: Message::TimeoutNow {
+                term: Term(7),
+                leader: NodeId(1),
+                fence_index: 42,
+            },
+        };
+        let valid = encode_timeout_now(ClusterId([4; 16]), replicated_limits(), &envelope)
+            .expect("encode timeout-now");
+        let mut wrong_leader = valid.clone();
+        wrong_leader.leader_id = 3;
+        assert_eq!(
+            context().decode_timeout_now(wrong_leader),
+            Err(PeerError::SenderRoleMismatch)
+        );
+        let mut zero_fence = valid;
+        zero_fence.fence_index = 0;
+        assert_eq!(
+            context().decode_timeout_now(zero_fence),
+            Err(PeerError::InvalidFenceIndex)
+        );
     }
 
     #[test]

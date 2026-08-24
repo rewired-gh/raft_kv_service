@@ -12,7 +12,7 @@ use axum::{
     },
 };
 use raft_kv_service::{
-    cluster::{MembershipView, NodeDiagnostics},
+    cluster::{LeadershipTransferResult, MembershipView, NodeDiagnostics},
     http::{AppState, ServiceError, router},
     kv::{Command, KvStateMachine},
     metrics::Metrics,
@@ -262,7 +262,7 @@ async fn authenticated_diagnostics_and_metrics_are_bounded_and_versioned() -> Re
     assert_eq!(status["role"], "leader");
     assert_eq!(status["commit_index"], 9);
     assert_eq!(status["request_queue_depth"], 2);
-    assert_eq!(status["peer_protocol_version"], 3);
+    assert_eq!(status["peer_protocol_version"], 4);
 
     let metrics = app
         .oneshot(
@@ -277,5 +277,46 @@ async fn authenticated_diagnostics_and_metrics_are_bounded_and_versioned() -> Re
     assert!(metrics.contains("raft_commit_index 9"));
     assert!(metrics.contains("raft_kv_build_info"));
     assert!(!metrics.contains(CLIENT));
+    Ok(())
+}
+
+#[tokio::test]
+async fn leadership_transfer_is_authenticated_and_reports_observed_completion() -> Result<()> {
+    let state = AppState::new("test-service")
+        .with_membership(
+            "secret",
+            |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+            || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+        )
+        .with_leadership_transfer(|target| async move {
+            Ok(LeadershipTransferResult {
+                target: NodeId(target),
+                term: Term(7),
+            })
+        });
+    let app = router(state, Duration::from_secs(1));
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::post("/operational/v1/leadership-transfer")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_node_id":2}"#))?,
+        )
+        .await?;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::post("/operational/v1/leadership-transfer")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_node_id":2}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+    assert_eq!(body["target_node_id"], 2);
+    assert_eq!(body["term"], 7);
     Ok(())
 }

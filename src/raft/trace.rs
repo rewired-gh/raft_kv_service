@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Envelope, Message, simulator::TraceEvent};
 
-pub const TRACE_SCHEMA_VERSION: u16 = 3;
+pub const TRACE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,10 +42,13 @@ pub enum TraceAction {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceMessage {
+    PreVote,
+    PreVoteResponse,
     RequestVote,
     RequestVoteResponse,
     AppendEntries,
     AppendEntriesResponse,
+    TimeoutNow,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,11 +439,16 @@ fn validate_send(record: &TraceRecord, hard_term: u64, durable_log: u64) -> Resu
         field: "message",
     })?;
     let term = required(record.term, record.sequence, "term")?;
-    if term > hard_term {
+    if term > hard_term
+        && !matches!(
+            message,
+            TraceMessage::PreVote | TraceMessage::PreVoteResponse
+        )
+    {
         return Err(TraceError::MessageBeforeHardState(record.sequence));
     }
     match message {
-        TraceMessage::AppendEntries => {
+        TraceMessage::AppendEntries | TraceMessage::TimeoutNow => {
             let index = required(record.index, record.sequence, "index")?;
             if index > durable_log {
                 return Err(TraceError::AppendBeforeDurableLog(record.sequence));
@@ -452,7 +460,9 @@ fn validate_send(record: &TraceRecord, hard_term: u64, durable_log: u64) -> Resu
                 return Err(TraceError::AcknowledgementBeforeDurableLog(record.sequence));
             }
         }
-        TraceMessage::RequestVote
+        TraceMessage::PreVote
+        | TraceMessage::PreVoteResponse
+        | TraceMessage::RequestVote
         | TraceMessage::RequestVoteResponse
         | TraceMessage::AppendEntriesResponse => {}
     }
@@ -568,6 +578,26 @@ fn fill_message(record: &mut TraceRecord, action: TraceAction, envelope: &Envelo
     record.node = envelope.from.0;
     record.peer = Some(envelope.to.0);
     let (message, term, index, accepted) = match &envelope.message {
+        Message::PreVote {
+            prospective_term,
+            last_log,
+            ..
+        } => (
+            TraceMessage::PreVote,
+            prospective_term.0,
+            Some(last_log.index),
+            None,
+        ),
+        Message::PreVoteResponse {
+            prospective_term,
+            vote_granted,
+            ..
+        } => (
+            TraceMessage::PreVoteResponse,
+            prospective_term.0,
+            None,
+            Some(*vote_granted),
+        ),
         Message::RequestVote { term, last_log, .. } => (
             TraceMessage::RequestVote,
             term.0,
@@ -602,6 +632,9 @@ fn fill_message(record: &mut TraceRecord, action: TraceAction, envelope: &Envelo
             Some(*match_index),
             Some(*accepted),
         ),
+        Message::TimeoutNow {
+            term, fence_index, ..
+        } => (TraceMessage::TimeoutNow, term.0, Some(*fence_index), None),
     };
     record.message = Some(message);
     record.term = Some(term);

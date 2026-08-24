@@ -30,8 +30,10 @@ use crate::{
     peer::{
         ClusterId, PeerContext, PeerLimits, SnapshotChunk, encode_append_entries,
         encode_append_entries_response, encode_forward_command, encode_forward_membership,
-        encode_forward_membership_response, encode_forward_response, encode_request_vote,
-        encode_request_vote_response, encode_snapshot_chunk, encode_snapshot_response, proto,
+        encode_forward_membership_response, encode_forward_response, encode_pre_vote,
+        encode_pre_vote_response, encode_request_vote, encode_request_vote_response,
+        encode_snapshot_chunk, encode_snapshot_response, encode_timeout_now,
+        encode_timeout_now_response, proto,
     },
     raft::{
         ClusterConfiguration, ConfigurationPhase, DurableRaft, Effect, EntryPayload, Envelope,
@@ -80,6 +82,22 @@ pub enum MembershipError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeadershipTransferError {
+    Unavailable,
+    Overloaded,
+    InvalidTarget,
+    Busy,
+    TimedOut,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeadershipTransferResult {
+    pub target: NodeId,
+    pub term: Term,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerAdmission {
     pub certificate_sha256: [u8; 32],
     pub staging_expires_unix_seconds: Option<u64>,
@@ -110,6 +128,8 @@ pub struct StaticNodeConfig {
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
     pub heartbeat_interval: Duration,
+    pub check_quorum: bool,
+    pub leadership_transfer_timeout: Duration,
     pub rpc_timeout: Duration,
     pub max_clients: u64,
     pub max_key_bytes: usize,
@@ -194,21 +214,21 @@ impl RunningNode {
                                 to,
                                 term,
                                 snapshot,
-                            } => {
-                                dispatch_snapshot(
-                                    cluster_id,
-                                    replicated_limits,
-                                    endpoint.clone(),
-                                    (from, to, term),
-                                    snapshot,
-                                    timeout,
-                                    peer_tls.clone(),
-                                )
-                                .await
-                            }
+                            } => dispatch_snapshot(
+                                cluster_id,
+                                replicated_limits,
+                                endpoint.clone(),
+                                (from, to, term),
+                                snapshot,
+                                timeout,
+                                peer_tls.clone(),
+                            )
+                            .await
+                            .map(Some),
                         };
                         match result {
-                            Ok(response) => response_handle.receive_response(response),
+                            Ok(Some(response)) => response_handle.receive_response(response),
+                            Ok(None) => {}
                             Err(error) => {
                                 if error.contains("timed out") {
                                     metrics.timed_out();
@@ -481,6 +501,18 @@ impl StaticNodeHandle {
             .map_err(|_| Status::unavailable("Raft worker stopped"))?
     }
 
+    async fn call_one_way(&self, envelope: Envelope) -> Result<(), Status> {
+        let (respond, response) = oneshot::channel();
+        self.enqueue(NodeRequest::PeerOneWay { envelope, respond })
+            .map_err(|error| match error {
+                EnqueueError::Full => Status::resource_exhausted("peer queue is full"),
+                EnqueueError::Disconnected => Status::unavailable("Raft worker stopped"),
+            })?;
+        response
+            .await
+            .map_err(|_| Status::unavailable("Raft worker stopped"))?
+    }
+
     pub async fn diagnostics(&self) -> Result<NodeDiagnostics, MembershipError> {
         let (respond, response) = oneshot::channel();
         self.enqueue(NodeRequest::Diagnostics { respond })
@@ -489,6 +521,21 @@ impl StaticNodeHandle {
                 EnqueueError::Disconnected => MembershipError::Unavailable,
             })?;
         response.await.map_err(|_| MembershipError::Unavailable)?
+    }
+
+    pub async fn transfer_leadership(
+        &self,
+        target: NodeId,
+    ) -> Result<LeadershipTransferResult, LeadershipTransferError> {
+        let (respond, response) = oneshot::channel();
+        self.enqueue(NodeRequest::LeadershipTransfer { target, respond })
+            .map_err(|error| match error {
+                EnqueueError::Full => LeadershipTransferError::Overloaded,
+                EnqueueError::Disconnected => LeadershipTransferError::Unavailable,
+            })?;
+        response
+            .await
+            .map_err(|_| LeadershipTransferError::Unavailable)?
     }
 }
 
@@ -701,6 +748,10 @@ enum NodeRequest {
         respond: oneshot::Sender<Result<Envelope, Status>>,
     },
     PeerResponse(Envelope),
+    PeerOneWay {
+        envelope: Envelope,
+        respond: oneshot::Sender<Result<(), Status>>,
+    },
     Status {
         respond: oneshot::Sender<(Option<NodeId>, Term)>,
     },
@@ -718,6 +769,10 @@ enum NodeRequest {
     },
     Diagnostics {
         respond: oneshot::Sender<Result<NodeDiagnostics, MembershipError>>,
+    },
+    LeadershipTransfer {
+        target: NodeId,
+        respond: oneshot::Sender<Result<LeadershipTransferResult, LeadershipTransferError>>,
     },
     AuthorizePeer {
         node_id: NodeId,
@@ -740,11 +795,20 @@ struct NodeWorker {
     pending_clients: HashMap<u64, oneshot::Sender<Result<CommandResult, ServiceError>>>,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
+    quorum_deadline: Instant,
+    pending_transfer: Option<PendingLeadershipTransfer>,
     incoming_snapshot: Option<IncomingSnapshot>,
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     pending_membership: Option<PendingMembership>,
     request_queue_depth: Arc<AtomicUsize>,
     metrics: Metrics,
+}
+
+struct PendingLeadershipTransfer {
+    target: NodeId,
+    term: Term,
+    deadline: Instant,
+    respond: oneshot::Sender<Result<LeadershipTransferResult, LeadershipTransferError>>,
 }
 
 struct IncomingSnapshot {
@@ -775,6 +839,8 @@ impl NodeWorker {
             outbound,
             election_deadline: now + random_election_timeout(&config),
             heartbeat_deadline: now + config.heartbeat_interval,
+            quorum_deadline: now + config.election_timeout_min,
+            pending_transfer: None,
             pending_clients: HashMap::new(),
             incoming_snapshot: None,
             endpoints,
@@ -787,11 +853,13 @@ impl NodeWorker {
 
     fn bootstrap(&mut self) -> Result<(), String> {
         if self.config.voters.len() == 1 {
+            let was_leader = self.raft.core().role() == Role::Leader;
             let effects = self
                 .raft
                 .handle(Event::ElectionTimeout)
                 .map_err(|error| error.to_string())?;
             self.process(effects, None)?;
+            self.refresh_leader_deadlines(was_leader);
         }
         Ok(())
     }
@@ -800,7 +868,14 @@ impl NodeWorker {
         loop {
             let now = Instant::now();
             let deadline = if self.raft.core().role() == Role::Leader {
-                self.heartbeat_deadline
+                let mut deadline = self.heartbeat_deadline;
+                if self.config.check_quorum {
+                    deadline = deadline.min(self.quorum_deadline);
+                }
+                if let Some(transfer) = &self.pending_transfer {
+                    deadline = deadline.min(transfer.deadline);
+                }
+                deadline
             } else {
                 self.election_deadline
             };
@@ -840,6 +915,7 @@ impl NodeWorker {
                     .ok_or_else(|| "core did not produce an RPC response".to_owned());
                 let _ = respond.send(response.map_err(Status::internal));
                 self.fail_pending_after_stepdown(was_leader);
+                self.complete_or_fail_transfer();
                 Ok(())
             }
             NodeRequest::PeerResponse(envelope) => {
@@ -858,8 +934,21 @@ impl NodeWorker {
                     .handle(Event::Receive(envelope))
                     .map_err(|error| error.to_string())?;
                 self.process(effects, None)?;
+                self.refresh_leader_deadlines(was_leader);
                 self.maybe_start_joint()?;
                 self.fail_pending_after_stepdown(was_leader);
+                self.complete_or_fail_transfer();
+                Ok(())
+            }
+            NodeRequest::PeerOneWay { envelope, respond } => {
+                let was_leader = self.raft.core().role() == Role::Leader;
+                let effects = self
+                    .raft
+                    .handle(Event::Receive(envelope))
+                    .map_err(|error| error.to_string())?;
+                self.process(effects, None)?;
+                self.refresh_leader_deadlines(was_leader);
+                let _ = respond.send(Ok(()));
                 Ok(())
             }
             NodeRequest::Status { respond } => {
@@ -890,6 +979,9 @@ impl NodeWorker {
                 let result = self.diagnostics();
                 let _ = respond.send(result);
                 Ok(())
+            }
+            NodeRequest::LeadershipTransfer { target, respond } => {
+                self.handle_leadership_transfer(target, respond)
             }
             NodeRequest::AuthorizePeer { node_id, respond } => {
                 let _ = respond.send(self.peer_is_authorized(node_id));
@@ -1243,11 +1335,46 @@ impl NodeWorker {
     }
 
     fn on_timer(&mut self) -> Result<(), String> {
+        let was_leader = self.raft.core().role() == Role::Leader;
         let _election_timer =
             (self.raft.core().role() != Role::Leader).then(|| self.metrics.time_election());
+        let now = Instant::now();
         let effects = if self.raft.core().role() == Role::Leader {
-            self.heartbeat_deadline = Instant::now() + self.config.heartbeat_interval;
-            self.raft.heartbeat().map_err(|error| error.to_string())?
+            let mut effects = Vec::new();
+            if self
+                .pending_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.deadline <= now)
+            {
+                effects.extend(
+                    self.raft
+                        .handle(Event::AbortLeadershipTransfer)
+                        .map_err(|error| error.to_string())?,
+                );
+                if let Some(transfer) = self.pending_transfer.take() {
+                    self.metrics.leadership_transfer_timed_out();
+                    let _ = transfer
+                        .respond
+                        .send(Err(LeadershipTransferError::TimedOut));
+                }
+            }
+            if self.config.check_quorum && self.quorum_deadline <= now {
+                let was_leader = self.raft.core().role() == Role::Leader;
+                effects.extend(
+                    self.raft
+                        .handle(Event::CheckQuorum)
+                        .map_err(|error| error.to_string())?,
+                );
+                self.quorum_deadline = now + self.config.election_timeout_min;
+                if was_leader && self.raft.core().role() != Role::Leader {
+                    self.metrics.check_quorum_stepdown();
+                }
+            }
+            if self.raft.core().role() == Role::Leader && self.heartbeat_deadline <= now {
+                self.heartbeat_deadline = now + self.config.heartbeat_interval;
+                effects.extend(self.raft.heartbeat().map_err(|error| error.to_string())?);
+            }
+            effects
         } else {
             self.metrics.election();
             self.election_deadline = Instant::now() + random_election_timeout(&self.config);
@@ -1256,6 +1383,8 @@ impl NodeWorker {
                 .map_err(|error| error.to_string())?
         };
         self.process(effects, None)?;
+        self.refresh_leader_deadlines(was_leader);
+        self.complete_or_fail_transfer();
         Ok(())
     }
 
@@ -1321,10 +1450,99 @@ impl NodeWorker {
                 }
             }
         }
-        if self.raft.core().role() == Role::Leader {
-            self.heartbeat_deadline = Instant::now() + self.config.heartbeat_interval;
-        }
         Ok(direct)
+    }
+
+    fn handle_leadership_transfer(
+        &mut self,
+        target: NodeId,
+        respond: oneshot::Sender<Result<LeadershipTransferResult, LeadershipTransferError>>,
+    ) -> Result<(), String> {
+        if self.pending_transfer.is_some()
+            || !self.pending_clients.is_empty()
+            || self.pending_membership.is_some()
+            || self.raft.core().commit_index() != self.raft.core().last_applied()
+            || self.raft.core().commit_index() != self.raft.core().last_log_position().index
+        {
+            self.metrics.leadership_transfer_failed();
+            let _ = respond.send(Err(LeadershipTransferError::Busy));
+            return Ok(());
+        }
+        self.metrics.leadership_transfer_attempted();
+        let term = self.raft.core().hard_state().current_term;
+        let effects = match self.raft.transfer_leadership(target) {
+            Ok(effects) => effects,
+            Err(crate::raft::RuntimeError::Core(
+                crate::raft::CoreError::InvalidLeadershipTransferTarget(_),
+            )) => {
+                self.metrics.leadership_transfer_failed();
+                let _ = respond.send(Err(LeadershipTransferError::InvalidTarget));
+                return Ok(());
+            }
+            Err(crate::raft::RuntimeError::Core(
+                crate::raft::CoreError::NotLeader | crate::raft::CoreError::LeaderNotReady,
+            )) => {
+                self.metrics.leadership_transfer_failed();
+                let _ = respond.send(Err(LeadershipTransferError::Unavailable));
+                return Ok(());
+            }
+            Err(crate::raft::RuntimeError::Core(
+                crate::raft::CoreError::PersistencePending
+                | crate::raft::CoreError::ConfigurationChangeInProgress
+                | crate::raft::CoreError::LeadershipTransferInProgress,
+            )) => {
+                self.metrics.leadership_transfer_failed();
+                let _ = respond.send(Err(LeadershipTransferError::Busy));
+                return Ok(());
+            }
+            Err(_) => {
+                self.metrics.leadership_transfer_failed();
+                let _ = respond.send(Err(LeadershipTransferError::Internal));
+                return Ok(());
+            }
+        };
+        self.pending_transfer = Some(PendingLeadershipTransfer {
+            target,
+            term,
+            deadline: Instant::now() + self.config.leadership_transfer_timeout,
+            respond,
+        });
+        self.process(effects, None)?;
+        Ok(())
+    }
+
+    fn complete_or_fail_transfer(&mut self) {
+        let Some(transfer) = self.pending_transfer.as_ref() else {
+            return;
+        };
+        if self.raft.core().role() == Role::Leader {
+            return;
+        }
+        let succeeded = self.raft.core().leader() == Some(transfer.target)
+            && self.raft.core().hard_state().current_term > transfer.term;
+        let transfer = self.pending_transfer.take().expect("transfer is present");
+        if succeeded {
+            self.metrics.leadership_transfer_completed();
+            let _ = transfer.respond.send(Ok(LeadershipTransferResult {
+                target: transfer.target,
+                term: self.raft.core().hard_state().current_term,
+            }));
+        } else if self.raft.core().leadership_transfer_target().is_none() {
+            self.metrics.leadership_transfer_failed();
+            let _ = transfer
+                .respond
+                .send(Err(LeadershipTransferError::Unavailable));
+        } else {
+            self.pending_transfer = Some(transfer);
+        }
+    }
+
+    fn refresh_leader_deadlines(&mut self, was_leader: bool) {
+        if !was_leader && self.raft.core().role() == Role::Leader {
+            let now = Instant::now();
+            self.heartbeat_deadline = now + self.config.heartbeat_interval;
+            self.quorum_deadline = now + self.config.election_timeout_min;
+        }
     }
 
     fn complete_clients(&mut self, applied: Vec<AppliedEntry>) {
@@ -1504,7 +1722,9 @@ fn unix_time_seconds() -> u64 {
 fn is_response(envelope: &Envelope) -> bool {
     matches!(
         envelope.message,
-        Message::RequestVoteResponse { .. } | Message::AppendEntriesResponse { .. }
+        Message::PreVoteResponse { .. }
+            | Message::RequestVoteResponse { .. }
+            | Message::AppendEntriesResponse { .. }
     )
 }
 
@@ -1570,6 +1790,28 @@ impl PeerRpcService {
 
 #[tonic::async_trait]
 impl proto::raft_peer_server::RaftPeer for PeerRpcService {
+    async fn pre_vote(
+        &self,
+        request: Request<proto::PreVoteRequest>,
+    ) -> Result<Response<proto::PreVoteResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
+        let envelope = self
+            .context
+            .decode_pre_vote(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sender(envelope.from, fingerprint).await?;
+        let response = self.handle.call(envelope).await?;
+        encode_pre_vote_response(
+            self.context.cluster_id,
+            self.context.replicated_limits,
+            &response,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     async fn forward_membership(
         &self,
         request: Request<proto::ForwardMembershipRequest>,
@@ -1723,6 +1965,36 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         .map(Response::new)
         .map_err(|error| Status::internal(error.to_string()))
     }
+
+    async fn timeout_now(
+        &self,
+        request: Request<proto::TimeoutNowRequest>,
+    ) -> Result<Response<proto::TimeoutNowResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
+        let envelope = self
+            .context
+            .decode_timeout_now(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let sender = envelope.from;
+        let term = match envelope.message {
+            Message::TimeoutNow { term, .. } => term,
+            _ => return Err(Status::internal("decoded wrong TimeoutNow message kind")),
+        };
+        self.authorize_sender(sender, fingerprint).await?;
+        let accepted = self.handle.call_one_way(envelope).await.is_ok();
+        encode_timeout_now_response(
+            self.context.cluster_id,
+            self.context.replicated_limits,
+            self.context.local_id,
+            sender,
+            term,
+            accepted,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
+    }
 }
 
 async fn dispatch(
@@ -1732,7 +2004,7 @@ async fn dispatch(
     envelope: Envelope,
     timeout: Duration,
     peer_tls: Option<TlsMaterial>,
-) -> Result<Envelope, String> {
+) -> Result<Option<Envelope>, String> {
     let channel = connect_peer(endpoint, timeout, peer_tls).await?;
     let mut client = peer_client(channel);
     let context = PeerContext {
@@ -1742,6 +2014,19 @@ async fn dispatch(
         replicated_limits,
     };
     match envelope.message {
+        Message::PreVote { .. } => {
+            let request = encode_pre_vote(cluster, replicated_limits, &envelope)
+                .map_err(|error| error.to_string())?;
+            let response = tokio::time::timeout(timeout, client.pre_vote(request))
+                .await
+                .map_err(|_| "PreVote timed out".to_owned())?
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            context
+                .decode_pre_vote_response(response)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
         Message::RequestVote { .. } => {
             let request = encode_request_vote(cluster, replicated_limits, &envelope)
                 .map_err(|error| error.to_string())?;
@@ -1752,6 +2037,7 @@ async fn dispatch(
                 .into_inner();
             context
                 .decode_request_vote_response(response)
+                .map(Some)
                 .map_err(|error| error.to_string())
         }
         Message::AppendEntries { .. } => {
@@ -1764,11 +2050,37 @@ async fn dispatch(
                 .into_inner();
             context
                 .decode_append_entries_response(response)
+                .map(Some)
                 .map_err(|error| error.to_string())
         }
-        Message::RequestVoteResponse { .. } | Message::AppendEntriesResponse { .. } => {
+        Message::TimeoutNow { .. } => {
+            let request = encode_timeout_now(cluster, replicated_limits, &envelope)
+                .map_err(|error| error.to_string())?;
+            let response = tokio::time::timeout(timeout, client.timeout_now(request))
+                .await
+                .map_err(|_| "TimeoutNow timed out".to_owned())?
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            let (_, response_term, accepted) = context
+                .decode_timeout_now_response(response)
+                .map_err(|error| error.to_string())?;
+            if !accepted || response_term != envelope_term(&envelope) {
+                return Err("TimeoutNow was rejected".to_owned());
+            }
+            Ok(None)
+        }
+        Message::PreVoteResponse { .. }
+        | Message::RequestVoteResponse { .. }
+        | Message::AppendEntriesResponse { .. } => {
             Err("attempted to dispatch a response as a request".to_owned())
         }
+    }
+}
+
+fn envelope_term(envelope: &Envelope) -> Term {
+    match envelope.message {
+        Message::TimeoutNow { term, .. } => term,
+        _ => Term(0),
     }
 }
 
@@ -2058,6 +2370,8 @@ mod tests {
             election_timeout_min: Duration::from_millis(120),
             election_timeout_max: Duration::from_millis(240),
             heartbeat_interval: Duration::from_millis(30),
+            check_quorum: true,
+            leadership_transfer_timeout: Duration::from_millis(300),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
             max_key_bytes: crate::kv::MAX_KEY_BYTES,
@@ -2114,6 +2428,8 @@ mod tests {
             election_timeout_min: Duration::from_millis(120),
             election_timeout_max: Duration::from_millis(240),
             heartbeat_interval: Duration::from_millis(30),
+            check_quorum: true,
+            leadership_transfer_timeout: Duration::from_millis(300),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
             max_key_bytes: crate::kv::MAX_KEY_BYTES,
@@ -2213,6 +2529,8 @@ mod tests {
                 election_timeout_min: Duration::from_millis(180),
                 election_timeout_max: Duration::from_millis(360),
                 heartbeat_interval: Duration::from_millis(40),
+                check_quorum: true,
+                leadership_transfer_timeout: Duration::from_millis(400),
                 rpc_timeout: Duration::from_millis(300),
                 max_clients: 10_000,
                 max_key_bytes: crate::kv::MAX_KEY_BYTES,
@@ -2353,6 +2671,8 @@ mod tests {
                 election_timeout_min: Duration::from_millis(120),
                 election_timeout_max: Duration::from_millis(240),
                 heartbeat_interval: Duration::from_millis(30),
+                check_quorum: true,
+                leadership_transfer_timeout: Duration::from_millis(300),
                 rpc_timeout: Duration::from_millis(100),
                 max_clients: 10_000,
                 max_key_bytes: crate::kv::MAX_KEY_BYTES,
@@ -2469,6 +2789,8 @@ mod tests {
             election_timeout_min: Duration::from_millis(120),
             election_timeout_max: Duration::from_millis(240),
             heartbeat_interval: Duration::from_millis(30),
+            check_quorum: true,
+            leadership_transfer_timeout: Duration::from_millis(300),
             rpc_timeout: Duration::from_millis(100),
             max_clients: 10_000,
             max_key_bytes: crate::kv::MAX_KEY_BYTES,

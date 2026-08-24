@@ -848,7 +848,7 @@ impl Error for SimError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{ClusterConfiguration, ConfigurationPhase, Message, Term};
+    use crate::raft::{ClusterConfiguration, ConfigurationPhase, Term};
 
     fn three_nodes() -> ClusterSimulator {
         ClusterSimulator::new([NodeId(1), NodeId(2), NodeId(3)])
@@ -1100,13 +1100,26 @@ mod tests {
             .timeout(NodeId(2))
             .expect("majority starts election");
         simulation
+            .timeout(NodeId(3))
+            .expect("the other majority voter expires stale leader knowledge");
+        simulation
             .run_until_idle(64)
             .expect("new leader commits no-op");
+        if simulation.role(NodeId(2)).expect("node") != Some(Role::Leader) {
+            simulation
+                .timeout(NodeId(2))
+                .expect("randomized retry resolves the split campaign");
+            simulation.run_until_idle(64).expect("retry elects leader");
+        }
         assert_eq!(
             simulation.role(NodeId(2)).expect("node"),
             Some(Role::Leader)
         );
         assert_eq!(simulation.commit_index(NodeId(2)).expect("node"), Some(2));
+        let replacement_term = simulation
+            .hard_state(NodeId(2))
+            .expect("replacement leader exists")
+            .current_term;
 
         simulation.heal(NodeId(1), NodeId(2)).expect("heal");
         simulation.heal(NodeId(1), NodeId(3)).expect("heal");
@@ -1121,7 +1134,7 @@ mod tests {
             simulation.last_log_position(NodeId(1)).expect("node"),
             crate::raft::LogPosition {
                 index: 2,
-                term: Term(2)
+                term: replacement_term
             }
         );
     }
@@ -1157,6 +1170,9 @@ mod tests {
     fn crash_before_persist_loses_candidate_transition() {
         let mut simulation = three_nodes();
         simulation.timeout(NodeId(1)).expect("timeout is accepted");
+        assert!(simulation.step().expect("deliver first pre-vote"));
+        assert!(simulation.step().expect("deliver second pre-vote"));
+        assert!(simulation.step().expect("deliver pre-vote quorum"));
         simulation.crash(NodeId(1)).expect("node can crash");
         simulation.restart(NodeId(1)).expect("node can restart");
         simulation
@@ -1182,7 +1198,6 @@ mod tests {
     fn dropping_vote_traffic_prevents_false_quorum() {
         let mut simulation = three_nodes();
         simulation.timeout(NodeId(1)).expect("timeout is accepted");
-        assert!(simulation.step().expect("candidate state persists"));
         assert_eq!(simulation.drop_all_messages(), 2);
         simulation
             .run_until_idle(8)
@@ -1190,7 +1205,7 @@ mod tests {
 
         assert_eq!(
             simulation.role(NodeId(1)).expect("node exists"),
-            Some(Role::Candidate)
+            Some(Role::PreCandidate)
         );
     }
 
@@ -1198,13 +1213,12 @@ mod tests {
     fn duplicated_and_reordered_requests_and_responses_remain_safe() {
         let mut simulation = three_nodes();
         simulation.timeout(NodeId(1)).expect("start election");
-        simulation.step().expect("persist candidate state");
         simulation
             .duplicate_next_message(NodeId(1), NodeId(2))
-            .expect("duplicate RequestVote");
+            .expect("duplicate PreVote");
         simulation
             .delay_next_message(NodeId(1), NodeId(2))
-            .expect("reorder RequestVote");
+            .expect("reorder PreVote");
 
         let mut duplicated_response = false;
         for _ in 0..32 {
@@ -1256,6 +1270,9 @@ mod tests {
     fn injected_storage_failure_loses_unacknowledged_transition_on_crash() {
         let mut simulation = three_nodes();
         simulation.timeout(NodeId(1)).expect("start election");
+        assert!(simulation.step().expect("deliver first pre-vote"));
+        assert!(simulation.step().expect("deliver second pre-vote"));
+        assert!(simulation.step().expect("deliver pre-vote quorum"));
         simulation
             .fail_next_storage(NodeId(1))
             .expect("arm storage failure");
@@ -1330,66 +1347,40 @@ mod tests {
             committed
         );
         simulation
+            .timeout(NodeId(2))
+            .expect("remaining voter starts a new election");
+        simulation
             .timeout(NodeId(1))
-            .expect("removed peer is not required for a new election");
+            .expect("the recovered voter expires stale leader knowledge");
         simulation
             .run_until_idle(128)
             .expect("new configuration elects safely");
+        if simulation.role(NodeId(2)).expect("role") != Some(Role::Leader) {
+            simulation
+                .timeout(NodeId(2))
+                .expect("retry resolves the split campaign");
+            simulation.run_until_idle(128).expect("retry elects safely");
+        }
         assert_eq!(
-            simulation.role(NodeId(1)).expect("role"),
+            simulation.role(NodeId(2)).expect("role"),
             Some(Role::Leader)
         );
     }
 
     #[test]
-    fn delayed_grant_remains_valid_after_voter_advances_term() {
+    fn competing_pre_vote_campaigns_never_create_dual_leaders() {
         let mut simulation = three_nodes();
         simulation.timeout(NodeId(1)).expect("timeout is accepted");
-        assert!(simulation.step().expect("candidate state persists"));
-        assert!(simulation.step().expect("node two receives vote request"));
-        assert!(simulation.step().expect("node two persists its vote"));
-
         simulation
             .timeout(NodeId(2))
-            .expect("node two starts a later election");
-        assert!(simulation.step().expect("node two persists the newer term"));
+            .expect("a competing pre-vote campaign starts");
         simulation
-            .run_until_idle(64)
+            .run_until_idle(128)
             .expect("simulation reaches quiescence");
-
-        let advanced = simulation
-            .trace()
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    TraceEvent::HardStatePersisted(
-                        NodeId(2),
-                        HardState {
-                            current_term: Term(2),
-                            ..
-                        }
-                    )
-                )
-            })
-            .expect("node two advances term");
-        let delivered_old_grant = simulation
-            .trace()
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    TraceEvent::MessageDelivered(Envelope {
-                        from: NodeId(2),
-                        to: NodeId(1),
-                        message: Message::RequestVoteResponse {
-                            term: Term(1),
-                            vote_granted: true
-                        }
-                    })
-                )
-            })
-            .expect("old durable grant is eventually delivered");
-        assert!(advanced < delivered_old_grant);
+        let leaders = [NodeId(1), NodeId(2), NodeId(3)]
+            .into_iter()
+            .filter(|node| simulation.role(*node).expect("known node") == Some(Role::Leader))
+            .count();
+        assert!(leaders <= 1);
     }
 }

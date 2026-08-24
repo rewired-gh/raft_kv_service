@@ -67,6 +67,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
         election_timeout_min: Duration::from_millis(config.raft.election_timeout_min_ms),
         election_timeout_max: Duration::from_millis(config.raft.election_timeout_max_ms),
         heartbeat_interval: Duration::from_millis(config.raft.heartbeat_interval_ms),
+        check_quorum: config.raft.check_quorum,
+        leadership_transfer_timeout: Duration::from_millis(
+            config.raft.leadership_transfer_timeout_ms,
+        ),
         rpc_timeout: Duration::from_millis(config.raft.rpc_timeout_ms),
         max_clients: config.raft.max_clients,
         max_key_bytes: config.raft.max_key_bytes,
@@ -105,9 +109,14 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let membership_node = node.clone();
     let membership_reader = node.clone();
     let diagnostics_node = node.clone();
+    let transfer_node = node.clone();
     let state = AppState::new(config.service.name)
         .with_command_limits(config.raft.max_key_bytes, config.raft.max_value_bytes)
         .with_metrics(metrics)
+        .with_leadership_transfer(move |target| {
+            let node = transfer_node.clone();
+            async move { node.transfer_leadership(NodeId(target)).await }
+        })
         .with_executor(move |command| {
             let node = kv_node.clone();
             async move { node.execute(command).await }

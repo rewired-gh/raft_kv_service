@@ -22,6 +22,9 @@ outbound_queue_capacity = 1024
 election_timeout_min_ms = 300
 election_timeout_max_ms = 600
 heartbeat_interval_ms = 100
+# Check-quorum uses election_timeout_min_ms as its leader activity window.
+check_quorum = true
+leadership_transfer_timeout_ms = 1200
 rpc_timeout_ms = 250
 max_clients = 10000
 max_key_bytes = 256
