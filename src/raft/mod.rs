@@ -15,7 +15,7 @@ pub use election::{
     RaftCore, ReplicationProgress, Role, Term, VoterSet,
 };
 pub use log::{EntryPayload, LogEntry};
-pub use runtime::{DurableRaft, RuntimeError};
+pub use runtime::{AppliedBatch, DurableRaft, RuntimeError};
 pub use trace::{
     ProtocolTrace, TRACE_SCHEMA_VERSION, TraceAction, TraceError, TraceMessage, TraceRecord,
 };

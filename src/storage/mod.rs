@@ -4,7 +4,10 @@ mod sqlite;
 
 use std::{error::Error, fmt::Debug};
 
-use crate::raft::{HardState, LogEntry, LogPosition, Term};
+use crate::{
+    kv::{CommandResult, ValueRecord},
+    raft::{HardState, LogEntry, LogPosition, Term},
+};
 
 pub use sqlite::SqliteStorage;
 
@@ -28,4 +31,16 @@ pub trait RaftStorage {
         previous: LogPosition,
         entries: &[LogEntry],
     ) -> Result<AppendOutcome, Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedEntry {
+    pub index: u64,
+    pub result: Option<CommandResult>,
+}
+
+pub trait StateMachineStorage: RaftStorage {
+    fn last_applied(&self) -> Result<u64, Self::Error>;
+    fn apply_committed(&mut self, entries: &[LogEntry]) -> Result<Vec<AppliedEntry>, Self::Error>;
+    fn value(&self, key: &str) -> Result<Option<ValueRecord>, Self::Error>;
 }

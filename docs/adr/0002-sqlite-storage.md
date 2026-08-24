@@ -64,6 +64,11 @@ not call SQLite directly.
   file-backed databases.
 - Crash tests terminate before and after every durable operation.
 - Startup runs schema checks and bounded integrity validation.
+- KV rows, client deduplication records, application results, and
+  `last_applied` share the same SQLite database. Each committed application
+  batch updates them in one immediate transaction, so a crash exposes either
+  the complete prior prefix or the complete new prefix.
+- Canonical command and result encodings are explicitly versioned. Application
+  rejects an entry that does not byte-for-byte match the durable Raft log.
 - Tests cover conflicting suffix replacement, monotonic hard state, atomic
   application, disk-full/error mapping, and reopen recovery.
-

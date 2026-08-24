@@ -176,6 +176,10 @@ pub enum CoreError {
     InvalidRecoveredLogTerm {
         index: u64,
     },
+    InvalidRecoveredApplied {
+        last_applied: u64,
+        last_log: u64,
+    },
     IndexExhausted,
     TermExhausted,
 }
@@ -243,6 +247,13 @@ impl Display for CoreError {
             Self::InvalidRecoveredLogTerm { index } => {
                 write!(formatter, "recovered log entry {index} has term zero")
             }
+            Self::InvalidRecoveredApplied {
+                last_applied,
+                last_log,
+            } => write!(
+                formatter,
+                "recovered last applied index {last_applied} exceeds log index {last_log}"
+            ),
             Self::IndexExhausted => formatter.write_str("Raft log index exhausted"),
             Self::TermExhausted => formatter.write_str("Raft term exhausted"),
         }
@@ -314,6 +325,16 @@ impl RaftCore {
         hard_state: HardState,
         log: Vec<LogEntry>,
     ) -> Result<Self, CoreError> {
+        Self::recover(id, voters, hard_state, log, 0)
+    }
+
+    pub fn recover(
+        id: NodeId,
+        voters: VoterSet,
+        hard_state: HardState,
+        log: Vec<LogEntry>,
+        last_applied: u64,
+    ) -> Result<Self, CoreError> {
         if !voters.contains(id) {
             return Err(CoreError::LocalNodeIsNotVoter(id));
         }
@@ -323,6 +344,13 @@ impl RaftCore {
             return Err(CoreError::InvalidRecoveredVote(voted_for));
         }
         validate_recovered_log(&log)?;
+        let last_log = log.last().map_or(0, |entry| entry.index);
+        if last_applied > last_log {
+            return Err(CoreError::InvalidRecoveredApplied {
+                last_applied,
+                last_log,
+            });
+        }
         Ok(Self {
             id,
             voters,
@@ -334,10 +362,10 @@ impl RaftCore {
             pending: None,
             append_after_hard_state: None,
             pending_log: None,
-            commit_index: 0,
+            commit_index: last_applied,
             replication: BTreeMap::new(),
             leader_noop_index: None,
-            last_applied: 0,
+            last_applied,
             pending_application: None,
         })
     }

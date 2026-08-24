@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use crate::storage::{AppendOutcome, RaftStorage};
+use crate::storage::{AppendOutcome, AppliedEntry, RaftStorage, StateMachineStorage};
 
 use super::{CoreError, Effect, EntryPayload, Event, LogMutation, NodeId, RaftCore, VoterSet};
 
@@ -54,24 +54,13 @@ pub struct DurableRaft<S: RaftStorage> {
     failed: bool,
 }
 
-impl<S: RaftStorage> DurableRaft<S> {
-    pub fn recover(
-        id: NodeId,
-        voters: VoterSet,
-        storage: S,
-    ) -> Result<Self, RuntimeError<S::Error>> {
-        let hard_state = storage.load_hard_state().map_err(RuntimeError::Storage)?;
-        let log = storage
-            .entries_from(1, usize::MAX)
-            .map_err(RuntimeError::Storage)?;
-        let core = RaftCore::new(id, voters, hard_state, log).map_err(RuntimeError::Core)?;
-        Ok(Self {
-            core,
-            storage,
-            failed: false,
-        })
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedBatch {
+    pub entries: Vec<AppliedEntry>,
+    pub effects: Vec<Effect>,
+}
 
+impl<S: RaftStorage> DurableRaft<S> {
     pub fn handle(&mut self, event: Event) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
         self.ensure_active()?;
         let effects = self.core.handle(event).map_err(RuntimeError::Core)?;
@@ -178,6 +167,56 @@ impl<S: RaftStorage> DurableRaft<S> {
             pending.extend(continuation);
         }
         Ok(external)
+    }
+}
+
+impl<S: StateMachineStorage> DurableRaft<S> {
+    pub fn recover(
+        id: NodeId,
+        voters: VoterSet,
+        storage: S,
+    ) -> Result<Self, RuntimeError<S::Error>> {
+        let hard_state = storage.load_hard_state().map_err(RuntimeError::Storage)?;
+        let log = storage
+            .entries_from(1, usize::MAX)
+            .map_err(RuntimeError::Storage)?;
+        let last_applied = storage.last_applied().map_err(RuntimeError::Storage)?;
+        let core = RaftCore::recover(id, voters, hard_state, log, last_applied)
+            .map_err(RuntimeError::Core)?;
+        Ok(Self {
+            core,
+            storage,
+            failed: false,
+        })
+    }
+
+    pub fn apply_committed(
+        &mut self,
+        entries: &[super::LogEntry],
+    ) -> Result<AppliedBatch, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let applied = match self.storage.apply_committed(entries) {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.failed = true;
+                return Err(RuntimeError::Storage(error));
+            }
+        };
+        let last_index = entries
+            .last()
+            .map(|entry| entry.index)
+            .ok_or(RuntimeError::Core(CoreError::NoApplicationPending))?;
+        let continuation = match self.core.acknowledge_applied(last_index) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.failed = true;
+                return Err(RuntimeError::Core(error));
+            }
+        };
+        Ok(AppliedBatch {
+            entries: applied,
+            effects: self.execute(continuation)?,
+        })
     }
 }
 
@@ -301,6 +340,20 @@ mod tests {
         }
     }
 
+    impl StateMachineStorage for FailingStorage {
+        fn last_applied(&self) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+
+        fn apply_committed(&mut self, _: &[LogEntry]) -> Result<Vec<AppliedEntry>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn value(&self, _: &str) -> Result<Option<crate::kv::ValueRecord>, Self::Error> {
+            Ok(None)
+        }
+    }
+
     #[test]
     fn storage_divergence_permanently_fails_the_runtime() {
         let voters = VoterSet::new([NodeId(1)]).expect("voters");
@@ -330,5 +383,24 @@ mod tests {
         );
         assert_eq!(runtime.core().role(), Role::Leader);
         assert!(runtime.core().leader_ready());
+
+        let committed = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::ApplyCommitted(entries) => Some(entries),
+                _ => None,
+            })
+            .expect("committed no-op is emitted for application");
+        let applied = runtime
+            .apply_committed(&committed)
+            .expect("state and last applied persist atomically");
+        assert_eq!(applied.entries.len(), 1);
+        assert_eq!(runtime.core().last_applied(), 1);
+
+        let storage = runtime.into_storage();
+        let voters = VoterSet::new([NodeId(1)]).expect("voters");
+        let recovered = DurableRaft::recover(NodeId(1), voters, storage).expect("recover");
+        assert_eq!(recovered.core().last_applied(), 1);
+        assert_eq!(recovered.core().commit_index(), 1);
     }
 }

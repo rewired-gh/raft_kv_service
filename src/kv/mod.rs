@@ -13,6 +13,7 @@ const CREATE: u8 = 1;
 const UPDATE: u8 = 2;
 const DELETE: u8 = 3;
 const READ: u8 = 4;
+const RESULT_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ClientId(pub [u8; 16]);
@@ -319,6 +320,135 @@ pub fn fingerprint(mutation: &Mutation) -> Result<[u8; 32], CommandError> {
     Ok(Sha256::digest(canonical).into())
 }
 
+pub fn encode_command_result(result: &CommandResult) -> Result<Vec<u8>, CommandError> {
+    let mut encoded = vec![RESULT_VERSION];
+    match result {
+        CommandResult::Mutation(result) => encode_mutation_result_into(&mut encoded, result),
+        CommandResult::Read(ReadResult::Found { value, revision }) => {
+            encoded.push(20);
+            encode_bytes(&mut encoded, value)?;
+            encoded.extend_from_slice(&revision.to_be_bytes());
+        }
+        CommandResult::Read(ReadResult::NotFound) => encoded.push(21),
+    }
+    Ok(encoded)
+}
+
+pub fn decode_command_result(encoded: &[u8]) -> Result<CommandResult, CommandError> {
+    let mut decoder = Decoder::new(encoded);
+    if decoder.byte()? != RESULT_VERSION {
+        return Err(CommandError::UnsupportedVersion);
+    }
+    let tag = decoder.byte()?;
+    let result = match tag {
+        1..=9 => CommandResult::Mutation(decode_mutation_result_from(tag, &mut decoder)?),
+        20 => CommandResult::Read(ReadResult::Found {
+            value: decoder.bytes()?,
+            revision: decoder.u64()?,
+        }),
+        21 => CommandResult::Read(ReadResult::NotFound),
+        _ => return Err(CommandError::UnknownResult(tag)),
+    };
+    if !decoder.remaining().is_empty() {
+        return Err(CommandError::TrailingBytes);
+    }
+    Ok(result)
+}
+
+pub fn encode_mutation_result(result: &MutationResult) -> Result<Vec<u8>, CommandError> {
+    let mut encoded = vec![RESULT_VERSION];
+    encode_mutation_result_into(&mut encoded, result);
+    Ok(encoded)
+}
+
+pub fn decode_mutation_result(encoded: &[u8]) -> Result<MutationResult, CommandError> {
+    let mut decoder = Decoder::new(encoded);
+    if decoder.byte()? != RESULT_VERSION {
+        return Err(CommandError::UnsupportedVersion);
+    }
+    let tag = decoder.byte()?;
+    let result = decode_mutation_result_from(tag, &mut decoder)?;
+    if !decoder.remaining().is_empty() {
+        return Err(CommandError::TrailingBytes);
+    }
+    Ok(result)
+}
+
+fn encode_mutation_result_into(output: &mut Vec<u8>, result: &MutationResult) {
+    match result {
+        MutationResult::Created { revision } => {
+            output.push(1);
+            output.extend_from_slice(&revision.to_be_bytes());
+        }
+        MutationResult::Updated { revision } => {
+            output.push(2);
+            output.extend_from_slice(&revision.to_be_bytes());
+        }
+        MutationResult::Deleted { revision } => {
+            output.push(3);
+            output.extend_from_slice(&revision.to_be_bytes());
+        }
+        MutationResult::PreconditionFailed { current_revision } => {
+            output.push(4);
+            encode_optional_revision(output, *current_revision);
+        }
+        MutationResult::Duplicate(result) => {
+            output.push(5);
+            encode_mutation_result_into(output, result);
+        }
+        MutationResult::StaleSequence { latest } => {
+            output.push(6);
+            output.extend_from_slice(&latest.to_be_bytes());
+        }
+        MutationResult::SequenceGap { expected } => {
+            output.push(7);
+            output.extend_from_slice(&expected.to_be_bytes());
+        }
+        MutationResult::IdentityConflict { sequence } => {
+            output.push(8);
+            output.extend_from_slice(&sequence.to_be_bytes());
+        }
+        MutationResult::ClientCapacityReached => output.push(9),
+    }
+}
+
+fn decode_mutation_result_from(
+    tag: u8,
+    decoder: &mut Decoder<'_>,
+) -> Result<MutationResult, CommandError> {
+    match tag {
+        1 => Ok(MutationResult::Created {
+            revision: decoder.u64()?,
+        }),
+        2 => Ok(MutationResult::Updated {
+            revision: decoder.u64()?,
+        }),
+        3 => Ok(MutationResult::Deleted {
+            revision: decoder.u64()?,
+        }),
+        4 => Ok(MutationResult::PreconditionFailed {
+            current_revision: decoder.optional_revision()?,
+        }),
+        5 => {
+            let nested_tag = decoder.byte()?;
+            Ok(MutationResult::Duplicate(Box::new(
+                decode_mutation_result_from(nested_tag, decoder)?,
+            )))
+        }
+        6 => Ok(MutationResult::StaleSequence {
+            latest: decoder.u64()?,
+        }),
+        7 => Ok(MutationResult::SequenceGap {
+            expected: decoder.u64()?,
+        }),
+        8 => Ok(MutationResult::IdentityConflict {
+            sequence: decoder.u64()?,
+        }),
+        9 => Ok(MutationResult::ClientCapacityReached),
+        _ => Err(CommandError::UnknownResult(tag)),
+    }
+}
+
 pub fn validate_key(key: &str) -> Result<(), CommandError> {
     if key.is_empty() {
         return Err(CommandError::EmptyKey);
@@ -463,6 +593,7 @@ pub enum CommandError {
     FieldTooLarge,
     UnsupportedVersion,
     UnknownOperation(u8),
+    UnknownResult(u8),
     InvalidUtf8,
     InvalidOption,
     Truncated,
@@ -654,5 +785,28 @@ mod tests {
             fingerprint(&first).expect("hash"),
             fingerprint(&second).expect("hash")
         );
+    }
+
+    #[test]
+    fn results_round_trip_without_losing_binary_values() {
+        let results = [
+            CommandResult::Mutation(MutationResult::Duplicate(Box::new(
+                MutationResult::PreconditionFailed {
+                    current_revision: Some(8),
+                },
+            ))),
+            CommandResult::Read(ReadResult::Found {
+                value: vec![0, 255],
+                revision: 9,
+            }),
+            CommandResult::Read(ReadResult::NotFound),
+        ];
+        for result in results {
+            assert_eq!(
+                decode_command_result(&encode_command_result(&result).expect("encode"))
+                    .expect("decode"),
+                result
+            );
+        }
     }
 }
