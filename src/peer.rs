@@ -5,7 +5,13 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use crate::raft::{EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term};
+use crate::{
+    kv::{
+        Command, CommandResult, decode_command, decode_command_result, encode_command,
+        encode_command_result,
+    },
+    raft::{EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term},
+};
 
 pub const PEER_PROTOCOL_VERSION: u32 = 1;
 
@@ -39,6 +45,26 @@ pub struct PeerContext {
 }
 
 impl PeerContext {
+    pub fn decode_forward_command(
+        &self,
+        request: proto::ForwardCommandRequest,
+    ) -> Result<(NodeId, Command), PeerError> {
+        let identity = self.validate_identity(request.identity)?;
+        if request.hop_count > 1 {
+            return Err(PeerError::ForwardingLoop);
+        }
+        let command = decode_command(&request.command).map_err(|_| PeerError::InvalidCommand)?;
+        Ok((identity.sender, command))
+    }
+
+    pub fn decode_forward_response(
+        &self,
+        response: proto::ForwardCommandResponse,
+    ) -> Result<CommandResult, PeerError> {
+        self.validate_identity(response.identity)?;
+        decode_command_result(&response.result).map_err(|_| PeerError::InvalidCommandResult)
+    }
+
     pub fn decode_request_vote(
         &self,
         request: proto::RequestVoteRequest,
@@ -147,6 +173,33 @@ impl PeerContext {
     }
 }
 
+pub fn encode_forward_command(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    command: &Command,
+) -> Result<proto::ForwardCommandRequest, PeerError> {
+    Ok(proto::ForwardCommandRequest {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        command: encode_command(command).map_err(|_| PeerError::InvalidCommand)?,
+        hop_count: 1,
+    })
+}
+
+pub fn encode_forward_response(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    result: &CommandResult,
+) -> Result<proto::ForwardCommandResponse, PeerError> {
+    Ok(proto::ForwardCommandResponse {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        result: encode_command_result(result).map_err(|_| PeerError::InvalidCommandResult)?,
+    })
+}
+
 struct Identity {
     sender: NodeId,
     term: Term,
@@ -233,15 +286,24 @@ fn encode_identity(
     envelope: &Envelope,
     term: Term,
 ) -> Result<proto::RpcIdentity, PeerError> {
-    valid_node(envelope.from.0)?;
-    valid_node(envelope.to.0)?;
+    encode_rpc_identity(cluster, envelope.from, envelope.to, term)
+}
+
+fn encode_rpc_identity(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+) -> Result<proto::RpcIdentity, PeerError> {
+    valid_node(from.0)?;
+    valid_node(to.0)?;
     if term == Term(0) {
         return Err(PeerError::ZeroTerm);
     }
     Ok(proto::RpcIdentity {
         cluster_id: cluster.0.to_vec(),
-        sender_id: envelope.from.0,
-        recipient_id: envelope.to.0,
+        sender_id: from.0,
+        recipient_id: to.0,
         protocol_version: PEER_PROTOCOL_VERSION,
         term: term.0,
     })
@@ -321,6 +383,9 @@ pub enum PeerError {
     InvalidNoop,
     CommandTooLarge,
     WrongMessageKind,
+    ForwardingLoop,
+    InvalidCommand,
+    InvalidCommandResult,
 }
 
 impl Display for PeerError {
@@ -390,6 +455,38 @@ mod tests {
         assert_eq!(
             context().decode_request_vote(encoded),
             Err(PeerError::UnsupportedProtocol(99))
+        );
+    }
+
+    #[test]
+    fn forwarding_round_trips_once_and_rejects_another_hop() {
+        let command = Command::Read {
+            key: "forwarded".into(),
+        };
+        let mut request =
+            encode_forward_command(ClusterId([4; 16]), NodeId(1), NodeId(2), Term(3), &command)
+                .expect("encode request");
+        assert_eq!(
+            context()
+                .decode_forward_command(request.clone())
+                .expect("decode request"),
+            (NodeId(1), command)
+        );
+        request.hop_count = 2;
+        assert_eq!(
+            context().decode_forward_command(request),
+            Err(PeerError::ForwardingLoop)
+        );
+
+        let result = CommandResult::Read(crate::kv::ReadResult::NotFound);
+        let response =
+            encode_forward_response(ClusterId([4; 16]), NodeId(1), NodeId(2), Term(3), &result)
+                .expect("encode response");
+        assert_eq!(
+            context()
+                .decode_forward_response(response)
+                .expect("decode response"),
+            result
         );
     }
 }

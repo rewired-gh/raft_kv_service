@@ -26,5 +26,7 @@ transactional ordered application resolves them.
   equivalent to a dropped Raft message and cannot fabricate success.
 - A new incompatible peer protocol requires an explicit version transition;
   removed Protobuf field numbers must be reserved.
-- Connection pooling, peer mTLS, forwarding, and snapshot streaming extend
-  this boundary in later milestones without changing core transitions.
+- Client-command forwarding is a separate, one-hop RPC on the same validated
+  peer identity envelope; the receiver executes locally and never forwards it.
+- Connection pooling, peer mTLS, and snapshot streaming extend this boundary in
+  later milestones without changing core transitions.

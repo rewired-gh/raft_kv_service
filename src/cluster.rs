@@ -5,7 +5,10 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -19,9 +22,12 @@ use crate::{
     kv::{Command, CommandResult, encode_command},
     peer::{
         ClusterId, PeerContext, PeerLimits, encode_append_entries, encode_append_entries_response,
-        encode_request_vote, encode_request_vote_response, proto,
+        encode_forward_command, encode_forward_response, encode_request_vote,
+        encode_request_vote_response, proto,
     },
-    raft::{DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, VoterSet},
+    raft::{
+        DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, Term, VoterSet,
+    },
     storage::{AppliedEntry, SqliteStorage},
 };
 
@@ -79,10 +85,21 @@ impl RunningNode {
 #[derive(Clone)]
 pub struct StaticNodeHandle {
     sender: SyncSender<NodeRequest>,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    endpoints: Arc<BTreeMap<NodeId, String>>,
+    rpc_timeout: Duration,
 }
 
 impl StaticNodeHandle {
     pub async fn execute(&self, command: Command) -> Result<CommandResult, ServiceError> {
+        match self.execute_local(command.clone()).await {
+            Err(ServiceError::Unavailable) => self.forward(command).await,
+            result => result,
+        }
+    }
+
+    async fn execute_local(&self, command: Command) -> Result<CommandResult, ServiceError> {
         let (respond, response) = oneshot::channel();
         self.sender
             .try_send(NodeRequest::Client { command, respond })
@@ -91,6 +108,58 @@ impl StaticNodeHandle {
                 mpsc::TrySendError::Disconnected(_) => ServiceError::Unavailable,
             })?;
         response.await.map_err(|_| ServiceError::Unavailable)?
+    }
+
+    async fn status(&self) -> Result<(Option<NodeId>, Term), ServiceError> {
+        let (respond, response) = oneshot::channel();
+        self.sender
+            .try_send(NodeRequest::Status { respond })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ServiceError::Overloaded,
+                mpsc::TrySendError::Disconnected(_) => ServiceError::Unavailable,
+            })?;
+        response.await.map_err(|_| ServiceError::Unavailable)
+    }
+
+    async fn forward(&self, command: Command) -> Result<CommandResult, ServiceError> {
+        let (leader, term) = self.status().await?;
+        let leader = leader
+            .filter(|leader| *leader != self.node_id)
+            .ok_or(ServiceError::Unavailable)?;
+        let endpoint = self
+            .endpoints
+            .get(&leader)
+            .ok_or(ServiceError::Unavailable)?;
+        let channel = tokio::time::timeout(
+            self.rpc_timeout,
+            Channel::from_shared(endpoint.clone())
+                .map_err(|_| ServiceError::Internal)?
+                .connect(),
+        )
+        .await
+        .map_err(|_| ServiceError::Unavailable)?
+        .map_err(|_| ServiceError::Unavailable)?;
+        let mut client = proto::raft_peer_client::RaftPeerClient::new(channel);
+        let request = encode_forward_command(self.cluster_id, self.node_id, leader, term, &command)
+            .map_err(|_| ServiceError::Internal)?;
+        let response = tokio::time::timeout(self.rpc_timeout, client.forward_command(request))
+            .await
+            .map_err(|_| ServiceError::Unavailable)?
+            .map_err(|status| match status.code() {
+                tonic::Code::ResourceExhausted => ServiceError::Overloaded,
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+                    ServiceError::Unavailable
+                }
+                _ => ServiceError::Internal,
+            })?
+            .into_inner();
+        PeerContext {
+            cluster_id: self.cluster_id,
+            local_id: self.node_id,
+            limits: PeerLimits::default(),
+        }
+        .decode_forward_response(response)
+        .map_err(|_| ServiceError::Internal)
     }
 
     fn receive_response(&self, envelope: Envelope) {
@@ -142,7 +211,13 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
         .recv()
         .map_err(|error| error.to_string())??;
 
-    let handle = StaticNodeHandle { sender };
+    let handle = StaticNodeHandle {
+        sender,
+        cluster_id: config.cluster_id,
+        node_id: config.node_id,
+        endpoints: Arc::new(config.peer_endpoints.clone()),
+        rpc_timeout: config.rpc_timeout,
+    };
     Ok(RunningNode {
         peer_service: PeerRpcService {
             context: PeerContext {
@@ -192,6 +267,9 @@ enum NodeRequest {
         respond: oneshot::Sender<Result<Envelope, Status>>,
     },
     PeerResponse(Envelope),
+    Status {
+        respond: oneshot::Sender<(Option<NodeId>, Term)>,
+    },
 }
 
 struct NodeWorker {
@@ -265,6 +343,7 @@ impl NodeWorker {
         match request {
             NodeRequest::Client { command, respond } => self.handle_client(command, respond),
             NodeRequest::PeerCall { envelope, respond } => {
+                let was_leader = self.raft.core().role() == Role::Leader;
                 let effects = self
                     .raft
                     .handle(Event::Receive(envelope.clone()))
@@ -275,14 +354,24 @@ impl NodeWorker {
                     .find(|candidate| candidate.to == envelope.from)
                     .ok_or_else(|| "core did not produce an RPC response".to_owned());
                 let _ = respond.send(response.map_err(Status::internal));
+                self.fail_pending_after_stepdown(was_leader);
                 Ok(())
             }
             NodeRequest::PeerResponse(envelope) => {
+                let was_leader = self.raft.core().role() == Role::Leader;
                 let effects = self
                     .raft
                     .handle(Event::Receive(envelope))
                     .map_err(|error| error.to_string())?;
                 self.process(effects, None)?;
+                self.fail_pending_after_stepdown(was_leader);
+                Ok(())
+            }
+            NodeRequest::Status { respond } => {
+                let _ = respond.send((
+                    self.raft.core().leader(),
+                    self.raft.core().hard_state().current_term,
+                ));
                 Ok(())
             }
         }
@@ -369,6 +458,14 @@ impl NodeWorker {
             }
         }
     }
+
+    fn fail_pending_after_stepdown(&mut self, was_leader: bool) {
+        if was_leader && self.raft.core().role() != Role::Leader {
+            for (_, respond) in self.pending_clients.drain() {
+                let _ = respond.send(Err(ServiceError::Unavailable));
+            }
+        }
+    }
 }
 
 fn random_election_timeout(config: &StaticNodeConfig) -> Duration {
@@ -398,6 +495,39 @@ pub struct PeerRpcService {
 
 #[tonic::async_trait]
 impl proto::raft_peer_server::RaftPeer for PeerRpcService {
+    async fn forward_command(
+        &self,
+        request: Request<proto::ForwardCommandRequest>,
+    ) -> Result<Response<proto::ForwardCommandResponse>, Status> {
+        let (sender, command) = self
+            .context
+            .decode_forward_command(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let result = self
+            .handle
+            .execute_local(command)
+            .await
+            .map_err(|error| match error {
+                ServiceError::Overloaded => Status::resource_exhausted("request queue is full"),
+                ServiceError::Unavailable => Status::unavailable("node is not the ready leader"),
+                ServiceError::Internal => Status::internal("command execution failed"),
+            })?;
+        let (_, term) = self
+            .handle
+            .status()
+            .await
+            .map_err(|_| Status::unavailable("Raft worker stopped"))?;
+        encode_forward_response(
+            self.context.cluster_id,
+            self.context.local_id,
+            sender,
+            term,
+            &result,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     async fn request_vote(
         &self,
         request: Request<proto::RequestVoteRequest>,
@@ -588,23 +718,23 @@ mod tests {
             },
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let revision = loop {
+        let (revision, leader_index) = loop {
             let mut committed = None;
-            for handle in &handles {
+            for (index, handle) in handles.iter().enumerate() {
                 if let Ok(Ok(CommandResult::Mutation(crate::kv::MutationResult::Created {
                     revision,
                 }))) = tokio::time::timeout(
                     Duration::from_millis(500),
-                    handle.execute(command.clone()),
+                    handle.execute_local(command.clone()),
                 )
                 .await
                 {
-                    committed = Some(revision);
+                    committed = Some((revision, index));
                     break;
                 }
             }
-            if let Some(revision) = committed {
-                break revision;
+            if let Some(committed) = committed {
+                break committed;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -613,6 +743,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(revision >= 2);
+
+        let follower = &handles[(leader_index + 1) % handles.len()];
+        assert_eq!(
+            follower
+                .execute(Command::Read {
+                    key: "distributed".into(),
+                })
+                .await
+                .expect("follower forwards a logged read"),
+            CommandResult::Read(crate::kv::ReadResult::Found {
+                value: b"yes".to_vec(),
+                revision,
+            })
+        );
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         for node in 1..=3 {
