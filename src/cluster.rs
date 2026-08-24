@@ -21,14 +21,15 @@ use crate::{
     http::ServiceError,
     kv::{Command, CommandResult, encode_command},
     peer::{
-        ClusterId, PeerContext, PeerLimits, encode_append_entries, encode_append_entries_response,
-        encode_forward_command, encode_forward_response, encode_request_vote,
-        encode_request_vote_response, proto,
+        ClusterId, PeerContext, PeerLimits, SnapshotChunk, encode_append_entries,
+        encode_append_entries_response, encode_forward_command, encode_forward_response,
+        encode_request_vote, encode_request_vote_response, encode_snapshot_chunk,
+        encode_snapshot_response, proto,
     },
     raft::{
         DurableRaft, Effect, EntryPayload, Envelope, Event, Message, NodeId, Role, Term, VoterSet,
     },
-    storage::{AppliedEntry, SqliteStorage},
+    storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage},
 };
 
 #[derive(Clone, Debug)]
@@ -44,13 +45,14 @@ pub struct StaticNodeConfig {
     pub heartbeat_interval: Duration,
     pub rpc_timeout: Duration,
     pub max_clients: u64,
+    pub snapshot_threshold_entries: u64,
     pub peer_endpoints: BTreeMap<NodeId, String>,
 }
 
 pub struct RunningNode {
     pub handle: StaticNodeHandle,
     pub peer_service: PeerRpcService,
-    outbound: tokio_mpsc::Receiver<Envelope>,
+    outbound: tokio_mpsc::Receiver<Outbound>,
     endpoints: BTreeMap<NodeId, String>,
     rpc_timeout: Duration,
 }
@@ -60,19 +62,36 @@ impl RunningNode {
         let handle = self.handle.clone();
         let response_handle = handle.clone();
         tokio::spawn(async move {
-            while let Some(envelope) = self.outbound.recv().await {
-                let Some(endpoint) = self.endpoints.get(&envelope.to).cloned() else {
-                    warn!(
-                        peer = envelope.to.0,
-                        "missing peer endpoint; dropping Raft RPC"
-                    );
+            while let Some(outbound) = self.outbound.recv().await {
+                let to = match &outbound {
+                    Outbound::Raft(envelope) => envelope.to,
+                    Outbound::Snapshot { to, .. } => *to,
+                };
+                let Some(endpoint) = self.endpoints.get(&to).cloned() else {
+                    warn!(peer = to.0, "missing peer endpoint; dropping Raft RPC");
                     continue;
                 };
                 let response_handle = response_handle.clone();
                 let cluster_id = self.peer_service.context.cluster_id;
                 let timeout = self.rpc_timeout;
                 tokio::spawn(async move {
-                    match dispatch(cluster_id, endpoint, envelope, timeout).await {
+                    let result = match outbound {
+                        Outbound::Raft(envelope) => {
+                            dispatch(cluster_id, endpoint, envelope, timeout).await
+                        }
+                        Outbound::Snapshot {
+                            from,
+                            to,
+                            term,
+                            snapshot,
+                        } => {
+                            dispatch_snapshot(
+                                cluster_id, endpoint, from, to, term, snapshot, timeout,
+                            )
+                            .await
+                        }
+                    };
+                    match result {
                         Ok(response) => response_handle.receive_response(response),
                         Err(error) => warn!(%error, "peer RPC failed"),
                     }
@@ -81,6 +100,16 @@ impl RunningNode {
         });
         (handle, self.peer_service)
     }
+}
+
+enum Outbound {
+    Raft(Envelope),
+    Snapshot {
+        from: NodeId,
+        to: NodeId,
+        term: Term,
+        snapshot: Snapshot,
+    },
 }
 
 #[derive(Clone)]
@@ -191,8 +220,8 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     let storage = SqliteStorage::open_with_max_clients(&config.data_file, config.max_clients)
         .map_err(|error| error.to_string())?;
     let voters = VoterSet::new(config.voters.iter().copied()).map_err(|error| error.to_string())?;
-    let raft =
-        DurableRaft::recover(config.node_id, voters, storage).map_err(|error| error.to_string())?;
+    let raft = DurableRaft::recover_with_snapshot(config.node_id, voters, storage)
+        .map_err(|error| error.to_string())?;
     let (sender, receiver) = mpsc::sync_channel(config.request_queue_capacity);
     let (outbound_sender, outbound) = tokio_mpsc::channel(config.outbound_queue_capacity);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
@@ -246,6 +275,7 @@ fn validate_config(config: &StaticNodeConfig) -> Result<(), String> {
         || config.heartbeat_interval >= config.election_timeout_min
         || config.rpc_timeout.is_zero()
         || config.max_clients == 0
+        || config.snapshot_threshold_entries == 0
     {
         return Err("invalid static Raft runtime configuration".to_owned());
     }
@@ -273,23 +303,46 @@ enum NodeRequest {
     Status {
         respond: oneshot::Sender<(Option<NodeId>, Term)>,
     },
+    SnapshotChunk {
+        chunk: SnapshotChunk,
+        respond: oneshot::Sender<Result<SnapshotProgress, Status>>,
+    },
+}
+
+struct SnapshotProgress {
+    snapshot_id: [u8; 32],
+    next_offset: usize,
+    installed: bool,
+    term: Term,
 }
 
 struct NodeWorker {
     raft: DurableRaft<SqliteStorage>,
     receiver: Receiver<NodeRequest>,
-    outbound: tokio_mpsc::Sender<Envelope>,
+    outbound: tokio_mpsc::Sender<Outbound>,
     config: StaticNodeConfig,
     pending_clients: HashMap<u64, oneshot::Sender<Result<CommandResult, ServiceError>>>,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
+    incoming_snapshot: Option<IncomingSnapshot>,
+}
+
+struct IncomingSnapshot {
+    sender: NodeId,
+    term: Term,
+    format_version: u32,
+    last_included: crate::raft::LogPosition,
+    voters: Vec<NodeId>,
+    snapshot_id: [u8; 32],
+    total_size: usize,
+    bytes: Vec<u8>,
 }
 
 impl NodeWorker {
     fn new(
         raft: DurableRaft<SqliteStorage>,
         receiver: Receiver<NodeRequest>,
-        outbound: tokio_mpsc::Sender<Envelope>,
+        outbound: tokio_mpsc::Sender<Outbound>,
         config: StaticNodeConfig,
     ) -> Self {
         let now = Instant::now();
@@ -300,6 +353,7 @@ impl NodeWorker {
             election_deadline: now + random_election_timeout(&config),
             heartbeat_deadline: now + config.heartbeat_interval,
             pending_clients: HashMap::new(),
+            incoming_snapshot: None,
             config,
         }
     }
@@ -377,6 +431,13 @@ impl NodeWorker {
                 ));
                 Ok(())
             }
+            NodeRequest::SnapshotChunk { chunk, respond } => {
+                let was_leader = self.raft.core().role() == Role::Leader;
+                let result = self.accept_snapshot_chunk(chunk);
+                let _ = respond.send(result);
+                self.fail_pending_after_stepdown(was_leader);
+                Ok(())
+            }
         }
     }
 
@@ -429,6 +490,13 @@ impl NodeWorker {
                         .map_err(|error| error.to_string())?;
                     self.complete_clients(batch.entries);
                     pending.extend(batch.effects);
+                    let compacted = self.raft.core().snapshot_position().index;
+                    let applied = self.raft.core().last_applied();
+                    if applied.saturating_sub(compacted) >= self.config.snapshot_threshold_entries {
+                        self.raft
+                            .create_snapshot(self.config.cluster_id.0)
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
                 Effect::Send(envelope)
                     if direct_peer == Some(envelope.to) && is_response(&envelope) =>
@@ -436,12 +504,27 @@ impl NodeWorker {
                     direct.push(envelope);
                 }
                 Effect::Send(envelope) => {
-                    let _ = self.outbound.try_send(envelope);
+                    let _ = self.outbound.try_send(Outbound::Raft(envelope));
                 }
                 Effect::ResetElectionTimer => {
                     self.election_deadline = Instant::now() + random_election_timeout(&self.config);
                 }
                 Effect::CommitIndexAdvanced(_) => {}
+                Effect::SendSnapshot { to, last_included } => {
+                    let snapshot = self
+                        .raft
+                        .storage()
+                        .current_snapshot()
+                        .map_err(|error| error.to_string())?
+                        .filter(|snapshot| snapshot.last_included == last_included)
+                        .ok_or_else(|| "core requested an unavailable snapshot".to_owned())?;
+                    let _ = self.outbound.try_send(Outbound::Snapshot {
+                        from: self.config.node_id,
+                        to,
+                        term: self.raft.core().hard_state().current_term,
+                        snapshot,
+                    });
+                }
                 Effect::PersistHardState(_) | Effect::PersistLog(_) => {
                     return Err("durable runtime leaked a persistence effect".to_owned());
                 }
@@ -468,6 +551,103 @@ impl NodeWorker {
                 let _ = respond.send(Err(ServiceError::Unavailable));
             }
         }
+    }
+
+    fn accept_snapshot_chunk(&mut self, chunk: SnapshotChunk) -> Result<SnapshotProgress, Status> {
+        let matches_staging = self.incoming_snapshot.as_ref().is_some_and(|staging| {
+            staging.sender == chunk.sender
+                && staging.term == chunk.term
+                && staging.format_version == chunk.format_version
+                && staging.last_included == chunk.last_included
+                && staging.voters == chunk.voters
+                && staging.snapshot_id == chunk.snapshot_id
+                && staging.total_size == chunk.total_size
+        });
+        if !matches_staging {
+            if chunk.offset != 0 {
+                return Err(Status::failed_precondition(
+                    "snapshot transfer must restart at offset zero",
+                ));
+            }
+            let effects = self
+                .raft
+                .observe_snapshot_leader(chunk.sender, chunk.term)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            self.process(effects, None).map_err(Status::internal)?;
+            self.incoming_snapshot = Some(IncomingSnapshot {
+                sender: chunk.sender,
+                term: chunk.term,
+                format_version: chunk.format_version,
+                last_included: chunk.last_included,
+                voters: chunk.voters.clone(),
+                snapshot_id: chunk.snapshot_id,
+                total_size: chunk.total_size,
+                bytes: Vec::new(),
+            });
+        }
+        let staging = self
+            .incoming_snapshot
+            .as_mut()
+            .ok_or_else(|| Status::internal("snapshot staging unavailable"))?;
+        if chunk.offset < staging.bytes.len() {
+            let end = chunk
+                .offset
+                .checked_add(chunk.bytes.len())
+                .ok_or_else(|| Status::invalid_argument("invalid snapshot offset"))?;
+            if end > staging.bytes.len() || staging.bytes[chunk.offset..end] != chunk.bytes {
+                return Err(Status::invalid_argument("conflicting snapshot chunk"));
+            }
+        } else if chunk.offset == staging.bytes.len() {
+            staging.bytes.extend_from_slice(&chunk.bytes);
+        } else {
+            return Err(Status::failed_precondition(
+                "snapshot chunk is out of order",
+            ));
+        }
+        let next_offset = staging.bytes.len();
+        if !chunk.done {
+            return Ok(SnapshotProgress {
+                snapshot_id: chunk.snapshot_id,
+                next_offset,
+                installed: false,
+                term: self.raft.core().hard_state().current_term,
+            });
+        }
+        if next_offset != staging.total_size {
+            return Err(Status::invalid_argument("incomplete final snapshot chunk"));
+        }
+        let staging = self
+            .incoming_snapshot
+            .take()
+            .ok_or_else(|| Status::internal("snapshot staging unavailable"))?;
+        let snapshot = Snapshot {
+            format_version: staging.format_version,
+            cluster_id: self.config.cluster_id.0,
+            last_included: staging.last_included,
+            voters: staging.voters,
+            payload: staging.bytes,
+            digest: staging.snapshot_id,
+        };
+        self.raft
+            .storage()
+            .validate_snapshot_for_cluster(self.config.cluster_id.0, &snapshot)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let effects = self
+            .raft
+            .install_snapshot(
+                staging.sender,
+                staging.term,
+                self.config.cluster_id.0,
+                &snapshot,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.process(effects, None).map_err(Status::internal)?;
+        Ok(SnapshotProgress {
+            snapshot_id: staging.snapshot_id,
+            next_offset,
+            installed: true,
+            term: self.raft.core().hard_state().current_term,
+        })
     }
 }
 
@@ -498,6 +678,39 @@ pub struct PeerRpcService {
 
 #[tonic::async_trait]
 impl proto::raft_peer_server::RaftPeer for PeerRpcService {
+    async fn install_snapshot(
+        &self,
+        request: Request<proto::InstallSnapshotRequest>,
+    ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
+        let chunk = self
+            .context
+            .decode_snapshot_chunk(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let sender = chunk.sender;
+        let (respond, response) = oneshot::channel();
+        self.handle
+            .sender
+            .try_send(NodeRequest::SnapshotChunk { chunk, respond })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Status::resource_exhausted("peer queue is full"),
+                mpsc::TrySendError::Disconnected(_) => Status::unavailable("Raft worker stopped"),
+            })?;
+        let progress = response
+            .await
+            .map_err(|_| Status::unavailable("Raft worker stopped"))??;
+        encode_snapshot_response(
+            self.context.cluster_id,
+            self.context.local_id,
+            sender,
+            progress.term,
+            progress.snapshot_id,
+            progress.next_offset,
+            progress.installed,
+        )
+        .map(Response::new)
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     async fn forward_command(
         &self,
         request: Request<proto::ForwardCommandRequest>,
@@ -612,6 +825,66 @@ async fn dispatch(
     }
 }
 
+async fn dispatch_snapshot(
+    cluster: ClusterId,
+    endpoint: String,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    snapshot: Snapshot,
+    timeout: Duration,
+) -> Result<Envelope, String> {
+    let channel = tokio::time::timeout(
+        timeout,
+        Channel::from_shared(endpoint)
+            .map_err(|error| error.to_string())?
+            .connect(),
+    )
+    .await
+    .map_err(|_| "snapshot peer connection timed out".to_owned())?
+    .map_err(|error| error.to_string())?;
+    let mut client = proto::raft_peer_client::RaftPeerClient::new(channel);
+    let context = PeerContext {
+        cluster_id: cluster,
+        local_id: from,
+        limits: PeerLimits::default(),
+    };
+    let chunk_size = context.limits.snapshot_chunk_bytes;
+    let mut offset = 0_usize;
+    let mut response_term = term;
+    while offset < snapshot.payload.len() {
+        let request = encode_snapshot_chunk(cluster, from, to, term, &snapshot, offset, chunk_size)
+            .map_err(|error| error.to_string())?;
+        let response = tokio::time::timeout(timeout, client.install_snapshot(request))
+            .await
+            .map_err(|_| "InstallSnapshot chunk timed out".to_owned())?
+            .map_err(|error| error.to_string())?
+            .into_inner();
+        let (snapshot_id, next_offset, installed, observed_term) = context
+            .decode_snapshot_response(response)
+            .map_err(|error| error.to_string())?;
+        if snapshot_id != snapshot.digest
+            || next_offset <= offset
+            || next_offset > snapshot.payload.len()
+            || installed != (next_offset == snapshot.payload.len())
+        {
+            return Err("invalid InstallSnapshot progress response".to_owned());
+        }
+        offset = next_offset;
+        response_term = observed_term;
+    }
+    Ok(Envelope {
+        from: to,
+        to: from,
+        message: Message::AppendEntriesResponse {
+            term: response_term,
+            accepted: true,
+            match_index: snapshot.last_included.index,
+            request_previous_index: snapshot.last_included.index,
+        },
+    })
+}
+
 pub fn peer_server(
     service: PeerRpcService,
 ) -> proto::raft_peer_server::RaftPeerServer<PeerRpcService> {
@@ -682,7 +955,7 @@ mod tests {
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
 
-        for (index, address) in addresses.into_iter().enumerate() {
+        for (index, address) in addresses.iter().copied().take(2).enumerate() {
             let node_id = NodeId(u64::try_from(index + 1).expect("node id"));
             let mut peer_endpoints = endpoints.clone();
             peer_endpoints.remove(&node_id);
@@ -698,6 +971,7 @@ mod tests {
                 heartbeat_interval: Duration::from_millis(30),
                 rpc_timeout: Duration::from_millis(100),
                 max_clients: 10_000,
+                snapshot_threshold_entries: 2,
                 peer_endpoints,
             })
             .expect("start node");
@@ -788,6 +1062,66 @@ mod tests {
             )
             .expect("check collected cluster history")
         );
+
+        // Node 3 starts only after the quorum has compacted through the create.
+        // Its first successful catch-up must therefore install a snapshot.
+        let node_id = NodeId(3);
+        let mut peer_endpoints = endpoints.clone();
+        peer_endpoints.remove(&node_id);
+        let running = start_static_node(StaticNodeConfig {
+            cluster_id: ClusterId([8; 16]),
+            node_id,
+            voters: voters.clone(),
+            data_file: directory.join("node-3.sqlite3"),
+            request_queue_capacity: 64,
+            outbound_queue_capacity: 64,
+            election_timeout_min: Duration::from_millis(120),
+            election_timeout_max: Duration::from_millis(240),
+            heartbeat_interval: Duration::from_millis(30),
+            rpc_timeout: Duration::from_millis(100),
+            max_clients: 10_000,
+            snapshot_threshold_entries: 2,
+            peer_endpoints,
+        })
+        .expect("start lagging node");
+        let (handle, service) = running.spawn_dispatcher();
+        let (shutdown, receive_shutdown) = oneshot::channel();
+        shutdowns.push(shutdown);
+        tokio::spawn(async move {
+            serve_peer(addresses[2], service, async {
+                let _ = receive_shutdown.await;
+            })
+            .await
+            .expect("lagging peer server");
+        });
+        handles.push(handle);
+
+        let catch_up_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let storage =
+                SqliteStorage::open(directory.join("node-3.sqlite3")).expect("open lagging state");
+            if storage
+                .value("distributed")
+                .expect("read lagging value")
+                .is_some()
+            {
+                assert_eq!(
+                    storage
+                        .current_snapshot()
+                        .expect("load installed snapshot")
+                        .expect("snapshot installed")
+                        .last_included
+                        .index,
+                    2
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < catch_up_deadline,
+                "lagging follower did not install snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         for node in 1..=3 {

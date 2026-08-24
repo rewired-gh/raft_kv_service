@@ -28,5 +28,5 @@ transactional ordered application resolves them.
   removed Protobuf field numbers must be reserved.
 - Client-command forwarding is a separate, one-hop RPC on the same validated
   peer identity envelope; the receiver executes locally and never forwards it.
-- Connection pooling, peer mTLS, and snapshot streaming extend this boundary in
-  later milestones without changing core transitions.
+- Snapshot transfer uses bounded, resumable unary chunks on this boundary.
+- Connection pooling and peer mTLS extend this boundary in later milestones.

@@ -69,6 +69,10 @@ impl VoterSet {
         self.0.contains(&node)
     }
 
+    pub fn members(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.0.iter().copied()
+    }
+
     fn has_quorum(&self, votes: &BTreeSet<NodeId>) -> bool {
         let granted = votes.intersection(&self.0).count();
         granted > self.0.len() / 2
@@ -126,6 +130,10 @@ pub enum Effect {
     ResetElectionTimer,
     CommitIndexAdvanced(u64),
     ApplyCommitted(Vec<LogEntry>),
+    SendSnapshot {
+        to: NodeId,
+        last_included: LogPosition,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +187,15 @@ pub enum CoreError {
     InvalidRecoveredApplied {
         last_applied: u64,
         last_log: u64,
+    },
+    InvalidSnapshotPosition(LogPosition),
+    SnapshotBeyondApplied {
+        snapshot_index: u64,
+        last_applied: u64,
+    },
+    StaleSnapshotTerm {
+        received: Term,
+        current: Term,
     },
     IndexExhausted,
     TermExhausted,
@@ -254,6 +271,23 @@ impl Display for CoreError {
                 formatter,
                 "recovered last applied index {last_applied} exceeds log index {last_log}"
             ),
+            Self::InvalidSnapshotPosition(position) => write!(
+                formatter,
+                "invalid snapshot position {} in term {}",
+                position.index, position.term.0
+            ),
+            Self::SnapshotBeyondApplied {
+                snapshot_index,
+                last_applied,
+            } => write!(
+                formatter,
+                "snapshot index {snapshot_index} exceeds last applied index {last_applied}"
+            ),
+            Self::StaleSnapshotTerm { received, current } => write!(
+                formatter,
+                "snapshot term {} is older than current term {}",
+                received.0, current.0
+            ),
             Self::IndexExhausted => formatter.write_str("Raft log index exhausted"),
             Self::TermExhausted => formatter.write_str("Raft term exhausted"),
         }
@@ -306,6 +340,7 @@ pub struct RaftCore {
     hard_state: HardState,
     role: Role,
     leader: Option<NodeId>,
+    snapshot_position: LogPosition,
     log: Vec<LogEntry>,
     granted_votes: BTreeSet<NodeId>,
     pending: Option<PendingPersistence>,
@@ -335,6 +370,24 @@ impl RaftCore {
         log: Vec<LogEntry>,
         last_applied: u64,
     ) -> Result<Self, CoreError> {
+        Self::recover_compacted(
+            id,
+            voters,
+            hard_state,
+            LogPosition::default(),
+            log,
+            last_applied,
+        )
+    }
+
+    pub fn recover_compacted(
+        id: NodeId,
+        voters: VoterSet,
+        hard_state: HardState,
+        snapshot_position: LogPosition,
+        log: Vec<LogEntry>,
+        last_applied: u64,
+    ) -> Result<Self, CoreError> {
         if !voters.contains(id) {
             return Err(CoreError::LocalNodeIsNotVoter(id));
         }
@@ -343,9 +396,14 @@ impl RaftCore {
         {
             return Err(CoreError::InvalidRecoveredVote(voted_for));
         }
-        validate_recovered_log(&log)?;
-        let last_log = log.last().map_or(0, |entry| entry.index);
-        if last_applied > last_log {
+        if (snapshot_position.index == 0) != (snapshot_position.term == Term(0)) {
+            return Err(CoreError::InvalidSnapshotPosition(snapshot_position));
+        }
+        validate_recovered_log(snapshot_position.index, &log)?;
+        let last_log = log
+            .last()
+            .map_or(snapshot_position.index, |entry| entry.index);
+        if last_applied < snapshot_position.index || last_applied > last_log {
             return Err(CoreError::InvalidRecoveredApplied {
                 last_applied,
                 last_log,
@@ -357,6 +415,7 @@ impl RaftCore {
             hard_state,
             role: Role::Follower,
             leader: None,
+            snapshot_position,
             log,
             granted_votes: BTreeSet::new(),
             pending: None,
@@ -374,6 +433,10 @@ impl RaftCore {
         self.id
     }
 
+    pub fn voters(&self) -> &VoterSet {
+        &self.voters
+    }
+
     pub fn role(&self) -> Role {
         self.role
     }
@@ -389,10 +452,83 @@ impl RaftCore {
     pub fn last_log_position(&self) -> LogPosition {
         self.log
             .last()
-            .map_or_else(LogPosition::default, |entry| LogPosition {
+            .map_or(self.snapshot_position, |entry| LogPosition {
                 index: entry.index,
                 term: entry.term,
             })
+    }
+
+    pub fn snapshot_position(&self) -> LogPosition {
+        self.snapshot_position
+    }
+
+    pub fn compact_through(&mut self, position: LogPosition) -> Result<(), CoreError> {
+        if position.index < self.snapshot_position.index
+            || self.term_at(position.index) != Some(position.term)
+        {
+            return Err(CoreError::InvalidSnapshotPosition(position));
+        }
+        if position.index > self.last_applied {
+            return Err(CoreError::SnapshotBeyondApplied {
+                snapshot_index: position.index,
+                last_applied: self.last_applied,
+            });
+        }
+        let remove = usize::try_from(position.index - self.snapshot_position.index)
+            .map_err(|_| CoreError::IndexExhausted)?;
+        self.log.drain(..remove);
+        self.snapshot_position = position;
+        Ok(())
+    }
+
+    pub fn observe_snapshot_leader(
+        &mut self,
+        term: Term,
+        leader: NodeId,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if !self.voters.contains(leader) {
+            return Err(CoreError::LocalNodeIsNotVoter(leader));
+        }
+        if term < self.hard_state.current_term {
+            return Err(CoreError::StaleSnapshotTerm {
+                received: term,
+                current: self.hard_state.current_term,
+            });
+        }
+        if term > self.hard_state.current_term {
+            return self.begin_persistence(PendingPersistence {
+                hard_state: HardState {
+                    current_term: term,
+                    voted_for: None,
+                },
+                role: Role::Follower,
+                leader: Some(leader),
+                granted_votes: BTreeSet::new(),
+                after_persist: vec![Effect::ResetElectionTimer],
+            });
+        }
+        self.role = Role::Follower;
+        self.leader = Some(leader);
+        self.granted_votes.clear();
+        Ok(vec![Effect::ResetElectionTimer])
+    }
+
+    pub fn restore_snapshot(
+        &mut self,
+        position: LogPosition,
+        retained_suffix: Vec<LogEntry>,
+    ) -> Result<(), CoreError> {
+        if position.index < self.last_applied || position.term == Term(0) {
+            return Err(CoreError::InvalidSnapshotPosition(position));
+        }
+        validate_recovered_log(position.index, &retained_suffix)?;
+        self.snapshot_position = position;
+        self.log = retained_suffix;
+        self.commit_index = position.index;
+        self.last_applied = position.index;
+        self.pending_application = None;
+        self.pending_log = None;
+        Ok(())
     }
 
     pub fn persistence_pending(&self) -> bool {
@@ -520,7 +656,11 @@ impl RaftCore {
             .pending_log
             .take()
             .ok_or(CoreError::NoPersistencePending)?;
-        reconcile_log(&mut self.log, &pending.mutation.entries)?;
+        reconcile_log(
+            self.snapshot_position.index,
+            &mut self.log,
+            &pending.mutation.entries,
+        )?;
         match pending.continuation {
             PendingLogContinuation::FollowerAppend(request) => Ok(self.finish_append(request)),
             PendingLogContinuation::LeaderEntry => self.finish_leader_entry(),
@@ -753,7 +893,8 @@ impl RaftCore {
             return Ok(effects);
         }
 
-        if let Some(conflict_index) = first_log_difference(&self.log, &request.entries)
+        if let Some(conflict_index) =
+            first_log_difference(self.snapshot_position.index, &self.log, &request.entries)
             && conflict_index <= self.commit_index
         {
             return Err(CoreError::CommittedLogConflict {
@@ -762,7 +903,7 @@ impl RaftCore {
             });
         }
 
-        if log_requires_update(&self.log, &request.entries) {
+        if log_requires_update(self.snapshot_position.index, &self.log, &request.entries) {
             let mutation = LogMutation {
                 previous: request.previous,
                 entries: request.entries.clone(),
@@ -946,6 +1087,12 @@ impl RaftCore {
             .replication
             .get(&peer)
             .ok_or(CoreError::LocalNodeIsNotVoter(peer))?;
+        if progress.next_index <= self.snapshot_position.index {
+            return Ok(Effect::SendSnapshot {
+                to: peer,
+                last_included: self.snapshot_position,
+            });
+        }
         let previous_index = progress
             .next_index
             .checked_sub(1)
@@ -956,7 +1103,14 @@ impl RaftCore {
                 expected: previous_index,
                 found: self.last_log_position().index,
             })?;
-        let start = usize::try_from(previous_index).map_err(|_| CoreError::IndexExhausted)?;
+        let start = usize::try_from(
+            progress
+                .next_index
+                .checked_sub(self.snapshot_position.index)
+                .and_then(|offset| offset.checked_sub(1))
+                .ok_or(CoreError::IndexExhausted)?,
+        )
+        .map_err(|_| CoreError::IndexExhausted)?;
         let entries = self.log.get(start..).unwrap_or_default().to_vec();
         Ok(Effect::Send(Envelope {
             from: self.id,
@@ -1000,8 +1154,8 @@ impl RaftCore {
             return;
         }
         let (Ok(start), Ok(end)) = (
-            usize::try_from(self.last_applied),
-            usize::try_from(self.commit_index),
+            usize::try_from(self.last_applied - self.snapshot_position.index),
+            usize::try_from(self.commit_index - self.snapshot_position.index),
         ) else {
             return;
         };
@@ -1045,7 +1199,15 @@ impl RaftCore {
         if index == 0 {
             return Some(Term(0));
         }
-        let position = usize::try_from(index.checked_sub(1)?).ok()?;
+        if index == self.snapshot_position.index {
+            return Some(self.snapshot_position.term);
+        }
+        let position = usize::try_from(
+            index
+                .checked_sub(self.snapshot_position.index)?
+                .checked_sub(1)?,
+        )
+        .ok()?;
         self.log.get(position).map(|entry| entry.term)
     }
 }
@@ -1067,13 +1229,17 @@ fn validate_append_entries(previous: u64, entries: &[LogEntry]) -> Result<(), Co
     Ok(())
 }
 
-fn log_requires_update(log: &[LogEntry], incoming: &[LogEntry]) -> bool {
-    first_log_difference(log, incoming).is_some()
+fn log_requires_update(base_index: u64, log: &[LogEntry], incoming: &[LogEntry]) -> bool {
+    first_log_difference(base_index, log, incoming).is_some()
 }
 
-fn first_log_difference(log: &[LogEntry], incoming: &[LogEntry]) -> Option<u64> {
+fn first_log_difference(base_index: u64, log: &[LogEntry], incoming: &[LogEntry]) -> Option<u64> {
     incoming.iter().find_map(|entry| {
-        let Some(offset) = entry.index.checked_sub(1) else {
+        let Some(offset) = entry
+            .index
+            .checked_sub(base_index)
+            .and_then(|offset| offset.checked_sub(1))
+        else {
             return Some(entry.index);
         };
         let Ok(position) = usize::try_from(offset) else {
@@ -1083,11 +1249,16 @@ fn first_log_difference(log: &[LogEntry], incoming: &[LogEntry]) -> Option<u64> 
     })
 }
 
-fn reconcile_log(log: &mut Vec<LogEntry>, incoming: &[LogEntry]) -> Result<(), CoreError> {
+fn reconcile_log(
+    base_index: u64,
+    log: &mut Vec<LogEntry>,
+    incoming: &[LogEntry],
+) -> Result<(), CoreError> {
     for (incoming_position, entry) in incoming.iter().enumerate() {
         let offset = entry
             .index
-            .checked_sub(1)
+            .checked_sub(base_index)
+            .and_then(|offset| offset.checked_sub(1))
             .ok_or(CoreError::IndexExhausted)?;
         let position = usize::try_from(offset).map_err(|_| CoreError::IndexExhausted)?;
         if log.get(position) == Some(entry) {
@@ -1100,8 +1271,8 @@ fn reconcile_log(log: &mut Vec<LogEntry>, incoming: &[LogEntry]) -> Result<(), C
     Ok(())
 }
 
-fn validate_recovered_log(log: &[LogEntry]) -> Result<(), CoreError> {
-    let mut expected = 1_u64;
+fn validate_recovered_log(base_index: u64, log: &[LogEntry]) -> Result<(), CoreError> {
+    let mut expected = base_index.checked_add(1).ok_or(CoreError::IndexExhausted)?;
     for entry in log {
         if entry.index != expected {
             return Err(CoreError::InvalidRecoveredLog {

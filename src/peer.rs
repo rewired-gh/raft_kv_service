@@ -11,6 +11,7 @@ use crate::{
         encode_command_result,
     },
     raft::{EntryPayload, Envelope, LogEntry, LogPosition, Message, NodeId, Term},
+    storage::{SNAPSHOT_FORMAT_VERSION, Snapshot},
 };
 
 pub const PEER_PROTOCOL_VERSION: u32 = 1;
@@ -26,6 +27,8 @@ pub struct ClusterId(pub [u8; 16]);
 pub struct PeerLimits {
     pub max_entries_per_append: usize,
     pub max_command_bytes: usize,
+    pub max_snapshot_bytes: usize,
+    pub snapshot_chunk_bytes: usize,
 }
 
 impl Default for PeerLimits {
@@ -34,6 +37,8 @@ impl Default for PeerLimits {
             max_entries_per_append: 256,
             // The client value limit plus room for the canonical command envelope.
             max_command_bytes: 1024 * 1024 + 1024,
+            max_snapshot_bytes: 256 * 1024 * 1024,
+            snapshot_chunk_bytes: 256 * 1024,
         }
     }
 }
@@ -46,6 +51,87 @@ pub struct PeerContext {
 }
 
 impl PeerContext {
+    pub fn decode_snapshot_response(
+        &self,
+        response: proto::InstallSnapshotResponse,
+    ) -> Result<([u8; 32], usize, bool, Term), PeerError> {
+        let identity = self.validate_identity(response.identity)?;
+        let snapshot_id = response
+            .snapshot_id
+            .try_into()
+            .map_err(|_| PeerError::InvalidSnapshotDigest)?;
+        let next_offset =
+            usize::try_from(response.next_offset).map_err(|_| PeerError::InvalidSnapshotChunk)?;
+        if next_offset > self.limits.max_snapshot_bytes {
+            return Err(PeerError::InvalidSnapshotChunk);
+        }
+        Ok((snapshot_id, next_offset, response.installed, identity.term))
+    }
+
+    pub fn decode_snapshot_chunk(
+        &self,
+        request: proto::InstallSnapshotRequest,
+    ) -> Result<SnapshotChunk, PeerError> {
+        let identity = self.validate_identity(request.identity)?;
+        if request.format_version != SNAPSHOT_FORMAT_VERSION {
+            return Err(PeerError::UnsupportedSnapshotFormat(request.format_version));
+        }
+        if request.last_included_index == 0 || request.last_included_term == 0 {
+            return Err(PeerError::InvalidSnapshotPosition);
+        }
+        let voters = request
+            .voter_ids
+            .into_iter()
+            .map(valid_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        if voters.is_empty() || voters.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(PeerError::InvalidSnapshotVoters);
+        }
+        let snapshot_id: [u8; 32] = request
+            .snapshot_id
+            .try_into()
+            .map_err(|_| PeerError::InvalidSnapshotDigest)?;
+        let digest: [u8; 32] = request
+            .sha256
+            .try_into()
+            .map_err(|_| PeerError::InvalidSnapshotDigest)?;
+        if snapshot_id != digest {
+            return Err(PeerError::InvalidSnapshotDigest);
+        }
+        let total_size =
+            usize::try_from(request.total_size).map_err(|_| PeerError::SnapshotTooLarge)?;
+        let offset =
+            usize::try_from(request.offset).map_err(|_| PeerError::InvalidSnapshotChunk)?;
+        let end = offset
+            .checked_add(request.chunk.len())
+            .ok_or(PeerError::InvalidSnapshotChunk)?;
+        if total_size == 0 || total_size > self.limits.max_snapshot_bytes {
+            return Err(PeerError::SnapshotTooLarge);
+        }
+        if request.chunk.is_empty()
+            || request.chunk.len() > self.limits.snapshot_chunk_bytes
+            || end > total_size
+            || request.done != (end == total_size)
+        {
+            return Err(PeerError::InvalidSnapshotChunk);
+        }
+        Ok(SnapshotChunk {
+            sender: identity.sender,
+            term: identity.term,
+            format_version: request.format_version,
+            last_included: LogPosition {
+                index: request.last_included_index,
+                term: Term(request.last_included_term),
+            },
+            voters,
+            snapshot_id,
+            offset,
+            total_size,
+            bytes: request.chunk,
+            done: request.done,
+        })
+    }
+
     pub fn decode_forward_command(
         &self,
         request: proto::ForwardCommandRequest,
@@ -178,6 +264,69 @@ impl PeerContext {
             term: Term(identity.term),
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotChunk {
+    pub sender: NodeId,
+    pub term: Term,
+    pub format_version: u32,
+    pub last_included: LogPosition,
+    pub voters: Vec<NodeId>,
+    pub snapshot_id: [u8; 32],
+    pub offset: usize,
+    pub total_size: usize,
+    pub bytes: Vec<u8>,
+    pub done: bool,
+}
+
+pub fn encode_snapshot_chunk(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    snapshot: &Snapshot,
+    offset: usize,
+    chunk_size: usize,
+) -> Result<proto::InstallSnapshotRequest, PeerError> {
+    let end = offset
+        .checked_add(chunk_size)
+        .map(|end| end.min(snapshot.payload.len()))
+        .ok_or(PeerError::InvalidSnapshotChunk)?;
+    if offset >= end {
+        return Err(PeerError::InvalidSnapshotChunk);
+    }
+    Ok(proto::InstallSnapshotRequest {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        format_version: snapshot.format_version,
+        last_included_index: snapshot.last_included.index,
+        last_included_term: snapshot.last_included.term.0,
+        voter_ids: snapshot.voters.iter().map(|node| node.0).collect(),
+        snapshot_id: snapshot.digest.to_vec(),
+        offset: u64::try_from(offset).map_err(|_| PeerError::InvalidSnapshotChunk)?,
+        total_size: u64::try_from(snapshot.payload.len())
+            .map_err(|_| PeerError::SnapshotTooLarge)?,
+        chunk: snapshot.payload[offset..end].to_vec(),
+        done: end == snapshot.payload.len(),
+        sha256: snapshot.digest.to_vec(),
+    })
+}
+
+pub fn encode_snapshot_response(
+    cluster: ClusterId,
+    from: NodeId,
+    to: NodeId,
+    term: Term,
+    snapshot_id: [u8; 32],
+    next_offset: usize,
+    installed: bool,
+) -> Result<proto::InstallSnapshotResponse, PeerError> {
+    Ok(proto::InstallSnapshotResponse {
+        identity: Some(encode_rpc_identity(cluster, from, to, term)?),
+        snapshot_id: snapshot_id.to_vec(),
+        next_offset: u64::try_from(next_offset).map_err(|_| PeerError::InvalidSnapshotChunk)?,
+        installed,
+    })
 }
 
 pub fn encode_forward_command(
@@ -393,6 +542,12 @@ pub enum PeerError {
     ForwardingLoop,
     InvalidCommand,
     InvalidCommandResult,
+    UnsupportedSnapshotFormat(u32),
+    InvalidSnapshotPosition,
+    InvalidSnapshotVoters,
+    InvalidSnapshotDigest,
+    SnapshotTooLarge,
+    InvalidSnapshotChunk,
 }
 
 impl Display for PeerError {
@@ -494,6 +649,45 @@ mod tests {
                 .decode_forward_response(response)
                 .expect("decode response"),
             result
+        );
+    }
+
+    #[test]
+    fn snapshot_chunks_bind_identity_offsets_and_digest() {
+        let snapshot = Snapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            cluster_id: [4; 16],
+            last_included: LogPosition {
+                index: 9,
+                term: Term(3),
+            },
+            voters: vec![NodeId(1), NodeId(2)],
+            payload: vec![1, 2, 3, 4],
+            digest: [8; 32],
+        };
+        let encoded = encode_snapshot_chunk(
+            ClusterId([4; 16]),
+            NodeId(1),
+            NodeId(2),
+            Term(3),
+            &snapshot,
+            0,
+            2,
+        )
+        .expect("encode chunk");
+        let decoded = context()
+            .decode_snapshot_chunk(encoded.clone())
+            .expect("decode chunk");
+        assert_eq!(decoded.offset, 0);
+        assert_eq!(decoded.total_size, 4);
+        assert_eq!(decoded.bytes, vec![1, 2]);
+        assert!(!decoded.done);
+
+        let mut invalid = encoded;
+        invalid.done = true;
+        assert_eq!(
+            context().decode_snapshot_chunk(invalid),
+            Err(PeerError::InvalidSnapshotChunk)
         );
     }
 }

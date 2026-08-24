@@ -142,7 +142,9 @@ impl Worker {
                     pending.extend(batch.effects);
                 }
                 Effect::ResetElectionTimer | Effect::CommitIndexAdvanced(_) => {}
-                Effect::Send(_) => return Err(NodeError::UnexpectedNetworkEffect),
+                Effect::Send(_) | Effect::SendSnapshot { .. } => {
+                    return Err(NodeError::UnexpectedNetworkEffect);
+                }
                 Effect::PersistHardState(_) | Effect::PersistLog(_) => {
                     return Err(NodeError::LeakedPersistenceEffect);
                 }

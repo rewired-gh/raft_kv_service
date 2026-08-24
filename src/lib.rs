@@ -44,6 +44,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         heartbeat_interval: Duration::from_millis(config.raft.heartbeat_interval_ms),
         rpc_timeout: Duration::from_millis(config.raft.rpc_timeout_ms),
         max_clients: config.raft.max_clients,
+        snapshot_threshold_entries: config.raft.snapshot_threshold_entries,
         peer_endpoints: endpoints,
     })
     .map_err(anyhow::Error::msg)

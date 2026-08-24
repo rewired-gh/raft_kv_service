@@ -430,6 +430,7 @@ impl ClusterSimulator {
                     let continuation = self.core_mut(node)?.acknowledge_applied(last_index)?;
                     self.schedule_effects(node, continuation)?;
                 }
+                Effect::SendSnapshot { .. } => {}
             }
         }
         Ok(())

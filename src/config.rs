@@ -33,6 +33,7 @@ pub struct RaftConfig {
     pub heartbeat_interval_ms: u64,
     pub rpc_timeout_ms: u64,
     pub max_clients: u64,
+    pub snapshot_threshold_entries: u64,
 }
 
 impl Default for RaftConfig {
@@ -50,6 +51,7 @@ impl Default for RaftConfig {
             heartbeat_interval_ms: 100,
             rpc_timeout_ms: 250,
             max_clients: 10_000,
+            snapshot_threshold_entries: 10_000,
         }
     }
 }

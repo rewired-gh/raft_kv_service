@@ -6,6 +6,7 @@ service RaftPeer {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc ForwardCommand(ForwardCommandRequest) returns (ForwardCommandResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 message RpcIdentity {
@@ -65,4 +66,25 @@ message ForwardCommandRequest {
 message ForwardCommandResponse {
   RpcIdentity identity = 1;
   bytes result = 2;
+}
+
+message InstallSnapshotRequest {
+  RpcIdentity identity = 1;
+  uint32 format_version = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  repeated uint64 voter_ids = 5;
+  bytes snapshot_id = 6;
+  uint64 offset = 7;
+  uint64 total_size = 8;
+  bytes chunk = 9;
+  bool done = 10;
+  bytes sha256 = 11;
+}
+
+message InstallSnapshotResponse {
+  RpcIdentity identity = 1;
+  bytes snapshot_id = 2;
+  uint64 next_offset = 3;
+  bool installed = 4;
 }

@@ -6,7 +6,9 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use crate::storage::{AppendOutcome, AppliedEntry, RaftStorage, StateMachineStorage};
+use crate::storage::{
+    AppendOutcome, AppliedEntry, RaftStorage, Snapshot, SnapshotStorage, StateMachineStorage,
+};
 
 use super::{CoreError, Effect, EntryPayload, Event, LogMutation, NodeId, RaftCore, VoterSet};
 
@@ -61,6 +63,19 @@ pub struct AppliedBatch {
 }
 
 impl<S: RaftStorage> DurableRaft<S> {
+    pub fn observe_snapshot_leader(
+        &mut self,
+        sender: NodeId,
+        term: super::Term,
+    ) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let effects = self
+            .core
+            .observe_snapshot_leader(term, sender)
+            .map_err(RuntimeError::Core)?;
+        self.execute(effects)
+    }
+
     pub fn handle(&mut self, event: Event) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
         self.ensure_active()?;
         let effects = self.core.handle(event).map_err(RuntimeError::Core)?;
@@ -220,6 +235,101 @@ impl<S: StateMachineStorage> DurableRaft<S> {
     }
 }
 
+impl<S: SnapshotStorage> DurableRaft<S> {
+    pub fn recover_with_snapshot(
+        id: NodeId,
+        voters: VoterSet,
+        storage: S,
+    ) -> Result<Self, RuntimeError<S::Error>> {
+        let hard_state = storage.load_hard_state().map_err(RuntimeError::Storage)?;
+        let snapshot = storage.current_snapshot().map_err(RuntimeError::Storage)?;
+        let snapshot_position = snapshot
+            .as_ref()
+            .map_or(super::LogPosition::default(), |snapshot| {
+                snapshot.last_included
+            });
+        if let Some(snapshot) = &snapshot {
+            let configured = voters.members().collect::<Vec<_>>();
+            if snapshot.voters != configured {
+                return Err(RuntimeError::Core(CoreError::InvalidSnapshotPosition(
+                    snapshot.last_included,
+                )));
+            }
+        }
+        let start = snapshot_position
+            .index
+            .checked_add(1)
+            .ok_or(RuntimeError::Core(CoreError::IndexExhausted))?;
+        let log = storage
+            .entries_from(start, usize::MAX)
+            .map_err(RuntimeError::Storage)?;
+        let last_applied = storage.last_applied().map_err(RuntimeError::Storage)?;
+        let core = RaftCore::recover_compacted(
+            id,
+            voters,
+            hard_state,
+            snapshot_position,
+            log,
+            last_applied,
+        )
+        .map_err(RuntimeError::Core)?;
+        Ok(Self {
+            core,
+            storage,
+            failed: false,
+        })
+    }
+
+    pub fn create_snapshot(
+        &mut self,
+        cluster_id: [u8; 16],
+    ) -> Result<Snapshot, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let voters = self.core.voters().members().collect::<Vec<_>>();
+        let snapshot = self
+            .storage
+            .create_snapshot(cluster_id, &voters)
+            .map_err(RuntimeError::Storage)?;
+        self.core
+            .compact_through(snapshot.last_included)
+            .map_err(RuntimeError::Core)?;
+        Ok(snapshot)
+    }
+
+    pub fn install_snapshot(
+        &mut self,
+        sender: NodeId,
+        term: super::Term,
+        expected_cluster_id: [u8; 16],
+        snapshot: &Snapshot,
+    ) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        if snapshot.voters != self.core.voters().members().collect::<Vec<_>>() {
+            return Err(RuntimeError::Core(CoreError::InvalidSnapshotPosition(
+                snapshot.last_included,
+            )));
+        }
+        let external = self.observe_snapshot_leader(sender, term)?;
+        if let Err(error) = self.storage.install_snapshot(expected_cluster_id, snapshot) {
+            self.failed = true;
+            return Err(RuntimeError::Storage(error));
+        }
+        let start = snapshot
+            .last_included
+            .index
+            .checked_add(1)
+            .ok_or(RuntimeError::Core(CoreError::IndexExhausted))?;
+        let suffix = self
+            .storage
+            .entries_from(start, usize::MAX)
+            .map_err(RuntimeError::Storage)?;
+        self.core
+            .restore_snapshot(snapshot.last_included, suffix)
+            .map_err(RuntimeError::Core)?;
+        Ok(external)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -243,7 +353,8 @@ mod tests {
             Effect::Send(envelope) => Some(envelope),
             Effect::ResetElectionTimer
             | Effect::CommitIndexAdvanced(_)
-            | Effect::ApplyCommitted(_) => None,
+            | Effect::ApplyCommitted(_)
+            | Effect::SendSnapshot { .. } => None,
             Effect::PersistHardState(_) | Effect::PersistLog(_) => {
                 panic!("runtime leaked an internal persistence effect")
             }
@@ -402,5 +513,47 @@ mod tests {
         let recovered = DurableRaft::recover(NodeId(1), voters, storage).expect("recover");
         assert_eq!(recovered.core().last_applied(), 1);
         assert_eq!(recovered.core().commit_index(), 1);
+    }
+
+    #[test]
+    fn compacted_snapshot_recovers_as_the_virtual_log_prefix() {
+        let voters = VoterSet::new([NodeId(1)]).expect("voters");
+        let storage = SqliteStorage::open_in_memory().expect("storage");
+        let mut runtime = DurableRaft::recover_with_snapshot(NodeId(1), voters.clone(), storage)
+            .expect("recover");
+        let effects = runtime.handle(Event::ElectionTimeout).expect("elect");
+        let committed = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::ApplyCommitted(entries) => Some(entries),
+                _ => None,
+            })
+            .expect("one-node noop commits");
+        runtime
+            .apply_committed(&committed)
+            .expect("apply committed noop");
+        let snapshot = runtime.create_snapshot([1; 16]).expect("create snapshot");
+        assert_eq!(
+            snapshot.last_included,
+            LogPosition {
+                index: 1,
+                term: Term(1)
+            }
+        );
+        assert_eq!(runtime.core().snapshot_position(), snapshot.last_included);
+        assert!(
+            runtime
+                .storage()
+                .entry(1)
+                .expect("compacted entry")
+                .is_none()
+        );
+
+        let storage = runtime.into_storage();
+        let recovered = DurableRaft::recover_with_snapshot(NodeId(1), voters, storage)
+            .expect("recover compacted node");
+        assert_eq!(recovered.core().snapshot_position(), snapshot.last_included);
+        assert_eq!(recovered.core().last_log_position(), snapshot.last_included);
+        assert_eq!(recovered.core().last_applied(), 1);
     }
 }

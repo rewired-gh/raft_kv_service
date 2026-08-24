@@ -8,18 +8,22 @@ use std::{
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use sha2::{Digest, Sha256};
 
-use super::{AppendOutcome, AppliedEntry, RaftStorage, StateMachineStorage};
+use super::{
+    AppendOutcome, AppliedEntry, RaftStorage, SNAPSHOT_FORMAT_VERSION, Snapshot, SnapshotStorage,
+    StateMachineStorage,
+};
 use crate::{
     kv::{
         ClientId, Command, CommandError, CommandResult, Mutation, MutationResult, ReadResult,
         ValueRecord, decode_command, decode_command_result, decode_mutation_result,
-        encode_command_result, encode_mutation_result, fingerprint,
+        encode_command_result, encode_mutation_result, fingerprint, validate_key,
     },
     raft::{EntryPayload, HardState, LogEntry, LogPosition, NodeId, Term},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
 
@@ -28,6 +32,18 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    pub fn validate_snapshot_for_cluster(
+        &self,
+        expected_cluster_id: [u8; 16],
+        snapshot: &Snapshot,
+    ) -> Result<(), StorageError> {
+        if snapshot.cluster_id != expected_cluster_id {
+            return Err(StorageError::SnapshotClusterMismatch);
+        }
+        let _ = decode_snapshot(snapshot)?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::open_with_max_clients(path, DEFAULT_MAX_CLIENTS)
     }
@@ -112,6 +128,16 @@ impl SqliteStorage {
                 result BLOB
             ) STRICT;
 
+            CREATE TABLE IF NOT EXISTS raft_snapshot (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                format_version INTEGER NOT NULL,
+                cluster_id BLOB NOT NULL CHECK (length(cluster_id) = 16),
+                last_included_index BLOB NOT NULL CHECK (length(last_included_index) = 8),
+                last_included_term BLOB NOT NULL CHECK (length(last_included_term) = 8),
+                payload BLOB NOT NULL,
+                digest BLOB NOT NULL CHECK (length(digest) = 32)
+            ) STRICT;
+
             INSERT OR IGNORE INTO hard_state(singleton, current_term, voted_for)
             VALUES (1, X'0000000000000000', NULL);
             ",
@@ -125,7 +151,7 @@ impl SqliteStorage {
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match user_version {
-            0 | 1 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
+            0..=2 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
             SCHEMA_VERSION => {}
             found => {
                 return Err(StorageError::UnsupportedSchemaVersion {
@@ -157,15 +183,20 @@ impl SqliteStorage {
 
         self.load_hard_state()?;
         let (last_applied, _) = load_state_machine_meta(&self.connection)?;
+        let snapshot_position = load_snapshot(&self.connection)?
+            .map_or(LogPosition::default(), |snapshot| snapshot.last_included);
         let last_log = self.last_log_position()?.index;
-        if last_applied > last_log {
+        if last_applied < snapshot_position.index || last_applied > last_log {
             return Err(StorageError::AppliedBeyondLog {
                 last_applied,
                 last_log,
             });
         }
-        let mut expected_index = 1_u64;
-        for entry in self.entries_from(1, usize::MAX)? {
+        let mut expected_index = snapshot_position
+            .index
+            .checked_add(1)
+            .ok_or(StorageError::IndexExhausted)?;
+        for entry in self.entries_from(expected_index, usize::MAX)? {
             if entry.index != expected_index {
                 return Err(StorageError::NonContiguousLog {
                     expected: expected_index,
@@ -205,21 +236,7 @@ impl RaftStorage for SqliteStorage {
     }
 
     fn last_log_position(&self) -> Result<LogPosition, Self::Error> {
-        let entry = self
-            .connection
-            .query_row(
-                "SELECT log_index, term, entry_kind, payload
-                 FROM raft_log ORDER BY log_index DESC LIMIT 1",
-                [],
-                decode_entry,
-            )
-            .optional()?;
-        Ok(
-            entry.map_or_else(LogPosition::default, |entry| LogPosition {
-                index: entry.index,
-                term: entry.term,
-            }),
-        )
+        last_log_position(&self.connection)
     }
 
     fn entry(&self, index: u64) -> Result<Option<LogEntry>, Self::Error> {
@@ -396,6 +413,488 @@ impl StateMachineStorage for SqliteStorage {
     fn value(&self, key: &str) -> Result<Option<ValueRecord>, Self::Error> {
         load_value(&self.connection, key)
     }
+}
+
+impl SnapshotStorage for SqliteStorage {
+    fn current_snapshot(&self) -> Result<Option<Snapshot>, Self::Error> {
+        load_snapshot(&self.connection)
+    }
+
+    fn create_snapshot(
+        &mut self,
+        cluster_id: [u8; 16],
+        voters: &[NodeId],
+    ) -> Result<Snapshot, Self::Error> {
+        validate_voters(voters)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (last_applied, max_clients) = load_state_machine_meta(&transaction)?;
+        if last_applied == 0 {
+            return Err(StorageError::SnapshotAppliedEntryMissingTerm(0));
+        }
+        let last_included = LogPosition {
+            index: last_applied,
+            term: term_at(&transaction, last_applied)?
+                .ok_or(StorageError::SnapshotAppliedEntryMissingTerm(last_applied))?,
+        };
+        if let Some(current) = load_snapshot(&transaction)?
+            && current.last_included.index >= last_applied
+        {
+            return Ok(current);
+        }
+        let payload =
+            encode_snapshot_payload(&transaction, cluster_id, last_included, voters, max_clients)?;
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let snapshot = Snapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            cluster_id,
+            last_included,
+            voters: voters.to_vec(),
+            payload,
+            digest,
+        };
+        persist_snapshot(&transaction, &snapshot)?;
+        transaction.execute(
+            "DELETE FROM raft_log WHERE log_index <= ?1",
+            params![encode_u64(last_applied).as_slice()],
+        )?;
+        transaction.execute(
+            "DELETE FROM applied_results WHERE log_index <= ?1",
+            params![encode_u64(last_applied).as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    fn install_snapshot(
+        &mut self,
+        expected_cluster_id: [u8; 16],
+        snapshot: &Snapshot,
+    ) -> Result<(), Self::Error> {
+        self.validate_snapshot_for_cluster(expected_cluster_id, snapshot)?;
+        let decoded = decode_snapshot(snapshot)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (last_applied, configured_max_clients) = load_state_machine_meta(&transaction)?;
+        if snapshot.last_included.index < last_applied {
+            return Err(StorageError::OlderSnapshot {
+                received: snapshot.last_included.index,
+                applied: last_applied,
+            });
+        }
+        if decoded.max_clients != configured_max_clients {
+            return Err(StorageError::MaxClientsMismatch {
+                configured: configured_max_clients,
+                persisted: decoded.max_clients,
+            });
+        }
+        if let Some(current) = load_snapshot(&transaction)?
+            && current.last_included.index == snapshot.last_included.index
+        {
+            if current.digest == snapshot.digest {
+                return Ok(());
+            }
+            return Err(StorageError::SnapshotConflict(snapshot.last_included.index));
+        }
+
+        let retain_suffix = term_at(&transaction, snapshot.last_included.index)?
+            == Some(snapshot.last_included.term);
+        if retain_suffix {
+            transaction.execute(
+                "DELETE FROM raft_log WHERE log_index <= ?1",
+                params![encode_u64(snapshot.last_included.index).as_slice()],
+            )?;
+        } else {
+            transaction.execute("DELETE FROM raft_log", [])?;
+        }
+        transaction.execute("DELETE FROM kv_state", [])?;
+        transaction.execute("DELETE FROM client_sessions", [])?;
+        transaction.execute("DELETE FROM applied_results", [])?;
+        for row in decoded.keys {
+            transaction.execute(
+                "INSERT INTO kv_state(key, value, revision) VALUES (?1, ?2, ?3)",
+                params![row.key, row.value, encode_u64(row.revision).as_slice()],
+            )?;
+        }
+        for row in decoded.clients {
+            transaction.execute(
+                "INSERT INTO client_sessions(client_id, sequence, fingerprint, result)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    row.client_id.as_slice(),
+                    encode_u64(row.sequence).as_slice(),
+                    row.fingerprint.as_slice(),
+                    row.result,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE state_machine_meta SET last_applied = ?1 WHERE singleton = 1",
+            params![encode_u64(snapshot.last_included.index).as_slice()],
+        )?;
+        persist_snapshot(&transaction, snapshot)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotKey {
+    key: String,
+    value: Vec<u8>,
+    revision: u64,
+}
+
+#[derive(Debug)]
+struct SnapshotClient {
+    client_id: [u8; 16],
+    sequence: u64,
+    fingerprint: [u8; 32],
+    result: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DecodedSnapshot {
+    max_clients: u64,
+    keys: Vec<SnapshotKey>,
+    clients: Vec<SnapshotClient>,
+}
+
+const SNAPSHOT_MAGIC: &[u8; 8] = b"RKVSNP01";
+
+fn validate_voters(voters: &[NodeId]) -> Result<(), StorageError> {
+    if voters.is_empty()
+        || voters.iter().any(|node| node.0 == 0)
+        || voters.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(StorageError::InvalidSnapshotVoters);
+    }
+    Ok(())
+}
+
+fn encode_snapshot_payload(
+    connection: &Connection,
+    cluster_id: [u8; 16],
+    last_included: LogPosition,
+    voters: &[NodeId],
+    max_clients: u64,
+) -> Result<Vec<u8>, StorageError> {
+    let mut output = Vec::new();
+    output.extend_from_slice(SNAPSHOT_MAGIC);
+    put_u32(&mut output, SNAPSHOT_FORMAT_VERSION);
+    output.extend_from_slice(&cluster_id);
+    put_u64(&mut output, last_included.index);
+    put_u64(&mut output, last_included.term.0);
+    put_u64(
+        &mut output,
+        u64::try_from(voters.len()).map_err(|_| StorageError::SnapshotEncoding)?,
+    );
+    for voter in voters {
+        put_u64(&mut output, voter.0);
+    }
+    put_u64(&mut output, max_clients);
+
+    let mut statement =
+        connection.prepare("SELECT key, value, revision FROM kv_state ORDER BY key ASC")?;
+    let keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    put_u64(
+        &mut output,
+        u64::try_from(keys.len()).map_err(|_| StorageError::SnapshotEncoding)?,
+    );
+    for (key, value, revision) in keys {
+        put_bytes(&mut output, key.as_bytes())?;
+        put_bytes(&mut output, &value)?;
+        put_u64(&mut output, decode_u64("snapshot revision", &revision)?);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT client_id, sequence, fingerprint, result
+         FROM client_sessions ORDER BY client_id ASC",
+    )?;
+    let clients = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    put_u64(
+        &mut output,
+        u64::try_from(clients.len()).map_err(|_| StorageError::SnapshotEncoding)?,
+    );
+    for (client_id, sequence, fingerprint, result) in clients {
+        let client_id: [u8; 16] = client_id
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let fingerprint: [u8; 32] = fingerprint
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        output.extend_from_slice(&client_id);
+        put_u64(&mut output, decode_u64("snapshot sequence", &sequence)?);
+        output.extend_from_slice(&fingerprint);
+        put_bytes(&mut output, &result)?;
+    }
+    Ok(output)
+}
+
+fn decode_snapshot(snapshot: &Snapshot) -> Result<DecodedSnapshot, StorageError> {
+    if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(StorageError::UnsupportedSnapshotFormat(
+            snapshot.format_version,
+        ));
+    }
+    if Sha256::digest(&snapshot.payload).as_slice() != snapshot.digest {
+        return Err(StorageError::SnapshotDigestMismatch);
+    }
+    let mut input = SnapshotReader::new(&snapshot.payload);
+    if input.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
+        return Err(StorageError::SnapshotEncoding);
+    }
+    let format = input.u32()?;
+    let cluster_id: [u8; 16] = input
+        .take(16)?
+        .try_into()
+        .map_err(|_| StorageError::SnapshotEncoding)?;
+    let position = LogPosition {
+        index: input.u64()?,
+        term: Term(input.u64()?),
+    };
+    let voter_count = input.count()?;
+    let mut voters = Vec::new();
+    for _ in 0..voter_count {
+        voters.push(NodeId(input.u64()?));
+    }
+    validate_voters(&voters)?;
+    if format != snapshot.format_version
+        || cluster_id != snapshot.cluster_id
+        || position != snapshot.last_included
+        || voters != snapshot.voters
+        || position.index == 0
+        || position.term == Term(0)
+    {
+        return Err(StorageError::SnapshotEncoding);
+    }
+    let max_clients = input.u64()?;
+    let key_count = input.count()?;
+    let mut keys = Vec::new();
+    for _ in 0..key_count {
+        let key = String::from_utf8(input.bytes()?).map_err(|_| StorageError::SnapshotEncoding)?;
+        validate_key(&key).map_err(StorageError::Command)?;
+        let value = input.bytes()?;
+        let revision = input.u64()?;
+        if revision == 0 || revision > position.index {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        keys.push(SnapshotKey {
+            key,
+            value,
+            revision,
+        });
+    }
+    let client_count = input.count()?;
+    let mut clients = Vec::new();
+    for _ in 0..client_count {
+        let client_id = input
+            .take(16)?
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let sequence = input.u64()?;
+        let fingerprint = input
+            .take(32)?
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let result = input.bytes()?;
+        decode_mutation_result(&result).map_err(StorageError::Command)?;
+        if sequence == 0 {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        clients.push(SnapshotClient {
+            client_id,
+            sequence,
+            fingerprint,
+            result,
+        });
+    }
+    if !input.is_empty() || u64::try_from(clients.len()).unwrap_or(u64::MAX) > max_clients {
+        return Err(StorageError::SnapshotEncoding);
+    }
+    Ok(DecodedSnapshot {
+        max_clients,
+        keys,
+        clients,
+    })
+}
+
+fn persist_snapshot(connection: &Connection, snapshot: &Snapshot) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT OR REPLACE INTO raft_snapshot(
+             singleton, format_version, cluster_id, last_included_index,
+             last_included_term, payload, digest
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            i64::from(snapshot.format_version),
+            snapshot.cluster_id.as_slice(),
+            encode_u64(snapshot.last_included.index).as_slice(),
+            encode_u64(snapshot.last_included.term.0).as_slice(),
+            snapshot.payload,
+            snapshot.digest.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_snapshot(connection: &Connection) -> Result<Option<Snapshot>, StorageError> {
+    let row = connection
+        .query_row(
+            "SELECT format_version, cluster_id, last_included_index,
+                    last_included_term, payload, digest
+             FROM raft_snapshot WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(format, cluster_id, index, term, payload, digest)| {
+        let format_version = u32::try_from(format).map_err(|_| StorageError::SnapshotEncoding)?;
+        let cluster_id = cluster_id
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let digest = digest
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        let snapshot = Snapshot {
+            format_version,
+            cluster_id,
+            last_included: LogPosition {
+                index: decode_u64("snapshot index", &index)?,
+                term: Term(decode_u64("snapshot term", &term)?),
+            },
+            voters: Vec::new(),
+            payload,
+            digest,
+        };
+        let decoded_voters = decode_snapshot_voters(&snapshot)?;
+        let snapshot = Snapshot {
+            voters: decoded_voters,
+            ..snapshot
+        };
+        let _ = decode_snapshot(&snapshot)?;
+        Ok(snapshot)
+    })
+    .transpose()
+}
+
+fn decode_snapshot_voters(snapshot: &Snapshot) -> Result<Vec<NodeId>, StorageError> {
+    if Sha256::digest(&snapshot.payload).as_slice() != snapshot.digest {
+        return Err(StorageError::SnapshotDigestMismatch);
+    }
+    let mut input = SnapshotReader::new(&snapshot.payload);
+    if input.take(8)? != SNAPSHOT_MAGIC {
+        return Err(StorageError::SnapshotEncoding);
+    }
+    let _ = input.u32()?;
+    let _ = input.take(16)?;
+    let _ = input.u64()?;
+    let _ = input.u64()?;
+    let count = input.count()?;
+    let mut voters = Vec::new();
+    for _ in 0..count {
+        voters.push(NodeId(input.u64()?));
+    }
+    Ok(voters)
+}
+
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], StorageError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(StorageError::SnapshotEncoding)?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, StorageError> {
+        let bytes = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, StorageError> {
+        let bytes = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| StorageError::SnapshotEncoding)?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn count(&mut self) -> Result<u64, StorageError> {
+        let count = self.u64()?;
+        if count > u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        Ok(count)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, StorageError> {
+        let length = usize::try_from(self.u64()?).map_err(|_| StorageError::SnapshotEncoding)?;
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), StorageError> {
+    put_u64(
+        output,
+        u64::try_from(value.len()).map_err(|_| StorageError::SnapshotEncoding)?,
+    );
+    output.extend_from_slice(value);
+    Ok(())
 }
 
 fn apply_command(
@@ -695,12 +1194,13 @@ fn last_log_position(connection: &Connection) -> Result<LogPosition, StorageErro
             decode_entry,
         )
         .optional()?;
-    Ok(
-        entry.map_or_else(LogPosition::default, |entry| LogPosition {
+    if let Some(entry) = entry {
+        return Ok(LogPosition {
             index: entry.index,
             term: entry.term,
-        }),
-    )
+        });
+    }
+    Ok(load_snapshot_position(connection)?.unwrap_or_default())
 }
 
 fn term_at(connection: &Connection, index: u64) -> Result<Option<Term>, StorageError> {
@@ -714,9 +1214,38 @@ fn term_at(connection: &Connection, index: u64) -> Result<Option<Term>, StorageE
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()?;
-    term.as_deref()
+    let term = term
+        .as_deref()
         .map(|bytes| decode_u64("term", bytes).map(Term))
-        .transpose()
+        .transpose()?;
+    if term.is_some() {
+        return Ok(term);
+    }
+    Ok(load_snapshot_position(connection)?
+        .filter(|position| position.index == index)
+        .map(|position| position.term))
+}
+
+fn load_snapshot_position(connection: &Connection) -> Result<Option<LogPosition>, StorageError> {
+    let row = connection
+        .query_row(
+            "SELECT last_included_index, last_included_term
+             FROM raft_snapshot WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    row.map(|(index, term)| {
+        let position = LogPosition {
+            index: decode_u64("snapshot index", &index)?,
+            term: Term(decode_u64("snapshot term", &term)?),
+        };
+        if position.index == 0 || position.term == Term(0) {
+            return Err(StorageError::SnapshotEncoding);
+        }
+        Ok(position)
+    })
+    .transpose()
 }
 
 fn load_entry(connection: &Connection, index: u64) -> Result<Option<LogEntry>, StorageError> {
@@ -803,6 +1332,14 @@ pub enum StorageError {
     InvalidClientCount(i64),
     InvalidMaxClients(u64),
     MaxClientsMismatch { configured: u64, persisted: u64 },
+    UnsupportedSnapshotFormat(u32),
+    SnapshotDigestMismatch,
+    SnapshotClusterMismatch,
+    InvalidSnapshotVoters,
+    SnapshotAppliedEntryMissingTerm(u64),
+    OlderSnapshot { received: u64, applied: u64 },
+    SnapshotConflict(u64),
+    SnapshotEncoding,
     Command(CommandError),
     HardStateRegression { current: HardState, next: HardState },
     InvalidLogEntry { index: u64, term: Term },
@@ -853,6 +1390,24 @@ impl Display for StorageError {
                 formatter,
                 "configured maximum client count {configured} does not match persisted value {persisted}"
             ),
+            Self::UnsupportedSnapshotFormat(version) => {
+                write!(formatter, "unsupported snapshot format version {version}")
+            }
+            Self::SnapshotDigestMismatch => formatter.write_str("snapshot digest mismatch"),
+            Self::SnapshotClusterMismatch => formatter.write_str("snapshot cluster mismatch"),
+            Self::InvalidSnapshotVoters => formatter.write_str("invalid snapshot voter set"),
+            Self::SnapshotAppliedEntryMissingTerm(index) => write!(
+                formatter,
+                "cannot snapshot applied index {index} without its log term"
+            ),
+            Self::OlderSnapshot { received, applied } => write!(
+                formatter,
+                "snapshot index {received} is older than applied index {applied}"
+            ),
+            Self::SnapshotConflict(index) => {
+                write!(formatter, "conflicting snapshot at included index {index}")
+            }
+            Self::SnapshotEncoding => formatter.write_str("invalid snapshot encoding"),
             Self::Command(error) => Display::fmt(error, formatter),
             Self::HardStateRegression { current, next } => {
                 write!(
@@ -1237,5 +1792,113 @@ mod tests {
         ));
         SqliteStorage::open_with_max_clients(&path, 7).expect("matching capacity reopens");
         std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn snapshot_round_trip_compacts_and_restores_state_and_sessions() {
+        let mut source = SqliteStorage::open_in_memory().expect("source");
+        let entries = vec![
+            LogEntry {
+                index: 1,
+                term: Term(2),
+                payload: EntryPayload::Noop,
+            },
+            command_entry(
+                2,
+                1,
+                Mutation::Create {
+                    key: "snapshotted".into(),
+                    value: b"value".to_vec(),
+                },
+            ),
+        ];
+        for entry in &entries {
+            source.append_local(entry).expect("append source log");
+        }
+        source.apply_committed(&entries).expect("apply source log");
+
+        let snapshot = source
+            .create_snapshot([7; 16], &[NodeId(1), NodeId(2), NodeId(3)])
+            .expect("create snapshot");
+        assert_eq!(
+            snapshot.last_included,
+            LogPosition {
+                index: 2,
+                term: Term(1)
+            }
+        );
+        assert_eq!(
+            source.last_log_position().expect("virtual log base"),
+            snapshot.last_included
+        );
+        assert!(
+            source
+                .entries_from(1, 10)
+                .expect("compacted log")
+                .is_empty()
+        );
+        assert_eq!(
+            source.current_snapshot().expect("load snapshot"),
+            Some(snapshot.clone())
+        );
+
+        let mut target = SqliteStorage::open_in_memory().expect("target");
+        target
+            .install_snapshot([7; 16], &snapshot)
+            .expect("install snapshot");
+        target
+            .install_snapshot([7; 16], &snapshot)
+            .expect("duplicate install is idempotent");
+        assert_eq!(target.last_applied().expect("restored index"), 2);
+        assert_eq!(
+            target.value("snapshotted").expect("restored value"),
+            Some(ValueRecord {
+                value: b"value".to_vec(),
+                revision: 2,
+            })
+        );
+
+        let retry = command_entry(
+            3,
+            1,
+            Mutation::Create {
+                key: "snapshotted".into(),
+                value: b"value".to_vec(),
+            },
+        );
+        target.append_local(&retry).expect("append after snapshot");
+        assert_eq!(
+            target.apply_committed(&[retry]).expect("apply retry")[0].result,
+            Some(CommandResult::Mutation(MutationResult::Duplicate(
+                Box::new(MutationResult::Created { revision: 2 })
+            )))
+        );
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_wrong_cluster_and_corruption() {
+        let mut source = SqliteStorage::open_in_memory().expect("source");
+        let noop = LogEntry {
+            index: 1,
+            term: Term(1),
+            payload: EntryPayload::Noop,
+        };
+        source.append_local(&noop).expect("append");
+        source.apply_committed(&[noop]).expect("apply");
+        let snapshot = source
+            .create_snapshot([1; 16], &[NodeId(1)])
+            .expect("snapshot");
+        let mut target = SqliteStorage::open_in_memory().expect("target");
+        assert!(matches!(
+            target.install_snapshot([2; 16], &snapshot),
+            Err(StorageError::SnapshotClusterMismatch)
+        ));
+        let mut corrupt = snapshot;
+        corrupt.payload.push(0);
+        assert!(matches!(
+            target.install_snapshot([1; 16], &corrupt),
+            Err(StorageError::SnapshotDigestMismatch)
+        ));
+        assert_eq!(target.last_applied().expect("unchanged target"), 0);
     }
 }
