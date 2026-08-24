@@ -2,6 +2,9 @@
 set -euo pipefail
 
 readonly OUTPUT_ROOT="${RAFT_KV_FORMAL_OUTPUT:-target/formal-evidence/tlc}"
+readonly TLA_TOOLS_RELEASE="1.7.4"
+readonly TLC_VERSION="2.19"
+readonly TLC_REVISION="5a47802"
 readonly MATRIX=(
   formal/RaftElection.cfg
   formal/RaftElection.extended.cfg
@@ -22,7 +25,8 @@ checksum() {
 }
 
 mkdir -p "${OUTPUT_ROOT}"
-printf '{"schema_version":1,"tlc_version":"1.7.4","models":[' > "${OUTPUT_ROOT}/manifest.json"
+printf '{"schema_version":2,"tla_tools_release":"%s","tlc_version":"%s","tlc_revision":"%s","models":[' \
+  "${TLA_TOOLS_RELEASE}" "${TLC_VERSION}" "${TLC_REVISION}" > "${OUTPUT_ROOT}/manifest.json"
 separator=""
 
 for configuration in "${MATRIX[@]}"; do
@@ -38,8 +42,8 @@ for configuration in "${MATRIX[@]}"; do
   RAFT_KV_TLC_WORKERS="${RAFT_KV_TLC_WORKERS:-4}" \
     ./scripts/tlc.sh check "${configuration}" 2>&1 | tee "${log}"
   elapsed="$(( $(date +%s) - started ))"
-  generated="$(awk '/states generated/{value=$1} END{print value}' "${log}" | tr -d ',')"
-  distinct="$(awk '/distinct states found/{value=$1} END{print value}' "${log}" | tr -d ',')"
+  generated="$(awk '/states generated, .* distinct states found/{value=$1} END{print value}' "${log}" | tr -d ',')"
+  distinct="$(awk '/states generated, .* distinct states found/{value=$4} END{print value}' "${log}" | tr -d ',')"
   generated="${generated:-0}"
   distinct="${distinct:-0}"
   printf '%s{"configuration":"%s","model":"%s","configuration_sha256":"%s","model_sha256":"%s","generated_states":%s,"distinct_states":%s,"runtime_seconds":%s,"result":"pass"}' \

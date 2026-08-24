@@ -1,0 +1,44 @@
+schema_version = 1
+property_set = "m7-release-coverage"
+recorded_at = "2026-08-24T16:04:09+08:00"
+source_commit = "53e998bcbcee190345fadcda7e5e9f58bdc88583"
+result = "pass"
+command = "COVERAGE_REPORT=target/coverage-release-3.json COVERAGE_CAMPAIGN_ROOT=target/coverage-campaigns-release-3 make coverage"
+rust_toolchain = "nightly-2026-08-24"
+cargo_llvm_cov = "0.9.0"
+report_sha256 = "cd8fc286dcd2333cc2f0c2d931d9a50543a6648296ab95341465bbcaf424650b"
+
+[thresholds]
+overall_lines_percent = 80.0
+overall_branches_percent = 70.0
+critical_lines_percent = 90.0
+critical_branches_percent = 80.0
+
+[observed]
+overall_lines_percent = 88.38
+overall_branches_percent = 70.08
+critical_lines_percent = 92.32
+critical_branches_percent = 80.37
+
+[[campaign]]
+seed = 424242
+cluster_size = 3
+operations = 12
+result = "pass"
+campaign_sha256 = "bfeb52acb5875b2469098c91e143df825a68118c368e3e0bf67f998c64e4259c"
+
+[[campaign]]
+seed = 929292
+cluster_size = 5
+operations = 12
+result = "pass"
+campaign_sha256 = "7ff8b198cf1960d4adde3bcba2ad6a9e79bd98b81546012f953147fd2a016821"
+
+[scope]
+critical_files = [
+  "src/raft/election.rs",
+  "src/raft/log.rs",
+  "src/raft/runtime.rs",
+  "src/storage/sqlite.rs",
+]
+statement = "The report includes all targets, all features, real RPC cluster tests, abrupt-exit storage tests, and instrumented 3-node and 5-node process fault campaigns."
