@@ -1,10 +1,14 @@
 # Protocol trace contract
 
-The protocol trace schema is version `3`. `ProtocolTrace` contains an
+The protocol trace schema is version `4`. `ProtocolTrace` contains an
 ordered list of records with contiguous sequence numbers. Records identify an
 abstract Raft action, node, optional peer, term, log index, message kind, and
 boolean outcome. Command payloads, key/value data, addresses, and credentials
 are intentionally absent.
+
+Version 4 adds `pre_vote`, `pre_vote_response`, and `timeout_now`. Pre-Vote
+records deliberately allow a prospective term one step beyond durable hard
+state; RequestVote and TimeoutNow remain bound to durable current term.
 
 M4 adds snapshot publication, transfer start, transfer interruption, and
 atomic installation actions. M7 adds a mandatory terminal record to file

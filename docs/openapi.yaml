@@ -37,6 +37,32 @@ paths:
             application/openmetrics-text:
               schema: { type: string }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /operational/v1/leadership-transfer:
+    post:
+      operationId: transferLeadership
+      summary: Move leadership to a caught-up active voter
+      description: >-
+        The current leader first reaches a quiescent commit/apply boundary,
+        fences new proposals, catches the target up, and sends TimeoutNow.
+        A 200 response means the target was subsequently observed as leader;
+        timeout or loss of leadership never reports success.
+      security: [{ OperationalMtls: [], OperationalBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LeadershipTransferRequest' }
+      responses:
+        '200':
+          description: Target observed as the new leader
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadershipTransferResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/LeadershipTransferBusy' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '504': { $ref: '#/components/responses/LeadershipTransferTimeout' }
   /operational/v1/membership:
     get:
       operationId: getCommittedMembership
@@ -223,6 +249,19 @@ components:
           required: [commit_index]
           properties:
             commit_index: { type: integer, format: uint64, minimum: 1 }
+    LeadershipTransferRequest:
+      type: object
+      additionalProperties: false
+      required: [target_node_id]
+      properties:
+        target_node_id: { type: integer, format: uint64, minimum: 1 }
+    LeadershipTransferResult:
+      type: object
+      additionalProperties: false
+      required: [target_node_id, term]
+      properties:
+        target_node_id: { type: integer, format: uint64, minimum: 1 }
+        term: { type: integer, format: uint64, minimum: 1 }
     Configuration:
       type: object
       additionalProperties: false
@@ -243,13 +282,14 @@ components:
     NodeStatus:
       type: object
       additionalProperties: false
-      required: [cluster_id, node_id, role, term, commit_index, applied_index, snapshot_index, active_membership, committed_membership, replication, request_queue_depth, outbound_queue_depth, build_version, storage_schema_version, snapshot_format_version, peer_protocol_version]
+      required: [cluster_id, node_id, role, term, leader_id, leadership_transfer_target_id, commit_index, applied_index, snapshot_index, active_membership, committed_membership, replication, request_queue_depth, outbound_queue_depth, build_version, storage_schema_version, snapshot_format_version, peer_protocol_version]
       properties:
         cluster_id: { type: string, format: uuid }
         node_id: { type: integer, format: uint64, minimum: 1 }
-        role: { type: string, enum: [follower, candidate, leader] }
+        role: { type: string, enum: [follower, pre_candidate, candidate, leader] }
         term: { type: integer, format: uint64, minimum: 0 }
         leader_id: { type: [integer, 'null'], format: uint64, minimum: 1 }
+        leadership_transfer_target_id: { type: [integer, 'null'], format: uint64, minimum: 1 }
         commit_index: { type: integer, format: uint64, minimum: 0 }
         applied_index: { type: integer, format: uint64, minimum: 0 }
         snapshot_index: { type: integer, format: uint64, minimum: 0 }
@@ -278,6 +318,12 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     MembershipConflict:
       description: Operation ID conflict or another change is in progress
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    LeadershipTransferBusy:
+      description: Leader is not at a safe boundary or another operation is active
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    LeadershipTransferTimeout:
+      description: Target did not establish leadership before the bounded deadline
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     InvalidRequest:
       description: Invalid syntax, key, identity, sequence, or conditional headers

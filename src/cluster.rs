@@ -59,6 +59,7 @@ pub struct NodeDiagnostics {
     pub role: Role,
     pub term: Term,
     pub leader: Option<NodeId>,
+    pub leadership_transfer_target: Option<NodeId>,
     pub commit_index: u64,
     pub applied_index: u64,
     pub last_log_index: u64,
@@ -501,7 +502,7 @@ impl StaticNodeHandle {
             .map_err(|_| Status::unavailable("Raft worker stopped"))?
     }
 
-    async fn call_one_way(&self, envelope: Envelope) -> Result<(), Status> {
+    async fn call_one_way(&self, envelope: Envelope) -> Result<bool, Status> {
         let (respond, response) = oneshot::channel();
         self.enqueue(NodeRequest::PeerOneWay { envelope, respond })
             .map_err(|error| match error {
@@ -750,7 +751,7 @@ enum NodeRequest {
     PeerResponse(Envelope),
     PeerOneWay {
         envelope: Envelope,
-        respond: oneshot::Sender<Result<(), Status>>,
+        respond: oneshot::Sender<Result<bool, Status>>,
     },
     Status {
         respond: oneshot::Sender<(Option<NodeId>, Term)>,
@@ -853,6 +854,7 @@ impl NodeWorker {
 
     fn bootstrap(&mut self) -> Result<(), String> {
         if self.config.voters.len() == 1 {
+            self.metrics.pre_vote_campaign();
             let was_leader = self.raft.core().role() == Role::Leader;
             let effects = self
                 .raft
@@ -860,6 +862,9 @@ impl NodeWorker {
                 .map_err(|error| error.to_string())?;
             self.process(effects, None)?;
             self.refresh_leader_deadlines(was_leader);
+            if self.raft.core().role() == Role::Leader {
+                self.metrics.pre_vote_won();
+            }
         }
         Ok(())
     }
@@ -877,7 +882,11 @@ impl NodeWorker {
                 }
                 deadline
             } else {
-                self.election_deadline
+                self.pending_transfer
+                    .as_ref()
+                    .map_or(self.election_deadline, |transfer| {
+                        self.election_deadline.min(transfer.deadline)
+                    })
             };
             match self
                 .receiver
@@ -928,19 +937,40 @@ impl NodeWorker {
                 ) {
                     self.metrics.retried();
                 }
-                let was_leader = self.raft.core().role() == Role::Leader;
+                let previous_role = self.raft.core().role();
+                let was_leader = previous_role == Role::Leader;
                 let effects = self
                     .raft
                     .handle(Event::Receive(envelope))
                     .map_err(|error| error.to_string())?;
                 self.process(effects, None)?;
                 self.refresh_leader_deadlines(was_leader);
+                if previous_role == Role::PreCandidate && self.raft.core().role() == Role::Leader {
+                    self.metrics.pre_vote_won();
+                }
                 self.maybe_start_joint()?;
                 self.fail_pending_after_stepdown(was_leader);
                 self.complete_or_fail_transfer();
                 Ok(())
             }
             NodeRequest::PeerOneWay { envelope, respond } => {
+                let accepted = matches!(
+                    envelope.message,
+                    Message::TimeoutNow {
+                        term,
+                        leader,
+                        fence_index,
+                    } if envelope.from == leader
+                        && term == self.raft.core().hard_state().current_term
+                        && self.raft.core().leader() == Some(leader)
+                        && self.raft.core().role() != Role::Leader
+                        && self.raft.core().voter_ids().contains(&self.config.node_id)
+                        && self.raft.core().last_log_position().index >= fence_index
+                );
+                if !accepted {
+                    let _ = respond.send(Ok(false));
+                    return Ok(());
+                }
                 let was_leader = self.raft.core().role() == Role::Leader;
                 let effects = self
                     .raft
@@ -948,7 +978,7 @@ impl NodeWorker {
                     .map_err(|error| error.to_string())?;
                 self.process(effects, None)?;
                 self.refresh_leader_deadlines(was_leader);
-                let _ = respond.send(Ok(()));
+                let _ = respond.send(Ok(true));
                 Ok(())
             }
             NodeRequest::Status { respond } => {
@@ -1085,6 +1115,7 @@ impl NodeWorker {
             role: self.raft.core().role(),
             term: self.raft.core().hard_state().current_term,
             leader: self.raft.core().leader(),
+            leadership_transfer_target: self.raft.core().leadership_transfer_target(),
             commit_index: self.raft.core().commit_index(),
             applied_index: self.raft.core().last_applied(),
             last_log_index: self.raft.core().last_log_position().index,
@@ -1339,25 +1370,27 @@ impl NodeWorker {
         let _election_timer =
             (self.raft.core().role() != Role::Leader).then(|| self.metrics.time_election());
         let now = Instant::now();
+        if self
+            .pending_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.deadline <= now)
+        {
+            if self.raft.core().role() == Role::Leader && !self.raft.core().persistence_pending() {
+                let abort = self
+                    .raft
+                    .handle(Event::AbortLeadershipTransfer)
+                    .map_err(|error| error.to_string())?;
+                self.process(abort, None)?;
+            }
+            if let Some(transfer) = self.pending_transfer.take() {
+                self.metrics.leadership_transfer_timed_out();
+                let _ = transfer
+                    .respond
+                    .send(Err(LeadershipTransferError::TimedOut));
+            }
+        }
         let effects = if self.raft.core().role() == Role::Leader {
             let mut effects = Vec::new();
-            if self
-                .pending_transfer
-                .as_ref()
-                .is_some_and(|transfer| transfer.deadline <= now)
-            {
-                effects.extend(
-                    self.raft
-                        .handle(Event::AbortLeadershipTransfer)
-                        .map_err(|error| error.to_string())?,
-                );
-                if let Some(transfer) = self.pending_transfer.take() {
-                    self.metrics.leadership_transfer_timed_out();
-                    let _ = transfer
-                        .respond
-                        .send(Err(LeadershipTransferError::TimedOut));
-                }
-            }
             if self.config.check_quorum && self.quorum_deadline <= now {
                 let was_leader = self.raft.core().role() == Role::Leader;
                 effects.extend(
@@ -1377,6 +1410,7 @@ impl NodeWorker {
             effects
         } else {
             self.metrics.election();
+            self.metrics.pre_vote_campaign();
             self.election_deadline = Instant::now() + random_election_timeout(&self.config);
             self.raft
                 .handle(Event::ElectionTimeout)
@@ -1384,6 +1418,9 @@ impl NodeWorker {
         };
         self.process(effects, None)?;
         self.refresh_leader_deadlines(was_leader);
+        if !was_leader && self.raft.core().role() == Role::Leader {
+            self.metrics.pre_vote_won();
+        }
         self.complete_or_fail_transfer();
         Ok(())
     }
@@ -1527,7 +1564,10 @@ impl NodeWorker {
                 target: transfer.target,
                 term: self.raft.core().hard_state().current_term,
             }));
-        } else if self.raft.core().leadership_transfer_target().is_none() {
+        } else if self.raft.core().leader().is_some()
+            || (self.raft.core().role() == Role::Leader
+                && self.raft.core().leadership_transfer_target().is_none())
+        {
             self.metrics.leadership_transfer_failed();
             let _ = transfer
                 .respond
@@ -1983,7 +2023,7 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
             _ => return Err(Status::internal("decoded wrong TimeoutNow message kind")),
         };
         self.authorize_sender(sender, fingerprint).await?;
-        let accepted = self.handle.call_one_way(envelope).await.is_ok();
+        let accepted = self.handle.call_one_way(envelope).await.unwrap_or(false);
         encode_timeout_now_response(
             self.context.cluster_id,
             self.context.replicated_limits,
@@ -2842,6 +2882,28 @@ mod tests {
                     >= revision
             );
         }
+        let transfer_target_index = (leader_index + 1) % 2;
+        let transfer = tokio::time::timeout(
+            Duration::from_secs(2),
+            handles[leader_index].transfer_leadership(NodeId(
+                u64::try_from(transfer_target_index + 1).expect("target node id"),
+            )),
+        )
+        .await
+        .expect("leadership transfer is bounded")
+        .expect("caught-up voter establishes leadership");
+        assert_eq!(
+            transfer.target,
+            NodeId(u64::try_from(transfer_target_index + 1).expect("target node id"))
+        );
+        assert_eq!(
+            handles[transfer_target_index]
+                .diagnostics()
+                .await
+                .expect("new leader diagnostics")
+                .role,
+            Role::Leader
+        );
         for shutdown in shutdowns {
             let _ = shutdown.send(());
         }

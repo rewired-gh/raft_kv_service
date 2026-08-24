@@ -381,11 +381,17 @@ removed fields. Incompatible peer protocol versions MUST fail explicitly.
 
 ### 10.1 Roles and terms
 
-A node is exactly one of follower, candidate, or leader in each term.
+A node is exactly one of follower, pre-candidate, candidate, or leader. A
+pre-candidate is a volatile campaign state and has not entered its prospective
+term.
 
 - Terms increase monotonically.
-- On election timeout, an eligible follower increments and persists its term
-  and self-vote before requesting votes as a candidate.
+- On election timeout, an eligible node first requests Pre-Votes for the next
+  term without modifying hard state. Only a Pre-Vote quorum may begin the real
+  election, which persists the new term and self-vote before RequestVote.
+- A node with a known current-term leader does not grant Pre-Vote. Pre-Vote
+  requests and responses neither reset election timers nor make future terms
+  durable. Stable and joint configurations use their normal quorum rules.
 - A candidate becomes leader only after receiving the election quorum required
   by its active configuration, then sends AppendEntries promptly.
 - Discovering a higher term causes a node to persist that term and become a
@@ -403,6 +409,24 @@ A node is exactly one of follower, candidate, or leader in each term.
   traffic MUST NOT suppress elections indefinitely.
 - Term and index representations MUST detect exhaustion and fail safely rather
   than wrap.
+
+### 10.1.1 Leader availability and controlled transfer
+
+- With CheckQuorum enabled, a leader counts structurally valid current-term
+  responses from active voters during each election-timeout window. Rejection
+  still proves activity; stale, staging, or unknown responses do not.
+- A stable configuration needs its majority; a joint configuration needs
+  separate old and new majorities. A leader that misses the required quorum
+  steps down in the same term and fails pending work. This is failure detection,
+  not a read lease or proof that a read is linearizable.
+- Leadership transfer accepts only another active voter in a stable
+  configuration. The leader reaches a committed/applied boundary, fences new
+  proposals, catches the target through normal replication, then sends exactly
+  one term- and log-fence-bound TimeoutNow.
+- TimeoutNow does not grant leadership. The target validates the sender,
+  current leader, term, membership, and local fence, then starts an ordinary
+  durable election. The old leader remains leader until protocol evidence makes
+  it step down; timeout, term change, or membership change aborts the transfer.
 
 ### 10.2 Log replication
 

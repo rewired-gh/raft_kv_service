@@ -30,7 +30,8 @@ Rust 执行的数学证明。
 
 ## 与众不同的地方
 
-- **不使用现成 Raft 库**：选举、日志复制、持久化屏障、快照和联合共识均自行实现。
+- **不使用现成 Raft 库**：Pre-Vote、CheckQuorum、可控领导权转移、日志复制、持久化
+  屏障、快照和联合共识均自行实现。
 - **规范先行且证据闭环**：已接受的 1.0 规范与 M0–M7 需求，通过 `verification/`
   映射到代码、模型、测试和证据；另有测试防止清单悄悄失效。
 - **有限但诚实的形式化验证**：TLA+/TLC 覆盖选举、日志、CRUD、快照、成员变更与公平
@@ -53,6 +54,8 @@ Rust 执行的数学证明。
 - 静态 1/3/5 节点部署与 leader 转发；
 - 持久化日志、崩溃恢复、逻辑快照与落后 follower 安装快照；
 - staging 节点及 Raft joint consensus 动态成员变更；
+- Pre-Vote 防止分区恢复节点无谓抬高任期，CheckQuorum 让失去多数派的 leader 主动退位；
+- 经过追平、写入隔离和超时保护的领导权转移；
 - 基于 client ID 与单调 sequence 的持久化去重；
 - 结构化日志、运行状态、指标、TLS/mTLS 和兼容性拒绝规则。
 
@@ -99,6 +102,9 @@ listener 位于 `:8181`、`:8182`、`:8183`；peer gRPC 只在 Compose 私有网
 docker compose restart node2              # 保留数据并重启
 curl -H 'Authorization: Bearer local-development-only' \
   http://localhost:8181/operational/v1/status
+curl -X POST -H 'Authorization: Bearer local-development-only' \
+  -H 'Content-Type: application/json' -d '{"target_node_id":2}' \
+  http://localhost:8181/operational/v1/leadership-transfer
 make reset-local NODE=node2 CONFIRM=yes   # 显式销毁 node2 本地卷
 ```
 

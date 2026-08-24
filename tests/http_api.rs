@@ -50,6 +50,7 @@ fn diagnostics() -> NodeDiagnostics {
         role: Role::Leader,
         term: Term(3),
         leader: Some(NodeId(1)),
+        leadership_transfer_target: None,
         commit_index: 9,
         applied_index: 9,
         last_log_index: 9,

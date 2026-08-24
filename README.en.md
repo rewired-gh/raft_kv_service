@@ -34,8 +34,9 @@ of every Rust execution.
 
 ## What makes it different
 
-- **Raft is implemented here:** no consensus library; election, replication,
-  durability barriers, snapshots, and joint consensus are repository code.
+- **Raft is implemented here:** no consensus library; Pre-Vote, CheckQuorum,
+  controlled leadership transfer, replication, durability barriers, snapshots,
+  and joint consensus are repository code.
 - **Specification-to-evidence closure:** specification 1.0 and M0–M7 map to
   code, models, tests, and recorded evidence under `verification/`.
 - **Rigorous but bounded formal verification:** TLA+/TLC covers election, log,
@@ -59,6 +60,10 @@ The service provides one linearizable CRUD namespace with durable client
 deduplication, 1/3/5-node deployments, follower forwarding, crash recovery,
 logical snapshots, lagging-follower installation, staging, and joint-consensus
 membership changes.
+
+Election hardening includes non-disruptive Pre-Vote, quorum-loss leader
+stepdown, and a bounded leadership-transfer API that reports success only after
+the target is observed as leader.
 
 It intentionally excludes multi-key transactions, scans, watches, TTLs,
 sharding/Multi-Raft, Byzantine tolerance, and recovery after permanent quorum
