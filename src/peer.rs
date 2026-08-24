@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub const PEER_PROTOCOL_VERSION: u32 = 2;
+pub const MAX_PEER_MESSAGE_BYTES: usize = 6 * 1024 * 1024;
 pub type ForwardMembershipOperation = Option<([u8; 16], ClusterConfiguration)>;
 
 pub mod proto {
@@ -39,7 +40,7 @@ pub struct PeerLimits {
 impl Default for PeerLimits {
     fn default() -> Self {
         Self {
-            max_entries_per_append: 256,
+            max_entries_per_append: crate::raft::MAX_ENTRIES_PER_APPEND,
             // The client value limit plus room for the canonical command envelope.
             max_command_bytes: 1024 * 1024 + 1024,
             max_snapshot_bytes: 256 * 1024 * 1024,

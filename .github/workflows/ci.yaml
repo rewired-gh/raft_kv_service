@@ -37,16 +37,62 @@ jobs:
           java-version: "25"
       - run: make formal
 
+  supply-chain:
+    name: Dependency, license, and secret policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo audit
+      - run: cargo deny check
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   image:
     name: Production image
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Build scan image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          push: false
+          load: true
+          target: runtime
+          tags: raft-kv-service:ci
+          cache-from: type=gha
+      - name: Scan image for fixed high and critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: raft-kv-service:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: false
           target: runtime
+          platforms: linux/amd64,linux/arm64
+          tags: raft-kv-service:${{ github.sha }}
+          outputs: type=oci,dest=/tmp/raft-kv-service.oci.tar
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: raft-kv-service-oci-${{ github.sha }}
+          path: /tmp/raft-kv-service.oci.tar
+          archive: false
+          retention-days: 14

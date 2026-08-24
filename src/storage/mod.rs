@@ -22,7 +22,7 @@ pub struct Snapshot {
     pub digest: [u8; 32],
 }
 
-pub use sqlite::SqliteStorage;
+pub use sqlite::{STORAGE_SCHEMA_VERSION, SqliteStorage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendOutcome {

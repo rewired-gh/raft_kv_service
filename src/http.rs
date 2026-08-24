@@ -22,7 +22,7 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
-use tower::ServiceBuilder;
+use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
 use tower_http::{
     catch_panic::CatchPanicLayer,
     limit::RequestBodyLimitLayer,
@@ -34,19 +34,20 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::kv::{
-    ClientId, Command, CommandResult, Mutation, MutationCommand, MutationResult, ReadResult,
-    validate_key,
+    ClientId, Command, CommandResult, MAX_VALUE_BYTES, Mutation, MutationCommand, MutationResult,
+    ReadResult, validate_key,
 };
 use crate::{
-    cluster::{MembershipError, MembershipView},
-    raft::ClusterConfiguration,
+    cluster::{MembershipError, MembershipView, NodeDiagnostics},
+    metrics::{Metrics, RaftMetricsSnapshot},
+    raft::{ClusterConfiguration, ConfigurationPhase, Role},
 };
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CLIENT_ID_HEADER: &str = "raft-kv-client-id";
 const REQUEST_SEQUENCE_HEADER: &str = "raft-kv-request-sequence";
 const REVISION_HEADER: &str = "raft-kv-revision";
-const MAX_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_HTTP_REQUESTS: usize = 256;
 
 type ExecutionFuture = Pin<Box<dyn Future<Output = Result<CommandResult, ServiceError>> + Send>>;
 type Executor = Arc<dyn Fn(Command) -> ExecutionFuture + Send + Sync>;
@@ -55,6 +56,9 @@ type MembershipFuture =
 type MembershipChanger =
     Arc<dyn Fn([u8; 16], ClusterConfiguration) -> MembershipFuture + Send + Sync>;
 type MembershipReader = Arc<dyn Fn() -> MembershipFuture + Send + Sync>;
+type DiagnosticsFuture =
+    Pin<Box<dyn Future<Output = Result<NodeDiagnostics, MembershipError>> + Send>>;
+type DiagnosticsReader = Arc<dyn Fn() -> DiagnosticsFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -64,6 +68,8 @@ pub struct AppState {
     membership_changer: Option<MembershipChanger>,
     membership_reader: Option<MembershipReader>,
     operational_token: Option<Arc<str>>,
+    diagnostics_reader: Option<DiagnosticsReader>,
+    metrics: Metrics,
 }
 
 impl AppState {
@@ -75,7 +81,23 @@ impl AppState {
             membership_changer: None,
             membership_reader: None,
             operational_token: None,
+            diagnostics_reader: None,
+            metrics: Metrics::new(),
         }
+    }
+
+    pub fn with_diagnostics<R, Fut>(mut self, reader: R) -> Self
+    where
+        R: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<NodeDiagnostics, MembershipError>> + Send + 'static,
+    {
+        self.diagnostics_reader = Some(Arc::new(move || Box::pin(reader())));
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     pub fn with_membership<C, CFut, R, RFut>(
@@ -125,32 +147,74 @@ pub enum ServiceError {
 }
 
 pub fn router(state: AppState, request_timeout: Duration) -> Router {
+    with_middleware(
+        Router::new()
+            .route("/health/live", get(liveness))
+            .route("/health/ready", get(readiness))
+            .route("/v1/keys/{key}", get(read).put(put_key).delete(delete_key))
+            .route(
+                "/operational/v1/membership",
+                get(get_membership).put(put_membership),
+            )
+            .route("/operational/v1/status", get(get_status))
+            .route("/metrics", get(get_metrics))
+            .fallback(not_found)
+            .with_state(state),
+        request_timeout,
+    )
+}
+
+pub fn client_router(state: AppState, request_timeout: Duration) -> Router {
+    with_middleware(
+        Router::new()
+            .route("/health/live", get(liveness))
+            .route("/health/ready", get(readiness))
+            .route("/v1/keys/{key}", get(read).put(put_key).delete(delete_key))
+            .fallback(not_found)
+            .with_state(state),
+        request_timeout,
+    )
+}
+
+pub fn operational_router(state: AppState, request_timeout: Duration) -> Router {
+    with_middleware(
+        Router::new()
+            .route("/health/live", get(liveness))
+            .route("/health/ready", get(readiness))
+            .route(
+                "/operational/v1/membership",
+                get(get_membership).put(put_membership),
+            )
+            .route("/operational/v1/status", get(get_status))
+            .route("/metrics", get(get_metrics))
+            .fallback(not_found)
+            .with_state(state),
+        request_timeout,
+    )
+}
+
+fn with_middleware(router: Router, request_timeout: Duration) -> Router {
     let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
     let middleware = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::info_span!("http.request", method = %request.method())
+            },
+        ))
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
             AUTHORIZATION,
         )))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(CatchPanicLayer::new())
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_HTTP_REQUESTS))
         .layer(RequestBodyLimitLayer::new(MAX_VALUE_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ));
 
-    Router::new()
-        .route("/health/live", get(liveness))
-        .route("/health/ready", get(readiness))
-        .route("/v1/keys/{key}", get(read).put(put_key).delete(delete_key))
-        .route(
-            "/operational/v1/membership",
-            get(get_membership).put(put_membership),
-        )
-        .fallback(not_found)
-        .with_state(state)
-        .layer(middleware)
+    router.layer(middleware)
 }
 
 #[derive(Deserialize)]
@@ -174,7 +238,168 @@ struct MembershipResponseBody {
     commit_index: u64,
 }
 
+#[derive(Serialize)]
+struct ConfigurationBody {
+    phase: &'static str,
+    operation_id: Uuid,
+    old: Vec<MemberBody>,
+    new: Vec<MemberBody>,
+}
+
+#[derive(Serialize)]
+struct ReplicationBody {
+    node_id: u64,
+    next_index: u64,
+    match_index: u64,
+}
+
+#[derive(Serialize)]
+struct StatusBody {
+    cluster_id: Uuid,
+    node_id: u64,
+    role: &'static str,
+    term: u64,
+    leader_id: Option<u64>,
+    commit_index: u64,
+    applied_index: u64,
+    snapshot_index: u64,
+    active_membership: ConfigurationBody,
+    committed_membership: ConfigurationBody,
+    replication: Vec<ReplicationBody>,
+    request_queue_depth: usize,
+    outbound_queue_depth: usize,
+    build_version: &'static str,
+    storage_schema_version: u32,
+    snapshot_format_version: u32,
+    peer_protocol_version: u32,
+}
+
+async fn get_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _request_timer = state.metrics.http_request();
+    let request_id = request_id(&headers);
+    if !operational_authorized(&state, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "operational-unauthorized",
+            "Unauthorized",
+            "a valid operational bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    let Some(reader) = &state.diagnostics_reader else {
+        return service_problem(ServiceError::Unavailable, request_id).into_response();
+    };
+    match reader().await {
+        Ok(status) => {
+            update_metrics(&state.metrics, &status);
+            Json(status_body(status)).into_response()
+        }
+        Err(error) => membership_response(Err(error), request_id),
+    }
+}
+
+async fn get_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _request_timer = state.metrics.http_request();
+    let request_id = request_id(&headers);
+    if !operational_authorized(&state, &headers) {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "operational-unauthorized",
+            "Unauthorized",
+            "a valid operational bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    if let Some(reader) = &state.diagnostics_reader
+        && let Ok(status) = reader().await
+    {
+        update_metrics(&state.metrics, &status);
+    }
+    match state.metrics.render() {
+        Ok(body) => (
+            [(CONTENT_TYPE, "application/openmetrics-text; version=1.0.0")],
+            body,
+        )
+            .into_response(),
+        Err(_) => internal_problem(request_id).into_response(),
+    }
+}
+
+fn status_body(status: NodeDiagnostics) -> StatusBody {
+    StatusBody {
+        cluster_id: Uuid::from_bytes(status.cluster_id),
+        node_id: status.node_id.0,
+        role: match status.role {
+            Role::Follower => "follower",
+            Role::Candidate => "candidate",
+            Role::Leader => "leader",
+        },
+        term: status.term.0,
+        leader_id: status.leader.map(|node| node.0),
+        commit_index: status.commit_index,
+        applied_index: status.applied_index,
+        snapshot_index: status.snapshot_index,
+        active_membership: configuration_body(&status.active_membership),
+        committed_membership: configuration_body(&status.committed_membership),
+        replication: status
+            .replication
+            .into_iter()
+            .map(|(node, progress)| ReplicationBody {
+                node_id: node.0,
+                next_index: progress.next_index,
+                match_index: progress.match_index,
+            })
+            .collect(),
+        request_queue_depth: status.request_queue_depth,
+        outbound_queue_depth: status.outbound_queue_depth,
+        build_version: env!("CARGO_PKG_VERSION"),
+        storage_schema_version: crate::storage::STORAGE_SCHEMA_VERSION,
+        snapshot_format_version: crate::storage::SNAPSHOT_FORMAT_VERSION,
+        peer_protocol_version: crate::peer::PEER_PROTOCOL_VERSION,
+    }
+}
+
+fn configuration_body(membership: &crate::raft::MembershipEntry) -> ConfigurationBody {
+    let members = |configuration: &ClusterConfiguration| {
+        configuration
+            .members()
+            .map(|(node_id, peer_endpoint)| MemberBody {
+                node_id,
+                peer_endpoint: peer_endpoint.to_owned(),
+            })
+            .collect()
+    };
+    ConfigurationBody {
+        phase: match membership.phase {
+            ConfigurationPhase::Joint => "joint",
+            ConfigurationPhase::Stable => "stable",
+        },
+        operation_id: Uuid::from_bytes(membership.operation_id),
+        old: members(&membership.old),
+        new: members(&membership.new),
+    }
+}
+
+fn update_metrics(metrics: &Metrics, status: &NodeDiagnostics) {
+    metrics.update_raft(&RaftMetricsSnapshot {
+        role: match status.role {
+            Role::Follower => 0,
+            Role::Candidate => 1,
+            Role::Leader => 2,
+        },
+        term: status.term.0,
+        commit: status.commit_index,
+        applied: status.applied_index,
+        snapshot: status.snapshot_index,
+        request_queue: status.request_queue_depth,
+        outbound_queue: status.outbound_queue_depth,
+    });
+}
+
 async fn get_membership(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
     if !operational_authorized(&state, &headers) {
         return problem(
@@ -197,6 +422,7 @@ async fn put_membership(
     headers: HeaderMap,
     Json(body): Json<MembershipRequestBody>,
 ) -> Response {
+    let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
     if !operational_authorized(&state, &headers) {
         return problem(
@@ -321,10 +547,12 @@ fn membership_response(
 }
 
 async fn liveness(State(state): State<AppState>) -> Json<Health> {
+    let _request_timer = state.metrics.http_request();
     Json(Health::up(state.service_name.to_string()))
 }
 
 async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
+    let _request_timer = state.metrics.http_request();
     if state.ready.load(Ordering::Acquire) {
         (
             StatusCode::OK,
@@ -344,6 +572,7 @@ async fn put_key(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
     if let Err(problem) = validate_http_key(&key, &request_id) {
         return problem.into_response();
@@ -396,6 +625,7 @@ async fn delete_key(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
     if let Err(problem) = validate_http_key(&key, &request_id) {
         return problem.into_response();
@@ -429,6 +659,7 @@ async fn read(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let _request_timer = state.metrics.http_request();
     let request_id = request_id(&headers);
     if let Err(problem) = validate_http_key(&key, &request_id) {
         return problem.into_response();

@@ -10,6 +10,8 @@ mod runtime;
 pub mod simulator;
 mod trace;
 
+pub const MAX_ENTRIES_PER_APPEND: usize = 4;
+
 pub use election::{
     CoreError, Effect, Envelope, Event, HardState, LogMutation, LogPosition, Message, NodeId,
     RaftCore, ReplicationProgress, Role, Term, VoterSet,

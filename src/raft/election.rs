@@ -1236,7 +1236,7 @@ impl RaftCore {
         if self.role != Role::Leader {
             return Ok(effects);
         }
-        if retry {
+        if retry || (accepted && match_index < last_index && self.commit_index == previous_commit) {
             effects.push(self.append_for_peer(peer)?);
         }
         if self.commit_index > previous_commit {
@@ -1379,7 +1379,14 @@ impl RaftCore {
                 .ok_or(CoreError::IndexExhausted)?,
         )
         .map_err(|_| CoreError::IndexExhausted)?;
-        let entries = self.log.get(start..).unwrap_or_default().to_vec();
+        let entries = self
+            .log
+            .get(start..)
+            .unwrap_or_default()
+            .iter()
+            .take(super::MAX_ENTRIES_PER_APPEND)
+            .cloned()
+            .collect();
         Ok(Effect::Send(Envelope {
             from: self.id,
             to: peer,

@@ -14,6 +14,8 @@ const UPDATE: u8 = 2;
 const DELETE: u8 = 3;
 const READ: u8 = 4;
 const RESULT_VERSION: u8 = 1;
+pub const MAX_KEY_BYTES: usize = 256;
+pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ClientId(pub [u8; 16]);
@@ -453,6 +455,9 @@ pub fn validate_key(key: &str) -> Result<(), CommandError> {
     if key.is_empty() {
         return Err(CommandError::EmptyKey);
     }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(CommandError::FieldTooLarge);
+    }
     if !key
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
@@ -470,9 +475,14 @@ fn validate_command(command: &Command) -> Result<(), CommandError> {
                 return Err(CommandError::InvalidSequence);
             }
             match &command.mutation {
-                Mutation::Create { key, .. }
-                | Mutation::Update { key, .. }
-                | Mutation::Delete { key, .. } => validate_key(key),
+                Mutation::Create { key, value } | Mutation::Update { key, value, .. } => {
+                    validate_key(key)?;
+                    if value.len() > MAX_VALUE_BYTES {
+                        return Err(CommandError::FieldTooLarge);
+                    }
+                    Ok(())
+                }
+                Mutation::Delete { key, .. } => validate_key(key),
             }
         }
     }

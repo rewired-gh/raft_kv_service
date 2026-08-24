@@ -31,3 +31,7 @@ staging = false
 host = "0.0.0.0"
 port = 9080
 advertised_url = "http://127.0.0.1:9080"
+
+[operational]
+host = "127.0.0.1"
+port = 8088

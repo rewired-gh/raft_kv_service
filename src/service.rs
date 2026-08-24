@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     path::Path,
-    sync::mpsc as std_mpsc,
+    sync::{Arc, Mutex, mpsc as std_mpsc},
     thread,
 };
 
@@ -19,7 +19,25 @@ use crate::{
 
 #[derive(Clone)]
 pub struct KvNodeHandle {
-    requests: mpsc::Sender<Request>,
+    inner: Arc<KvNodeInner>,
+}
+
+struct KvNodeInner {
+    requests: Mutex<Option<mpsc::Sender<Request>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for KvNodeInner {
+    fn drop(&mut self) {
+        if let Ok(requests) = self.requests.get_mut() {
+            requests.take();
+        }
+        if let Ok(worker) = self.worker.get_mut()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl KvNodeHandle {
@@ -49,7 +67,14 @@ impl KvNodeHandle {
 
     pub async fn execute(&self, command: Command) -> Result<CommandResult, ServiceError> {
         let (respond, response) = oneshot::channel();
-        self.requests
+        let requests = self
+            .inner
+            .requests
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .clone()
+            .ok_or(ServiceError::Unavailable)?;
+        requests
             .try_send(Request { command, respond })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ServiceError::Overloaded,
@@ -67,7 +92,7 @@ impl KvNodeHandle {
     ) -> Result<Self, NodeError> {
         let (requests, mut receiver) = mpsc::channel::<Request>(queue_capacity);
         let (started, startup) = std_mpsc::sync_channel(1);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("raft-kv-node".to_owned())
             .spawn(move || {
                 let mut worker = Worker { raft };
@@ -85,7 +110,12 @@ impl KvNodeHandle {
             .recv()
             .map_err(|_| NodeError::WorkerStopped)?
             .map_err(NodeError::Startup)?;
-        Ok(Self { requests })
+        Ok(Self {
+            inner: Arc::new(KvNodeInner {
+                requests: Mutex::new(Some(requests)),
+                worker: Mutex::new(Some(worker)),
+            }),
+        })
     }
 }
 

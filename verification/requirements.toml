@@ -100,8 +100,22 @@ evidence = [
 [[requirement]]
 id = "M6"
 spec_sections = ["15", "16", "17", "18", "19.M6"]
-status = "planned"
-evidence = []
+status = "verified"
+evidence = [
+  "docs/adr/0006-operational-hardening.md",
+  "docs/supply-chain-policy.md",
+  "src/metrics.rs",
+  "src/tls.rs",
+  "src/cluster.rs",
+  "src/storage/sqlite.rs",
+  "src/http.rs",
+  "docs/openapi.yaml",
+  "Dockerfile",
+  "compose.yaml",
+  ".github/workflows/ci.yaml",
+  "deny.toml",
+  "verification/evidence/m6-runtime.toml",
+]
 
 [[requirement]]
 id = "M7"

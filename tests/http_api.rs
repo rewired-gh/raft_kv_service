@@ -12,10 +12,12 @@ use axum::{
     },
 };
 use raft_kv_service::{
-    cluster::MembershipView,
+    cluster::{MembershipView, NodeDiagnostics},
     http::{AppState, ServiceError, router},
     kv::{Command, KvStateMachine},
-    raft::NodeId,
+    metrics::Metrics,
+    peer::ClusterId,
+    raft::{ClusterConfiguration, MembershipEntry, NodeId, Role, Term},
 };
 use tower::ServiceExt;
 
@@ -36,6 +38,27 @@ fn test_app() -> axum::Router {
         }
     });
     router(state, Duration::from_secs(1))
+}
+
+fn diagnostics() -> NodeDiagnostics {
+    let membership = MembershipEntry::initial(
+        ClusterConfiguration::new([(1, "http://node-1:9080".to_owned())]).expect("membership"),
+    );
+    NodeDiagnostics {
+        cluster_id: ClusterId([7; 16]).0,
+        node_id: NodeId(1),
+        role: Role::Leader,
+        term: Term(3),
+        leader: Some(NodeId(1)),
+        commit_index: 9,
+        applied_index: 9,
+        snapshot_index: 4,
+        active_membership: membership.clone(),
+        committed_membership: membership,
+        replication: Vec::new(),
+        request_queue_depth: 2,
+        outbound_queue_depth: 1,
+    }
 }
 
 fn mutation_request(
@@ -165,5 +188,50 @@ async fn operational_membership_requires_authentication_and_validates_contract()
     let body: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(body["commit_index"], 9);
     assert_eq!(body["members"][0]["node_id"], 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_diagnostics_and_metrics_are_bounded_and_versioned() -> Result<()> {
+    let metrics = Metrics::new();
+    let state = AppState::new("test-service")
+        .with_metrics(metrics)
+        .with_membership(
+            "secret",
+            |_, _| async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+            || async { Err(raft_kv_service::cluster::MembershipError::Unavailable) },
+        )
+        .with_diagnostics(|| async { Ok(diagnostics()) });
+    let app = router(state, Duration::from_secs(1));
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::get("/operational/v1/status")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value =
+        serde_json::from_slice(&to_bytes(status.into_body(), 16 * 1024).await?)?;
+    assert_eq!(status["role"], "leader");
+    assert_eq!(status["commit_index"], 9);
+    assert_eq!(status["request_queue_depth"], 2);
+    assert_eq!(status["peer_protocol_version"], 2);
+
+    let metrics = app
+        .oneshot(
+            Request::get("/metrics")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = to_bytes(metrics.into_body(), 128 * 1024).await?;
+    let metrics = std::str::from_utf8(&metrics)?;
+    assert!(metrics.contains("raft_commit_index 9"));
+    assert!(metrics.contains("raft_kv_build_info"));
+    assert!(!metrics.contains(CLIENT));
     Ok(())
 }

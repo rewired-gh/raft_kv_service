@@ -1,7 +1,8 @@
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
-    path::Path,
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -26,12 +27,14 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 5;
+pub const STORAGE_SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: i64 = STORAGE_SCHEMA_VERSION as i64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CLIENTS: u64 = 10_000;
 
 pub struct SqliteStorage {
     connection: Connection,
+    _process_lock: Option<File>,
 }
 
 impl SqliteStorage {
@@ -55,23 +58,30 @@ impl SqliteStorage {
         path: impl AsRef<Path>,
         max_clients: u64,
     ) -> Result<Self, StorageError> {
+        let process_lock = acquire_process_lock(path.as_ref())?;
         let connection = Connection::open_with_flags(
-            path,
+            path.as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Self::initialize(connection, true, max_clients)
+        Self::initialize(connection, true, max_clients, Some(process_lock))
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
-        Self::initialize(Connection::open_in_memory()?, false, DEFAULT_MAX_CLIENTS)
+        Self::initialize(
+            Connection::open_in_memory()?,
+            false,
+            DEFAULT_MAX_CLIENTS,
+            None,
+        )
     }
 
     fn initialize(
         connection: Connection,
         file_backed: bool,
         max_clients: u64,
+        process_lock: Option<File>,
     ) -> Result<Self, StorageError> {
         if max_clients == 0 {
             return Err(StorageError::InvalidMaxClients(max_clients));
@@ -160,8 +170,6 @@ impl SqliteStorage {
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match user_version {
             0 => connection.pragma_update(None, "user_version", SCHEMA_VERSION)?,
-            1..=3 => migrate_configuration_entries(&connection)?,
-            4 => {}
             SCHEMA_VERSION => {}
             found => {
                 return Err(StorageError::UnsupportedSchemaVersion {
@@ -172,7 +180,10 @@ impl SqliteStorage {
         }
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
-        let storage = Self { connection };
+        let storage = Self {
+            connection,
+            _process_lock: process_lock,
+        };
         storage.validate()?;
         let (_, persisted_max_clients) = load_state_machine_meta(&storage.connection)?;
         if persisted_max_clients != max_clients {
@@ -222,24 +233,22 @@ impl SqliteStorage {
     }
 }
 
-fn migrate_configuration_entries(connection: &Connection) -> Result<(), StorageError> {
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         ALTER TABLE raft_log RENAME TO raft_log_previous;
-         CREATE TABLE raft_log (
-             log_index BLOB PRIMARY KEY CHECK (length(log_index) = 8),
-             term BLOB NOT NULL CHECK (length(term) = 8),
-             entry_kind INTEGER NOT NULL CHECK (entry_kind IN (0, 1, 2)),
-             payload BLOB NOT NULL,
-             CHECK (entry_kind != 0 OR length(payload) = 0)
-         ) STRICT;
-         INSERT INTO raft_log(log_index, term, entry_kind, payload)
-         SELECT log_index, term, entry_kind, payload FROM raft_log_previous;
-         DROP TABLE raft_log_previous;
-         PRAGMA user_version = 4;
-         COMMIT;",
-    )?;
-    Ok(())
+fn acquire_process_lock(path: &Path) -> Result<File, StorageError> {
+    let mut lock_name = path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(StorageError::Io)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StorageError::DataFileLocked(lock_path)),
+        Err(std::fs::TryLockError::Error(error)) => Err(StorageError::Io(error)),
+    }
 }
 
 impl RaftStorage for SqliteStorage {
@@ -1488,6 +1497,8 @@ fn decode_u64_sql(column: usize, bytes: &[u8]) -> rusqlite::Result<u64> {
 
 #[derive(Debug)]
 pub enum StorageError {
+    Io(std::io::Error),
+    DataFileLocked(PathBuf),
     Sqlite(rusqlite::Error),
     UnsupportedSchemaVersion { expected: i64, found: i64 },
     IntegrityCheckFailed(String),
@@ -1526,6 +1537,14 @@ impl From<rusqlite::Error> for StorageError {
 impl Display for StorageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
+            Self::DataFileLocked(path) => {
+                write!(
+                    formatter,
+                    "data file is already owned by another process: {}",
+                    path.display()
+                )
+            }
             Self::Sqlite(error) => write!(formatter, "SQLite storage error: {error}"),
             Self::UnsupportedSchemaVersion { expected, found } => write!(
                 formatter,
@@ -1629,6 +1648,7 @@ impl Display for StorageError {
 impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
             Self::Command(error) => Some(error),
             _ => None,
@@ -1846,6 +1866,25 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_state_rejects_a_second_process_owner() {
+        let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("raft-kv-lock-test-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&directory).expect("temporary directory is created");
+        let database = directory.join("node.sqlite3");
+        let first = SqliteStorage::open(&database).expect("first owner acquires lock");
+
+        assert!(matches!(
+            SqliteStorage::open(&database),
+            Err(StorageError::DataFileLocked(_))
+        ));
+
+        drop(first);
+        drop(SqliteStorage::open(&database).expect("lock is released on drop"));
+        std::fs::remove_dir_all(&directory).expect("temporary directory is removed");
+    }
+
+    #[test]
     fn committed_crud_and_deduplication_apply_atomically_and_idempotently() {
         let mut storage = SqliteStorage::open_in_memory().expect("storage");
         let entries = vec![
@@ -1969,7 +2008,32 @@ mod tests {
                 persisted: 7,
             })
         ));
-        SqliteStorage::open_with_max_clients(&path, 7).expect("matching capacity reopens");
+        drop(SqliteStorage::open_with_max_clients(&path, 7).expect("matching capacity reopens"));
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn prior_schema_is_rejected_without_an_explicit_migration() {
+        let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "raft-kv-schema-test-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create temporary directory");
+        let path = directory.join("prior.sqlite3");
+        let connection = Connection::open(&path).expect("create prior database");
+        connection
+            .pragma_update(None, "user_version", 4_i64)
+            .expect("mark prior schema");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteStorage::open(&path),
+            Err(StorageError::UnsupportedSchemaVersion {
+                expected: 5,
+                found: 4,
+            })
+        ));
         std::fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 

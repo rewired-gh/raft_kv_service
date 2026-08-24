@@ -7,19 +7,25 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tonic::{Request, Response, Status, transport::Channel};
+use tonic::{
+    Request, Response, Status,
+    transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig},
+};
 use tracing::warn;
 
 use crate::{
     http::ServiceError,
-    kv::{Command, CommandResult, encode_command},
+    kv::{Command, CommandResult, MutationResult, encode_command},
+    metrics::Metrics,
     peer::{
         ClusterId, PeerContext, PeerLimits, SnapshotChunk, encode_append_entries,
         encode_append_entries_response, encode_forward_command, encode_forward_membership,
@@ -31,6 +37,7 @@ use crate::{
         Event, LogEntry, MembershipEntry, Message, NodeId, Role, Term,
     },
     storage::{AppliedEntry, Snapshot, SnapshotStorage, SqliteStorage, StateMachineStorage},
+    tls::TlsMaterial,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +45,23 @@ pub struct MembershipView {
     pub operation_id: [u8; 16],
     pub members: Vec<(NodeId, String)>,
     pub commit_index: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeDiagnostics {
+    pub cluster_id: [u8; 16],
+    pub node_id: NodeId,
+    pub role: Role,
+    pub term: Term,
+    pub leader: Option<NodeId>,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub snapshot_index: u64,
+    pub active_membership: MembershipEntry,
+    pub committed_membership: MembershipEntry,
+    pub replication: Vec<(NodeId, crate::raft::ReplicationProgress)>,
+    pub request_queue_depth: usize,
+    pub outbound_queue_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +72,12 @@ pub enum MembershipError {
     Conflict,
     ChangeInProgress,
     Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerAdmission {
+    pub certificate_sha256: [u8; 32],
+    pub staging_expires_unix_seconds: Option<u64>,
 }
 
 struct PendingMembership {
@@ -81,6 +111,9 @@ pub struct StaticNodeConfig {
     pub peer_endpoints: BTreeMap<NodeId, String>,
     pub local_peer_endpoint: String,
     pub staging: bool,
+    pub peer_tls: Option<TlsMaterial>,
+    pub peer_certificates: BTreeMap<NodeId, PeerAdmission>,
+    pub metrics: Metrics,
 }
 
 pub struct RunningNode {
@@ -89,12 +122,14 @@ pub struct RunningNode {
     outbound: tokio_mpsc::Receiver<Outbound>,
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
+    peer_tls: Option<TlsMaterial>,
 }
 
 impl RunningNode {
     pub fn spawn_dispatcher(mut self) -> (StaticNodeHandle, PeerRpcService) {
         let handle = self.handle.clone();
         let response_handle = handle.clone();
+        let dispatcher_metrics = self.peer_service.metrics.clone();
         tokio::spawn(async move {
             while let Some(outbound) = self.outbound.recv().await {
                 let to = match &outbound {
@@ -113,10 +148,13 @@ impl RunningNode {
                 let response_handle = response_handle.clone();
                 let cluster_id = self.peer_service.context.cluster_id;
                 let timeout = self.rpc_timeout;
+                let peer_tls = self.peer_tls.clone();
+                let metrics = dispatcher_metrics.clone();
                 tokio::spawn(async move {
+                    let _replication_timer = metrics.time_replication();
                     let result = match outbound {
                         Outbound::Raft(envelope) => {
-                            dispatch(cluster_id, endpoint, envelope, timeout).await
+                            dispatch(cluster_id, endpoint, envelope, timeout, peer_tls).await
                         }
                         Outbound::Snapshot {
                             from,
@@ -125,14 +163,24 @@ impl RunningNode {
                             snapshot,
                         } => {
                             dispatch_snapshot(
-                                cluster_id, endpoint, from, to, term, snapshot, timeout,
+                                cluster_id,
+                                endpoint,
+                                (from, to, term),
+                                snapshot,
+                                timeout,
+                                peer_tls,
                             )
                             .await
                         }
                     };
                     match result {
                         Ok(response) => response_handle.receive_response(response),
-                        Err(error) => warn!(%error, "peer RPC failed"),
+                        Err(error) => {
+                            if error.contains("timed out") {
+                                metrics.timed_out();
+                            }
+                            warn!(%error, "peer RPC failed");
+                        }
                     }
                 });
             }
@@ -158,9 +206,31 @@ pub struct StaticNodeHandle {
     node_id: NodeId,
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     rpc_timeout: Duration,
+    peer_tls: Option<TlsMaterial>,
+    request_queue_depth: Arc<AtomicUsize>,
+    metrics: Metrics,
+}
+
+#[derive(Clone, Copy)]
+enum EnqueueError {
+    Full,
+    Disconnected,
 }
 
 impl StaticNodeHandle {
+    fn enqueue(&self, request: NodeRequest) -> Result<(), EnqueueError> {
+        self.request_queue_depth.fetch_add(1, Ordering::Relaxed);
+        match self.sender.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.request_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                Err(match error {
+                    mpsc::TrySendError::Full(_) => EnqueueError::Full,
+                    mpsc::TrySendError::Disconnected(_) => EnqueueError::Disconnected,
+                })
+            }
+        }
+    }
     pub async fn execute(&self, command: Command) -> Result<CommandResult, ServiceError> {
         match self.execute_local(command.clone()).await {
             Err(ServiceError::Unavailable) => self.forward(command).await,
@@ -170,11 +240,10 @@ impl StaticNodeHandle {
 
     async fn execute_local(&self, command: Command) -> Result<CommandResult, ServiceError> {
         let (respond, response) = oneshot::channel();
-        self.sender
-            .try_send(NodeRequest::Client { command, respond })
+        self.enqueue(NodeRequest::Client { command, respond })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => ServiceError::Overloaded,
-                mpsc::TrySendError::Disconnected(_) => ServiceError::Unavailable,
+                EnqueueError::Full => ServiceError::Overloaded,
+                EnqueueError::Disconnected => ServiceError::Unavailable,
             })?;
         response.await.map_err(|_| ServiceError::Unavailable)?
     }
@@ -201,16 +270,15 @@ impl StaticNodeHandle {
         target: ClusterConfiguration,
     ) -> Result<MembershipView, MembershipError> {
         let (respond, response) = oneshot::channel();
-        self.sender
-            .try_send(NodeRequest::MembershipChange {
-                operation_id,
-                target,
-                respond,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => MembershipError::Overloaded,
-                mpsc::TrySendError::Disconnected(_) => MembershipError::Unavailable,
-            })?;
+        self.enqueue(NodeRequest::MembershipChange {
+            operation_id,
+            target,
+            respond,
+        })
+        .map_err(|error| match error {
+            EnqueueError::Full => MembershipError::Overloaded,
+            EnqueueError::Disconnected => MembershipError::Unavailable,
+        })?;
         response.await.map_err(|_| MembershipError::Unavailable)?
     }
 
@@ -223,11 +291,10 @@ impl StaticNodeHandle {
 
     async fn membership_local(&self) -> Result<MembershipView, MembershipError> {
         let (respond, response) = oneshot::channel();
-        self.sender
-            .try_send(NodeRequest::MembershipQuery { respond })
+        self.enqueue(NodeRequest::MembershipQuery { respond })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => MembershipError::Overloaded,
-                mpsc::TrySendError::Disconnected(_) => MembershipError::Unavailable,
+                EnqueueError::Full => MembershipError::Overloaded,
+                EnqueueError::Disconnected => MembershipError::Unavailable,
             })?;
         response.await.map_err(|_| MembershipError::Unavailable)?
     }
@@ -236,6 +303,7 @@ impl StaticNodeHandle {
         &self,
         operation: Option<([u8; 16], &ClusterConfiguration)>,
     ) -> Result<MembershipView, MembershipError> {
+        self.metrics.forwarded();
         let (leader, term) = self
             .status()
             .await
@@ -250,21 +318,15 @@ impl StaticNodeHandle {
             .get(&leader)
             .cloned()
             .ok_or(MembershipError::Unavailable)?;
-        let channel = tokio::time::timeout(
-            self.rpc_timeout,
-            Channel::from_shared(endpoint)
-                .map_err(|_| MembershipError::Internal)?
-                .connect(),
-        )
-        .await
-        .map_err(|_| MembershipError::Unavailable)?
-        .map_err(|_| MembershipError::Unavailable)?;
+        let channel = connect_peer(endpoint, self.rpc_timeout, self.peer_tls.clone())
+            .await
+            .map_err(|_| MembershipError::Unavailable)?;
         let request =
             encode_forward_membership(self.cluster_id, self.node_id, leader, term, operation)
                 .map_err(|_| MembershipError::Internal)?;
         let response = tokio::time::timeout(
             self.rpc_timeout,
-            proto::raft_peer_client::RaftPeerClient::new(channel).forward_membership(request),
+            peer_client(channel).forward_membership(request),
         )
         .await
         .map_err(|_| MembershipError::Unavailable)?
@@ -287,16 +349,16 @@ impl StaticNodeHandle {
 
     async fn status(&self) -> Result<(Option<NodeId>, Term), ServiceError> {
         let (respond, response) = oneshot::channel();
-        self.sender
-            .try_send(NodeRequest::Status { respond })
+        self.enqueue(NodeRequest::Status { respond })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => ServiceError::Overloaded,
-                mpsc::TrySendError::Disconnected(_) => ServiceError::Unavailable,
+                EnqueueError::Full => ServiceError::Overloaded,
+                EnqueueError::Disconnected => ServiceError::Unavailable,
             })?;
         response.await.map_err(|_| ServiceError::Unavailable)
     }
 
     async fn forward(&self, command: Command) -> Result<CommandResult, ServiceError> {
+        self.metrics.forwarded();
         let (leader, term) = self.status().await?;
         let leader = leader
             .filter(|leader| *leader != self.node_id)
@@ -308,16 +370,10 @@ impl StaticNodeHandle {
             .get(&leader)
             .cloned()
             .ok_or(ServiceError::Unavailable)?;
-        let channel = tokio::time::timeout(
-            self.rpc_timeout,
-            Channel::from_shared(endpoint)
-                .map_err(|_| ServiceError::Internal)?
-                .connect(),
-        )
-        .await
-        .map_err(|_| ServiceError::Unavailable)?
-        .map_err(|_| ServiceError::Unavailable)?;
-        let mut client = proto::raft_peer_client::RaftPeerClient::new(channel);
+        let channel = connect_peer(endpoint, self.rpc_timeout, self.peer_tls.clone())
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+        let mut client = peer_client(channel);
         let request = encode_forward_command(self.cluster_id, self.node_id, leader, term, &command)
             .map_err(|_| ServiceError::Internal)?;
         let response = tokio::time::timeout(self.rpc_timeout, client.forward_command(request))
@@ -341,20 +397,29 @@ impl StaticNodeHandle {
     }
 
     fn receive_response(&self, envelope: Envelope) {
-        let _ = self.sender.try_send(NodeRequest::PeerResponse(envelope));
+        let _ = self.enqueue(NodeRequest::PeerResponse(envelope));
     }
 
     async fn call(&self, envelope: Envelope) -> Result<Envelope, Status> {
         let (respond, response) = oneshot::channel();
-        self.sender
-            .try_send(NodeRequest::PeerCall { envelope, respond })
+        self.enqueue(NodeRequest::PeerCall { envelope, respond })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => Status::resource_exhausted("peer queue is full"),
-                mpsc::TrySendError::Disconnected(_) => Status::unavailable("Raft worker stopped"),
+                EnqueueError::Full => Status::resource_exhausted("peer queue is full"),
+                EnqueueError::Disconnected => Status::unavailable("Raft worker stopped"),
             })?;
         response
             .await
             .map_err(|_| Status::unavailable("Raft worker stopped"))?
+    }
+
+    pub async fn diagnostics(&self) -> Result<NodeDiagnostics, MembershipError> {
+        let (respond, response) = oneshot::channel();
+        self.enqueue(NodeRequest::Diagnostics { respond })
+            .map_err(|error| match error {
+                EnqueueError::Full => MembershipError::Overloaded,
+                EnqueueError::Disconnected => MembershipError::Unavailable,
+            })?;
+        response.await.map_err(|_| MembershipError::Unavailable)?
     }
 }
 
@@ -394,11 +459,13 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
     )
     .map_err(|error| error.to_string())?;
     let endpoints = Arc::new(RwLock::new(config.peer_endpoints.clone()));
+    let request_queue_depth = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::sync_channel(config.request_queue_capacity);
     let (outbound_sender, outbound) = tokio_mpsc::channel(config.outbound_queue_capacity);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let worker_config = config.clone();
     let worker_endpoints = endpoints.clone();
+    let worker_queue_depth = request_queue_depth.clone();
     thread::Builder::new()
         .name(format!("raft-node-{}", config.node_id.0))
         .spawn(move || {
@@ -408,6 +475,7 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
                 outbound_sender,
                 worker_config,
                 worker_endpoints,
+                worker_queue_depth,
             );
             let started = worker.bootstrap();
             let can_run = started.is_ok();
@@ -427,6 +495,9 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
         node_id: config.node_id,
         endpoints: endpoints.clone(),
         rpc_timeout: config.rpc_timeout,
+        peer_tls: config.peer_tls.clone(),
+        request_queue_depth,
+        metrics: config.metrics.clone(),
     };
     Ok(RunningNode {
         peer_service: PeerRpcService {
@@ -436,11 +507,15 @@ pub fn start_static_node(config: StaticNodeConfig) -> Result<RunningNode, String
                 limits: PeerLimits::default(),
             },
             handle: handle.clone(),
+            peer_certificates: Arc::new(config.peer_certificates.clone()),
+            require_peer_identity: config.peer_tls.is_some(),
+            metrics: config.metrics.clone(),
         },
         handle,
         outbound,
         endpoints,
         rpc_timeout: config.rpc_timeout,
+        peer_tls: config.peer_tls,
     })
 }
 
@@ -465,6 +540,14 @@ fn validate_config(config: &StaticNodeConfig) -> Result<(), String> {
         if *voter != config.node_id && !config.peer_endpoints.contains_key(voter) {
             return Err(format!("missing endpoint for voter {}", voter.0));
         }
+    }
+    if config.peer_tls.is_some()
+        && config
+            .peer_endpoints
+            .keys()
+            .any(|node| !config.peer_certificates.contains_key(node))
+    {
+        return Err("peer TLS requires an admitted certificate fingerprint for every configured remote peer".to_owned());
     }
     Ok(())
 }
@@ -494,6 +577,13 @@ enum NodeRequest {
     MembershipQuery {
         respond: oneshot::Sender<Result<MembershipView, MembershipError>>,
     },
+    Diagnostics {
+        respond: oneshot::Sender<Result<NodeDiagnostics, MembershipError>>,
+    },
+    AuthorizePeer {
+        node_id: NodeId,
+        respond: oneshot::Sender<bool>,
+    },
 }
 
 struct SnapshotProgress {
@@ -514,6 +604,8 @@ struct NodeWorker {
     incoming_snapshot: Option<IncomingSnapshot>,
     endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
     pending_membership: Option<PendingMembership>,
+    request_queue_depth: Arc<AtomicUsize>,
+    metrics: Metrics,
 }
 
 struct IncomingSnapshot {
@@ -535,6 +627,7 @@ impl NodeWorker {
         outbound: tokio_mpsc::Sender<Outbound>,
         config: StaticNodeConfig,
         endpoints: Arc<RwLock<BTreeMap<NodeId, String>>>,
+        request_queue_depth: Arc<AtomicUsize>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -547,6 +640,8 @@ impl NodeWorker {
             incoming_snapshot: None,
             endpoints,
             pending_membership: None,
+            request_queue_depth,
+            metrics: config.metrics.clone(),
             config,
         }
     }
@@ -575,6 +670,7 @@ impl NodeWorker {
                 .recv_timeout(deadline.saturating_duration_since(now))
             {
                 Ok(request) => {
+                    self.request_queue_depth.fetch_sub(1, Ordering::Relaxed);
                     if let Err(error) = self.handle_request(request) {
                         warn!(%error, node = self.config.node_id.0, "Raft worker request failed");
                     }
@@ -608,6 +704,15 @@ impl NodeWorker {
                 Ok(())
             }
             NodeRequest::PeerResponse(envelope) => {
+                if matches!(
+                    envelope.message,
+                    Message::AppendEntriesResponse {
+                        accepted: false,
+                        ..
+                    }
+                ) {
+                    self.metrics.retried();
+                }
                 let was_leader = self.raft.core().role() == Role::Leader;
                 let effects = self
                     .raft
@@ -642,7 +747,41 @@ impl NodeWorker {
                 let _ = respond.send(result);
                 Ok(())
             }
+            NodeRequest::Diagnostics { respond } => {
+                let result = self.diagnostics();
+                let _ = respond.send(result);
+                Ok(())
+            }
+            NodeRequest::AuthorizePeer { node_id, respond } => {
+                let _ = respond.send(self.peer_is_authorized(node_id));
+                Ok(())
+            }
         }
+    }
+
+    fn peer_is_authorized(&self, node_id: NodeId) -> bool {
+        let active = self
+            .raft
+            .core()
+            .committed_membership()
+            .is_ok_and(|membership| {
+                membership.old.node_ids().any(|node| node == node_id.0)
+                    || membership.new.node_ids().any(|node| node == node_id.0)
+            });
+        if active {
+            return true;
+        }
+        let staged = self
+            .pending_membership
+            .as_ref()
+            .is_some_and(|pending| pending.target.node_ids().any(|node| node == node_id.0));
+        let not_expired = self
+            .config
+            .peer_certificates
+            .get(&node_id)
+            .and_then(|admission| admission.staging_expires_unix_seconds)
+            .is_some_and(|expiry| expiry > unix_time_seconds());
+        staged && not_expired
     }
 
     fn handle_client(
@@ -652,6 +791,11 @@ impl NodeWorker {
     ) -> Result<(), String> {
         if !self.raft.core().leader_ready() {
             let _ = respond.send(Err(ServiceError::Unavailable));
+            return Ok(());
+        }
+        if self.pending_clients.len() >= self.config.request_queue_capacity {
+            self.metrics.reject();
+            let _ = respond.send(Err(ServiceError::Overloaded));
             return Ok(());
         }
         let encoded = encode_command(&command).map_err(|error| error.to_string())?;
@@ -681,6 +825,46 @@ impl NodeWorker {
                 .map(|(node, endpoint)| (NodeId(node), endpoint.to_owned()))
                 .collect(),
             commit_index: self.raft.core().last_applied(),
+        })
+    }
+
+    fn diagnostics(&self) -> Result<NodeDiagnostics, MembershipError> {
+        let active_membership = self.raft.core().membership().clone();
+        let committed_membership = self
+            .raft
+            .core()
+            .committed_membership()
+            .map_err(|_| MembershipError::Internal)?;
+        let replication = self
+            .raft
+            .core()
+            .voter_ids()
+            .into_iter()
+            .filter(|node| *node != self.config.node_id)
+            .filter_map(|node| {
+                self.raft
+                    .core()
+                    .replication_progress(node)
+                    .map(|progress| (node, progress))
+            })
+            .collect();
+        Ok(NodeDiagnostics {
+            cluster_id: self.config.cluster_id.0,
+            node_id: self.config.node_id,
+            role: self.raft.core().role(),
+            term: self.raft.core().hard_state().current_term,
+            leader: self.raft.core().leader(),
+            commit_index: self.raft.core().commit_index(),
+            applied_index: self.raft.core().last_applied(),
+            snapshot_index: self.raft.core().snapshot_position().index,
+            active_membership,
+            committed_membership,
+            replication,
+            request_queue_depth: self.request_queue_depth.load(Ordering::Relaxed),
+            outbound_queue_depth: self
+                .outbound
+                .max_capacity()
+                .saturating_sub(self.outbound.capacity()),
         })
     }
 
@@ -714,7 +898,12 @@ impl NodeWorker {
         }
         if let Some(pending) = self.pending_membership.as_mut() {
             if pending.operation_id == operation_id && pending.target == target {
-                pending.responders.push(respond);
+                if pending.responders.len() >= self.config.request_queue_capacity {
+                    self.metrics.reject();
+                    let _ = respond.send(Err(MembershipError::Overloaded));
+                } else {
+                    pending.responders.push(respond);
+                }
             } else {
                 let error = if pending.operation_id == operation_id {
                     MembershipError::Conflict
@@ -728,6 +917,35 @@ impl NodeWorker {
         if self.raft.core().membership_is_joint() {
             let _ = respond.send(Err(MembershipError::ChangeInProgress));
             return Ok(());
+        }
+        if self.config.peer_tls.is_some() {
+            let committed = self
+                .raft
+                .core()
+                .committed_membership()
+                .map_err(|error| error.to_string())?;
+            let current = committed
+                .old
+                .node_ids()
+                .chain(committed.new.node_ids())
+                .map(NodeId)
+                .collect::<std::collections::BTreeSet<_>>();
+            let invalid = target.node_ids().map(NodeId).any(|node| {
+                if node == self.config.node_id {
+                    return false;
+                }
+                let Some(admission) = self.config.peer_certificates.get(&node) else {
+                    return true;
+                };
+                !current.contains(&node)
+                    && !admission
+                        .staging_expires_unix_seconds
+                        .is_some_and(|expiry| expiry > unix_time_seconds())
+            });
+            if invalid {
+                let _ = respond.send(Err(MembershipError::Invalid));
+                return Ok(());
+            }
         }
 
         {
@@ -884,10 +1102,13 @@ impl NodeWorker {
     }
 
     fn on_timer(&mut self) -> Result<(), String> {
+        let _election_timer =
+            (self.raft.core().role() != Role::Leader).then(|| self.metrics.time_election());
         let effects = if self.raft.core().role() == Role::Leader {
             self.heartbeat_deadline = Instant::now() + self.config.heartbeat_interval;
             self.raft.heartbeat().map_err(|error| error.to_string())?
         } else {
+            self.metrics.election();
             self.election_deadline = Instant::now() + random_election_timeout(&self.config);
             self.raft
                 .handle(Event::ElectionTimeout)
@@ -908,6 +1129,8 @@ impl NodeWorker {
             match effect {
                 Effect::ApplyCommitted(entries) => {
                     let membership_entries = entries.clone();
+                    let _apply_timer = self.metrics.time_apply();
+                    let _storage_timer = self.metrics.time_storage();
                     let batch = self
                         .raft
                         .apply_committed(&entries)
@@ -918,9 +1141,11 @@ impl NodeWorker {
                     let compacted = self.raft.core().snapshot_position().index;
                     let applied = self.raft.core().last_applied();
                     if applied.saturating_sub(compacted) >= self.config.snapshot_threshold_entries {
+                        let _snapshot_timer = self.metrics.time_snapshot();
                         self.raft
                             .create_snapshot(self.config.cluster_id.0)
                             .map_err(|error| error.to_string())?;
+                        self.metrics.snapshot();
                     }
                 }
                 Effect::Send(envelope)
@@ -963,6 +1188,12 @@ impl NodeWorker {
 
     fn complete_clients(&mut self, applied: Vec<AppliedEntry>) {
         for applied in applied {
+            if matches!(
+                &applied.result,
+                Some(CommandResult::Mutation(MutationResult::Duplicate(_)))
+            ) {
+                self.metrics.deduplicated();
+            }
             if let Some(respond) = self.pending_clients.remove(&applied.index) {
                 let result = applied.result.ok_or(ServiceError::Internal);
                 let _ = respond.send(result);
@@ -1082,6 +1313,8 @@ impl NodeWorker {
             .storage()
             .validate_snapshot_for_cluster(self.config.cluster_id.0, &snapshot)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let _snapshot_timer = self.metrics.time_snapshot();
+        let _storage_timer = self.metrics.time_storage();
         let effects = self
             .raft
             .install_snapshot(
@@ -1091,6 +1324,7 @@ impl NodeWorker {
                 &snapshot,
             )
             .map_err(|error| Status::internal(error.to_string()))?;
+        self.metrics.snapshot();
         self.process(effects, None).map_err(Status::internal)?;
         Ok(SnapshotProgress {
             snapshot_id: staging.snapshot_id,
@@ -1113,6 +1347,12 @@ fn random_election_timeout(config: &StaticNodeConfig) -> Duration {
     Duration::from_millis(u64::try_from(min + offset).unwrap_or(u64::MAX))
 }
 
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn is_response(envelope: &Envelope) -> bool {
     matches!(
         envelope.message,
@@ -1124,6 +1364,60 @@ fn is_response(envelope: &Envelope) -> bool {
 pub struct PeerRpcService {
     context: PeerContext,
     handle: StaticNodeHandle,
+    peer_certificates: Arc<BTreeMap<NodeId, PeerAdmission>>,
+    require_peer_identity: bool,
+    metrics: Metrics,
+}
+
+impl PeerRpcService {
+    fn presented_fingerprint<T>(&self, request: &Request<T>) -> Result<Option<[u8; 32]>, Status> {
+        if !self.require_peer_identity {
+            return Ok(None);
+        }
+        let certificate = request
+            .peer_certs()
+            .and_then(|certificates| certificates.first().cloned())
+            .ok_or_else(|| Status::unauthenticated("peer client certificate is required"))?;
+        let presented: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+        Ok(Some(presented))
+    }
+
+    async fn authorize_sender(
+        &self,
+        sender: NodeId,
+        presented: Option<[u8; 32]>,
+    ) -> Result<(), Status> {
+        if !self.require_peer_identity {
+            return Ok(());
+        }
+        let presented = presented
+            .ok_or_else(|| Status::unauthenticated("peer client certificate is required"))?;
+        let expected = self
+            .peer_certificates
+            .get(&sender)
+            .ok_or_else(|| Status::permission_denied("peer identity is not admitted"))?;
+        if presented != expected.certificate_sha256 {
+            return Err(Status::permission_denied(
+                "peer certificate does not match claimed node ID",
+            ));
+        }
+        let (respond, response) = oneshot::channel();
+        self.handle
+            .enqueue(NodeRequest::AuthorizePeer {
+                node_id: sender,
+                respond,
+            })
+            .map_err(|_| Status::unavailable("Raft worker stopped"))?;
+        if !response
+            .await
+            .map_err(|_| Status::unavailable("Raft worker stopped"))?
+        {
+            return Err(Status::permission_denied(
+                "peer identity is outside active membership or staging admission",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -1132,10 +1426,14 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         &self,
         request: Request<proto::ForwardMembershipRequest>,
     ) -> Result<Response<proto::ForwardMembershipResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
         let (sender, operation) = self
             .context
             .decode_forward_membership(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sender(sender, fingerprint).await?;
         let result = match operation {
             Some((operation_id, target)) => {
                 self.handle
@@ -1164,18 +1462,21 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         &self,
         request: Request<proto::InstallSnapshotRequest>,
     ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
         let chunk = self
             .context
             .decode_snapshot_chunk(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let sender = chunk.sender;
+        self.authorize_sender(sender, fingerprint).await?;
         let (respond, response) = oneshot::channel();
         self.handle
-            .sender
-            .try_send(NodeRequest::SnapshotChunk { chunk, respond })
+            .enqueue(NodeRequest::SnapshotChunk { chunk, respond })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => Status::resource_exhausted("peer queue is full"),
-                mpsc::TrySendError::Disconnected(_) => Status::unavailable("Raft worker stopped"),
+                EnqueueError::Full => Status::resource_exhausted("peer queue is full"),
+                EnqueueError::Disconnected => Status::unavailable("Raft worker stopped"),
             })?;
         let progress = response
             .await
@@ -1197,10 +1498,14 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         &self,
         request: Request<proto::ForwardCommandRequest>,
     ) -> Result<Response<proto::ForwardCommandResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
         let (sender, command) = self
             .context
             .decode_forward_command(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sender(sender, fingerprint).await?;
         let result = self
             .handle
             .execute_local(command)
@@ -1230,10 +1535,14 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
         let envelope = self
             .context
             .decode_request_vote(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sender(envelope.from, fingerprint).await?;
         let response = self.handle.call(envelope).await?;
         encode_request_vote_response(self.context.cluster_id, &response)
             .map(Response::new)
@@ -1244,10 +1553,14 @@ impl proto::raft_peer_server::RaftPeer for PeerRpcService {
         &self,
         request: Request<proto::AppendEntriesRequest>,
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
+        let _rpc_timer = self.metrics.time_peer_rpc();
+        self.metrics.peer_rpc();
+        let fingerprint = self.presented_fingerprint(&request)?;
         let envelope = self
             .context
             .decode_append_entries(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sender(envelope.from, fingerprint).await?;
         let response = self.handle.call(envelope).await?;
         encode_append_entries_response(self.context.cluster_id, &response)
             .map(Response::new)
@@ -1260,17 +1573,10 @@ async fn dispatch(
     endpoint: String,
     envelope: Envelope,
     timeout: Duration,
+    peer_tls: Option<TlsMaterial>,
 ) -> Result<Envelope, String> {
-    let channel = tokio::time::timeout(
-        timeout,
-        Channel::from_shared(endpoint)
-            .map_err(|error| error.to_string())?
-            .connect(),
-    )
-    .await
-    .map_err(|_| "peer connection timed out".to_owned())?
-    .map_err(|error| error.to_string())?;
-    let mut client = proto::raft_peer_client::RaftPeerClient::new(channel);
+    let channel = connect_peer(endpoint, timeout, peer_tls).await?;
+    let mut client = peer_client(channel);
     let context = PeerContext {
         cluster_id: cluster,
         local_id: envelope.from,
@@ -1310,22 +1616,14 @@ async fn dispatch(
 async fn dispatch_snapshot(
     cluster: ClusterId,
     endpoint: String,
-    from: NodeId,
-    to: NodeId,
-    term: Term,
+    identity: (NodeId, NodeId, Term),
     snapshot: Snapshot,
     timeout: Duration,
+    peer_tls: Option<TlsMaterial>,
 ) -> Result<Envelope, String> {
-    let channel = tokio::time::timeout(
-        timeout,
-        Channel::from_shared(endpoint)
-            .map_err(|error| error.to_string())?
-            .connect(),
-    )
-    .await
-    .map_err(|_| "snapshot peer connection timed out".to_owned())?
-    .map_err(|error| error.to_string())?;
-    let mut client = proto::raft_peer_client::RaftPeerClient::new(channel);
+    let (from, to, term) = identity;
+    let channel = connect_peer(endpoint, timeout, peer_tls).await?;
+    let mut client = peer_client(channel);
     let context = PeerContext {
         cluster_id: cluster,
         local_id: from,
@@ -1367,10 +1665,42 @@ async fn dispatch_snapshot(
     })
 }
 
+async fn connect_peer(
+    endpoint: String,
+    timeout: Duration,
+    peer_tls: Option<TlsMaterial>,
+) -> Result<Channel, String> {
+    let mut endpoint = Channel::from_shared(endpoint).map_err(|error| error.to_string())?;
+    if let Some(tls) = peer_tls {
+        let ca = tls
+            .client_ca
+            .ok_or_else(|| "peer TLS client CA is missing".to_owned())?;
+        endpoint = endpoint
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(ca))
+                    .identity(Identity::from_pem(tls.certificate, tls.private_key)),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    tokio::time::timeout(timeout, endpoint.connect())
+        .await
+        .map_err(|_| "peer connection timed out".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
 pub fn peer_server(
     service: PeerRpcService,
 ) -> proto::raft_peer_server::RaftPeerServer<PeerRpcService> {
     proto::raft_peer_server::RaftPeerServer::new(service)
+        .max_decoding_message_size(crate::peer::MAX_PEER_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::peer::MAX_PEER_MESSAGE_BYTES)
+}
+
+fn peer_client(channel: Channel) -> proto::raft_peer_client::RaftPeerClient<Channel> {
+    proto::raft_peer_client::RaftPeerClient::new(channel)
+        .max_decoding_message_size(crate::peer::MAX_PEER_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::peer::MAX_PEER_MESSAGE_BYTES)
 }
 
 pub async fn serve_peer(
@@ -1378,7 +1708,29 @@ pub async fn serve_peer(
     service: PeerRpcService,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
-    tonic::transport::Server::builder()
+    serve_peer_tls(address, service, None, shutdown).await
+}
+
+pub async fn serve_peer_tls(
+    address: SocketAddr,
+    service: PeerRpcService,
+    tls: Option<TlsMaterial>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), tonic::transport::Error> {
+    let mut server = tonic::transport::Server::builder()
+        .concurrency_limit_per_connection(128)
+        .timeout(Duration::from_secs(5));
+    if let Some(tls) = tls {
+        let ca = tls
+            .client_ca
+            .expect("validated peer TLS material contains a client CA");
+        server = server.tls_config(
+            ServerTlsConfig::new()
+                .identity(Identity::from_pem(tls.certificate, tls.private_key))
+                .client_ca_root(Certificate::from_pem(ca)),
+        )?;
+    }
+    server
         .add_service(peer_server(service))
         .serve_with_shutdown(address, shutdown)
         .await
@@ -1394,8 +1746,7 @@ mod tests {
     use super::*;
     use crate::{
         history::{CheckOptions, Operation, is_linearizable},
-        kv::{ClientId, Mutation, MutationCommand, ValueRecord},
-        storage::StateMachineStorage,
+        kv::{ClientId, Mutation, MutationCommand},
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1413,6 +1764,69 @@ mod tests {
     fn available_address() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         listener.local_addr().expect("local address")
+    }
+
+    #[tokio::test]
+    async fn peer_certificate_identity_is_bound_to_active_membership() {
+        let directory = temp_directory();
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert(NodeId(2), "https://node-2:9080".to_owned());
+        let fingerprint = [3; 32];
+        let mut admissions = BTreeMap::new();
+        admissions.insert(
+            NodeId(2),
+            PeerAdmission {
+                certificate_sha256: fingerprint,
+                staging_expires_unix_seconds: None,
+            },
+        );
+        let running = start_static_node(StaticNodeConfig {
+            cluster_id: ClusterId([5; 16]),
+            node_id: NodeId(1),
+            voters: vec![NodeId(1), NodeId(2)],
+            data_file: directory.join("peer-auth.sqlite3"),
+            request_queue_capacity: 16,
+            outbound_queue_capacity: 16,
+            election_timeout_min: Duration::from_millis(120),
+            election_timeout_max: Duration::from_millis(240),
+            heartbeat_interval: Duration::from_millis(30),
+            rpc_timeout: Duration::from_millis(100),
+            max_clients: 10_000,
+            snapshot_threshold_entries: 100,
+            peer_endpoints: endpoints,
+            local_peer_endpoint: "https://node-1:9080".to_owned(),
+            staging: false,
+            peer_tls: Some(TlsMaterial {
+                certificate: Vec::new(),
+                private_key: Vec::new(),
+                client_ca: Some(Vec::new()),
+            }),
+            peer_certificates: admissions,
+            metrics: Metrics::new(),
+        })
+        .expect("start authenticated node");
+
+        assert!(
+            running
+                .peer_service
+                .authorize_sender(NodeId(2), Some(fingerprint))
+                .await
+                .is_ok()
+        );
+        assert!(
+            running
+                .peer_service
+                .authorize_sender(NodeId(2), Some([4; 32]))
+                .await
+                .is_err()
+        );
+        assert!(
+            running
+                .peer_service
+                .authorize_sender(NodeId(3), Some(fingerprint))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1435,12 +1849,15 @@ mod tests {
             peer_endpoints: BTreeMap::new(),
             local_peer_endpoint: "http://node-1:9080".to_owned(),
             staging: false,
+            peer_tls: None,
+            peer_certificates: BTreeMap::new(),
+            metrics: Metrics::new(),
         };
         let target =
             ClusterConfiguration::new([(1, "http://node-1:9081".to_owned())]).expect("target");
         let operation_id = [4; 16];
         let running = start_static_node(config.clone()).expect("start node");
-        let handle = running.handle;
+        let handle = running.handle.clone();
         let first = handle
             .change_membership(operation_id, target.clone())
             .await
@@ -1459,8 +1876,21 @@ mod tests {
         );
         assert_eq!(handle.membership().await.expect("query"), first);
         drop(handle);
-
-        let restarted = start_static_node(config).expect("restart node");
+        drop(running);
+        let mut restarted = None;
+        for _ in 0..100 {
+            match start_static_node(config.clone()) {
+                Ok(node) => {
+                    restarted = Some(node);
+                    break;
+                }
+                Err(error) if error.contains("already owned") => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("restart node: {error}"),
+            }
+        }
+        let restarted = restarted.expect("worker releases the data-file lock");
         let retried = restarted
             .handle
             .change_membership(operation_id, target)
@@ -1515,6 +1945,9 @@ mod tests {
                 peer_endpoints,
                 local_peer_endpoint: endpoints[&node_id].clone(),
                 staging: node_id == NodeId(4),
+                peer_tls: None,
+                peer_certificates: BTreeMap::new(),
+                metrics: Metrics::new(),
             })
             .expect("start dynamic node");
             let (handle, service) = running.spawn_dispatcher();
@@ -1651,6 +2084,9 @@ mod tests {
                 peer_endpoints,
                 local_peer_endpoint: endpoints[&node_id].clone(),
                 staging: false,
+                peer_tls: None,
+                peer_certificates: BTreeMap::new(),
+                metrics: Metrics::new(),
             })
             .expect("start node");
             let (handle, service) = running.spawn_dispatcher();
@@ -1762,9 +2198,13 @@ mod tests {
             peer_endpoints,
             local_peer_endpoint: endpoints[&node_id].clone(),
             staging: false,
+            peer_tls: None,
+            peer_certificates: BTreeMap::new(),
+            metrics: Metrics::new(),
         })
         .expect("start lagging node");
         let (handle, service) = running.spawn_dispatcher();
+        let lagging_handle = handle.clone();
         let (shutdown, receive_shutdown) = oneshot::channel();
         shutdowns.push(shutdown);
         tokio::spawn(async move {
@@ -1778,22 +2218,8 @@ mod tests {
 
         let catch_up_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let storage =
-                SqliteStorage::open(directory.join("node-3.sqlite3")).expect("open lagging state");
-            if storage
-                .value("distributed")
-                .expect("read lagging value")
-                .is_some()
-            {
-                assert_eq!(
-                    storage
-                        .current_snapshot()
-                        .expect("load installed snapshot")
-                        .expect("snapshot installed")
-                        .last_included
-                        .index,
-                    2
-                );
+            let diagnostics = lagging_handle.diagnostics().await.expect("lagging status");
+            if diagnostics.applied_index >= revision && diagnostics.snapshot_index == 2 {
                 break;
             }
             assert!(
@@ -1804,15 +2230,14 @@ mod tests {
         }
 
         tokio::time::sleep(Duration::from_millis(250)).await;
-        for node in 1..=3 {
-            let storage = SqliteStorage::open(directory.join(format!("node-{node}.sqlite3")))
-                .expect("open follower state");
-            assert_eq!(
-                storage.value("distributed").expect("read applied value"),
-                Some(ValueRecord {
-                    value: b"yes".to_vec(),
-                    revision,
-                })
+        for handle in &handles {
+            assert!(
+                handle
+                    .diagnostics()
+                    .await
+                    .expect("follower diagnostics")
+                    .applied_index
+                    >= revision
             );
         }
         for shutdown in shutdowns {

@@ -1,0 +1,30 @@
+schema_version = 1
+property_set = "m6-operational-hardening"
+recorded_at = "2026-08-24T13:34:32+08:00"
+rust_command = "cargo test --all-targets --all-features --locked"
+rust_result = "pass"
+rust_tests = 82
+clippy_command = "cargo clippy --all-targets --all-features -- -D warnings"
+clippy_result = "pass"
+formal_command = "make formal"
+formal_result = "pass"
+supply_chain_commands = ["cargo audit", "cargo deny check"]
+supply_chain_result = "pass"
+container_result = "pass"
+container_runtime = "running healthy as 10001:10001 with read-only root filesystem"
+multiarch_platforms = ["linux/amd64", "linux/arm64"]
+multiarch_oci_manifest = "sha256:ea207dc35e1bd1fd66001443ad08921cfdea1c3d752b9ecce88d58311a5eb57a"
+sbom = "BuildKit SPDX attestations on both platform manifests"
+provenance = "BuildKit mode=max attestations on both platform manifests"
+
+evidence = [
+  "separate client, operational, and peer listeners",
+  "client TLS, operational mTLS plus token, and peer mTLS",
+  "certificate-to-node binding plus committed-membership or expiring staging authorization",
+  "bounded HTTP and gRPC concurrency/messages, append batches, snapshots, queues, proposals, and sessions",
+  "exclusive file-backed SQLite process ownership",
+  "authenticated local diagnostics and bounded-label OpenMetrics",
+  "digest-pinned non-root image and liveness healthcheck",
+  "dependency, license, source, secret, and container scan policy in immutable CI steps",
+  "explicit protocol/storage/snapshot compatibility and upgrade policy",
+]

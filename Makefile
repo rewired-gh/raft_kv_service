@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run check fmt lint test formal-setup formal docker-dev image clean
+.PHONY: help setup run check fmt lint test formal-setup formal supply-chain docker-dev image reset-local clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -32,11 +32,18 @@ formal: ## Model-check the fast formal suite
 	./scripts/tlc.sh check formal/RaftSnapshot.cfg
 	./scripts/tlc.sh check formal/RaftMembership.cfg
 
+supply-chain: ## Audit Rust dependencies, licenses, and sources
+	cargo audit
+	cargo deny check
+
 docker-dev: ## Start the development service with Compose
 	docker compose up --build
 
 image: ## Build the production image
 	docker build --target runtime --tag raft-kv-service:local .
+
+reset-local: ## Delete one named Compose node volume: NODE=node1 CONFIRM=yes
+	./scripts/reset-local.sh "$(NODE)" "$(CONFIRM)"
 
 clean: ## Remove local Rust build artifacts
 	cargo clean

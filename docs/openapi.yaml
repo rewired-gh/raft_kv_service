@@ -8,12 +8,40 @@ info:
     with the same client ID, sequence, precondition, key, and body.
 servers:
   - url: http://localhost:8080
+    description: Client API (TLS is required outside isolated local development)
+  - url: https://localhost:8088
+    description: Operational API (mTLS and bearer token required)
 paths:
+  /operational/v1/status:
+    get:
+      operationId: getNodeStatus
+      summary: Inspect local Raft, membership, replication, queue, and format state
+      security: [{ OperationalMtls: [], OperationalBearer: [] }]
+      responses:
+        '200':
+          description: Local node diagnostics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Read bounded-label OpenMetrics diagnostics
+      security: [{ OperationalMtls: [], OperationalBearer: [] }]
+      responses:
+        '200':
+          description: OpenMetrics text exposition
+          content:
+            application/openmetrics-text:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /operational/v1/membership:
     get:
       operationId: getCommittedMembership
       summary: Read the committed cluster configuration through the leader
-      security: [{ OperationalBearer: [] }]
+      security: [{ OperationalMtls: [], OperationalBearer: [] }]
       responses:
         '200':
           description: Committed membership
@@ -29,7 +57,7 @@ paths:
         The operation ID and exact target are idempotent. Reusing an operation
         ID with another target is a conflict. Success is returned only after
         the final stable configuration commits and is durably applied.
-      security: [{ OperationalBearer: [] }]
+      security: [{ OperationalMtls: [], OperationalBearer: [] }]
       requestBody:
         required: true
         content:
@@ -124,6 +152,8 @@ paths:
         '503': { $ref: '#/components/responses/Unavailable' }
 components:
   securitySchemes:
+    OperationalMtls:
+      type: mutualTLS
     OperationalBearer:
       type: http
       scheme: bearer
@@ -193,6 +223,45 @@ components:
           required: [commit_index]
           properties:
             commit_index: { type: integer, format: uint64, minimum: 1 }
+    Configuration:
+      type: object
+      additionalProperties: false
+      required: [phase, operation_id, old, new]
+      properties:
+        phase: { type: string, enum: [stable, joint] }
+        operation_id: { type: string, format: uuid }
+        old: { type: array, items: { $ref: '#/components/schemas/Member' } }
+        new: { type: array, items: { $ref: '#/components/schemas/Member' } }
+    ReplicationProgress:
+      type: object
+      additionalProperties: false
+      required: [node_id, next_index, match_index]
+      properties:
+        node_id: { type: integer, format: uint64, minimum: 1 }
+        next_index: { type: integer, format: uint64, minimum: 1 }
+        match_index: { type: integer, format: uint64, minimum: 0 }
+    NodeStatus:
+      type: object
+      additionalProperties: false
+      required: [cluster_id, node_id, role, term, commit_index, applied_index, snapshot_index, active_membership, committed_membership, replication, request_queue_depth, outbound_queue_depth, build_version, storage_schema_version, snapshot_format_version, peer_protocol_version]
+      properties:
+        cluster_id: { type: string, format: uuid }
+        node_id: { type: integer, format: uint64, minimum: 1 }
+        role: { type: string, enum: [follower, candidate, leader] }
+        term: { type: integer, format: uint64, minimum: 0 }
+        leader_id: { type: [integer, 'null'], format: uint64, minimum: 1 }
+        commit_index: { type: integer, format: uint64, minimum: 0 }
+        applied_index: { type: integer, format: uint64, minimum: 0 }
+        snapshot_index: { type: integer, format: uint64, minimum: 0 }
+        active_membership: { $ref: '#/components/schemas/Configuration' }
+        committed_membership: { $ref: '#/components/schemas/Configuration' }
+        replication: { type: array, items: { $ref: '#/components/schemas/ReplicationProgress' } }
+        request_queue_depth: { type: integer, minimum: 0 }
+        outbound_queue_depth: { type: integer, minimum: 0 }
+        build_version: { type: string }
+        storage_schema_version: { type: integer, minimum: 1 }
+        snapshot_format_version: { type: integer, minimum: 1 }
+        peer_protocol_version: { type: integer, minimum: 1 }
     Problem:
       type: object
       additionalProperties: false
