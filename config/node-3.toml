@@ -1,0 +1,8 @@
+[raft]
+node_id = 3
+voters = [1, 2, 3]
+data_file = "data/node-3.sqlite3"
+peer_endpoints = [
+  { node_id = 1, url = "http://node1:9080" },
+  { node_id = 2, url = "http://node2:9080" },
+]

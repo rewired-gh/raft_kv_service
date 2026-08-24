@@ -11,6 +11,18 @@ log_filter = "raft_kv_service=debug,tower_http=info"
 log_format = "pretty"
 
 [raft]
+cluster_id = "00000000-0000-0000-0000-000000000001"
 node_id = 1
+voters = [1]
+peer_endpoints = []
 data_file = "data/node-1.sqlite3"
 request_queue_capacity = 256
+outbound_queue_capacity = 1024
+election_timeout_min_ms = 300
+election_timeout_max_ms = 600
+heartbeat_interval_ms = 100
+rpc_timeout_ms = 250
+
+[peer]
+host = "0.0.0.0"
+port = 9080

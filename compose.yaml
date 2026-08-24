@@ -1,24 +1,62 @@
 name: raft-kv-service
 
+x-node: &node
+  build:
+    context: .
+    target: development
+  command: cargo run
+  init: true
+  environment: &node-environment
+    RAFT_KV__SERVER__HOST: 0.0.0.0
+    RAFT_KV__PEER__HOST: 0.0.0.0
+    RAFT_KV__TELEMETRY__LOG_FORMAT: pretty
+    RUST_BACKTRACE: "1"
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "http://localhost:8080/health/ready"]
+    interval: 2s
+    timeout: 1s
+    retries: 30
+
 services:
-  service:
-    build:
-      context: .
-      target: development
-    command: cargo run
-    init: true
+  node1:
+    <<: *node
     environment:
-      RAFT_KV__SERVER__HOST: 0.0.0.0
-      RAFT_KV__TELEMETRY__LOG_FORMAT: pretty
-      RUST_BACKTRACE: "1"
-    ports:
-      - "8080:8080"
+      <<: *node-environment
+      RAFT_KV_CONFIG_FILE: config/node-1
+    ports: ["8081:8080"]
     volumes:
       - .:/workspace
       - cargo-registry:/usr/local/cargo/registry
       - target:/workspace/target
+      - node1-data:/workspace/data
+
+  node2:
+    <<: *node
+    environment:
+      <<: *node-environment
+      RAFT_KV_CONFIG_FILE: config/node-2
+    ports: ["8082:8080"]
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/workspace/target
+      - node2-data:/workspace/data
+
+  node3:
+    <<: *node
+    environment:
+      <<: *node-environment
+      RAFT_KV_CONFIG_FILE: config/node-3
+    ports: ["8083:8080"]
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/workspace/target
+      - node3-data:/workspace/data
 
 volumes:
   cargo-registry:
   target:
-
+  node1-data:
+  node2-data:
+  node3-data:

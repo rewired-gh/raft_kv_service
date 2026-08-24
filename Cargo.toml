@@ -10,6 +10,7 @@ publish = false
 anyhow = "1.0.104"
 axum = "0.8.9"
 config = { version = "0.15.25", default-features = false, features = ["toml"] }
+fastrand = "2.5.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }

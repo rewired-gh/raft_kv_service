@@ -44,8 +44,15 @@ evidence = [
 [[requirement]]
 id = "M3"
 spec_sections = ["6", "7", "8", "12.2", "19.M3"]
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "src/kv/mod.rs",
+  "src/storage/sqlite.rs",
+  "src/http.rs",
+  "docs/openapi.yaml",
+  "src/cluster.rs",
+  "tests/http_api.rs",
+]
 
 [[requirement]]
 id = "M4"

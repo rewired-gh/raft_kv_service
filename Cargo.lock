@@ -844,6 +844,7 @@ dependencies = [
  "anyhow",
  "axum",
  "config",
+ "fastrand",
  "prost",
  "protoc-bin-vendored",
  "rusqlite",

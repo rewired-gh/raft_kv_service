@@ -42,9 +42,13 @@ verifies its pinned SHA-256 digest under the ignored `.tools/` directory.
 
 ## Start with Docker
 
-```sh
-docker compose up --build
-```
+`docker compose up --build` starts the default three-voter experiment. Client
+listeners are published on `localhost:8081`, `:8082`, and `:8083`; peer gRPC
+stays on the private Compose network. Until follower forwarding is enabled,
+submit requests to the elected leader (non-leaders return a retryable 503).
+
+For a single local process, `make run` uses the one-node defaults on
+`localhost:8080` and persists state in `data/node-1.sqlite3`.
 
 Build the production image with `make image`. Its runtime process is non-root and exposes a container health check.
 
