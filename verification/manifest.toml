@@ -38,16 +38,66 @@ id = "log-matching"
 spec_section = "12.1.2"
 model = "formal/Raft.tla"
 invariant = "LogMatching"
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
+
+[[property]]
+id = "leader-append-only"
+spec_section = "12.1.3"
+model = "formal/Raft.tla"
+invariant = "LeaderAppendOnly"
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
+
+[[property]]
+id = "leader-completeness"
+spec_section = "12.1.4"
+model = "formal/Raft.tla"
+invariant = "LeaderCompleteness"
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
 
 [[property]]
 id = "state-machine-safety"
 spec_section = "12.1.5"
 model = "formal/Raft.tla"
 invariant = "StateMachineSafety"
-status = "planned"
-evidence = []
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
+
+[[property]]
+id = "committed-prefix-preservation"
+spec_section = "12.1.6"
+model = "formal/Raft.tla"
+invariant = "CommittedPrefixPreservation"
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
+
+[[property]]
+id = "log-persistence-ordering"
+spec_section = "11"
+model = "formal/Raft.tla"
+invariant = "NoAckBeforeDurability"
+status = "partial"
+evidence = [
+  "formal/Raft.cfg",
+  "verification/evidence/m2-fast-tlc.toml",
+]
 
 [[property]]
 id = "configuration-safety"

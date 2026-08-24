@@ -1,0 +1,33 @@
+schema_version = 1
+property_set = "m2-static-replication"
+recorded_at = "2026-08-24T10:29:38+08:00"
+tool = "TLC"
+tool_version = "2.19 (TLA+ tools 1.7.4)"
+command = "RAFT_KV_TLC_WORKERS=4 ./scripts/tlc.sh check formal/Raft.cfg"
+model = "formal/Raft.tla"
+model_sha256 = "e9c807c26d14e6aff69851037b2eb10519d56fcc73d67cc86f9527b28319b82a"
+configuration = "formal/Raft.cfg"
+configuration_sha256 = "a80123318ff69a94eac19f9c72a0f32e11f2a0cf2f7dc981303fa6f99cb4d961"
+generated_states = 78944
+distinct_states = 12243
+search_depth = 25
+result = "pass"
+
+[parameters]
+nodes = 3
+terms = 1
+log_entries = 1
+values = 1
+in_flight_messages = 1
+symmetry_reduction = true
+
+invariants = [
+  "TypeOK",
+  "ElectionSafety",
+  "LogMatching",
+  "LeaderAppendOnly",
+  "LeaderCompleteness",
+  "StateMachineSafety",
+  "CommittedPrefixPreservation",
+  "NoAckBeforeDurability",
+]

@@ -33,6 +33,8 @@ evidence = [
   "docs/adr/0002-sqlite-storage.md",
   "src/storage/mod.rs",
   "src/storage/sqlite.rs",
+  "formal/Raft.tla",
+  "verification/evidence/m2-fast-tlc.toml",
 ]
 
 [[requirement]]
