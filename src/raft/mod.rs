@@ -8,6 +8,7 @@ mod election;
 mod log;
 mod runtime;
 pub mod simulator;
+mod trace;
 
 pub use election::{
     CoreError, Effect, Envelope, Event, HardState, LogMutation, LogPosition, Message, NodeId,
@@ -15,3 +16,6 @@ pub use election::{
 };
 pub use log::{EntryPayload, LogEntry};
 pub use runtime::{DurableRaft, RuntimeError};
+pub use trace::{
+    ProtocolTrace, TRACE_SCHEMA_VERSION, TraceAction, TraceError, TraceMessage, TraceRecord,
+};

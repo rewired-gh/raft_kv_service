@@ -125,6 +125,7 @@ pub enum Effect {
     Send(Envelope),
     ResetElectionTimer,
     CommitIndexAdvanced(u64),
+    ApplyCommitted(Vec<LogEntry>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +147,11 @@ pub enum CoreError {
         observed: HardState,
     },
     LogPersistenceAcknowledgementMismatch,
+    NoApplicationPending,
+    ApplicationAcknowledgementMismatch {
+        expected: u64,
+        observed: u64,
+    },
     InvalidAppendEntries {
         expected: u64,
         found: u64,
@@ -198,6 +204,13 @@ impl Display for CoreError {
             Self::LogPersistenceAcknowledgementMismatch => {
                 formatter.write_str("log persistence acknowledgement mismatch")
             }
+            Self::NoApplicationPending => {
+                formatter.write_str("no committed application is pending")
+            }
+            Self::ApplicationAcknowledgementMismatch { expected, observed } => write!(
+                formatter,
+                "application acknowledgement mismatch: expected index {expected}, observed {observed}"
+            ),
             Self::InvalidAppendEntries { expected, found } => write!(
                 formatter,
                 "invalid AppendEntries sequence: expected index {expected}, found {found}"
@@ -290,6 +303,8 @@ pub struct RaftCore {
     commit_index: u64,
     replication: BTreeMap<NodeId, ReplicationProgress>,
     leader_noop_index: Option<u64>,
+    last_applied: u64,
+    pending_application: Option<Vec<LogEntry>>,
 }
 
 impl RaftCore {
@@ -322,6 +337,8 @@ impl RaftCore {
             commit_index: 0,
             replication: BTreeMap::new(),
             leader_noop_index: None,
+            last_applied: 0,
+            pending_application: None,
         })
     }
 
@@ -356,6 +373,10 @@ impl RaftCore {
 
     pub fn commit_index(&self) -> u64 {
         self.commit_index
+    }
+
+    pub fn last_applied(&self) -> u64 {
+        self.last_applied
     }
 
     pub fn replication_progress(&self, peer: NodeId) -> Option<ReplicationProgress> {
@@ -476,6 +497,23 @@ impl RaftCore {
             PendingLogContinuation::FollowerAppend(request) => Ok(self.finish_append(request)),
             PendingLogContinuation::LeaderEntry => self.finish_leader_entry(),
         }
+    }
+
+    pub fn acknowledge_applied(&mut self, observed: u64) -> Result<Vec<Effect>, CoreError> {
+        let expected = self
+            .pending_application
+            .as_ref()
+            .and_then(|entries| entries.last())
+            .map(|entry| entry.index)
+            .ok_or(CoreError::NoApplicationPending)?;
+        if observed != expected {
+            return Err(CoreError::ApplicationAcknowledgementMismatch { expected, observed });
+        }
+        self.pending_application = None;
+        self.last_applied = observed;
+        let mut effects = Vec::new();
+        self.emit_committed_application(&mut effects);
+        Ok(effects)
     }
 
     fn handle_election_timeout(&mut self) -> Result<Vec<Effect>, CoreError> {
@@ -723,6 +761,7 @@ impl RaftCore {
         if next_commit > self.commit_index {
             self.commit_index = next_commit;
             effects.push(Effect::CommitIndexAdvanced(next_commit));
+            self.emit_committed_application(&mut effects);
         }
         effects.push(Effect::Send(Envelope {
             from: self.id,
@@ -920,10 +959,28 @@ impl RaftCore {
                 if replicated > self.voters.0.len() / 2 {
                     self.commit_index = candidate;
                     effects.push(Effect::CommitIndexAdvanced(candidate));
+                    self.emit_committed_application(effects);
                     break;
                 }
             }
             candidate -= 1;
+        }
+    }
+
+    fn emit_committed_application(&mut self, effects: &mut Vec<Effect>) {
+        if self.pending_application.is_some() || self.last_applied >= self.commit_index {
+            return;
+        }
+        let (Ok(start), Ok(end)) = (
+            usize::try_from(self.last_applied),
+            usize::try_from(self.commit_index),
+        ) else {
+            return;
+        };
+        let entries = self.log.get(start..end).unwrap_or_default().to_vec();
+        if !entries.is_empty() {
+            self.pending_application = Some(entries.clone());
+            effects.push(Effect::ApplyCommitted(entries));
         }
     }
 
@@ -1111,8 +1168,25 @@ mod tests {
         let effects = node
             .acknowledge_log_persisted(mutation)
             .expect("leader no-op persists");
-        assert_eq!(effects, vec![Effect::CommitIndexAdvanced(1)]);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CommitIndexAdvanced(1),
+                Effect::ApplyCommitted(vec![LogEntry {
+                    index: 1,
+                    term: Term(1),
+                    payload: EntryPayload::Noop,
+                }]),
+            ]
+        );
         assert!(node.leader_ready());
+        assert_eq!(node.last_applied(), 0);
+        assert_eq!(
+            node.acknowledge_applied(1)
+                .expect("ordered application is acknowledged"),
+            Vec::<Effect>::new()
+        );
+        assert_eq!(node.last_applied(), 1);
     }
 
     #[test]
@@ -1407,6 +1481,7 @@ mod tests {
             effects,
             vec![
                 Effect::CommitIndexAdvanced(1),
+                Effect::ApplyCommitted(vec![entry.clone()]),
                 Effect::Send(Envelope {
                     from: NodeId(2),
                     to: NodeId(1),

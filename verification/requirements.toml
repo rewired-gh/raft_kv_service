@@ -28,13 +28,17 @@ evidence = [
 [[requirement]]
 id = "M2"
 spec_sections = ["10.2", "12.1", "19.M2"]
-status = "partial"
+status = "verified"
 evidence = [
   "docs/adr/0002-sqlite-storage.md",
   "src/storage/mod.rs",
   "src/storage/sqlite.rs",
   "formal/Raft.tla",
   "verification/evidence/m2-fast-tlc.toml",
+  "src/raft/runtime.rs",
+  "src/raft/trace.rs",
+  "docs/protocol-tracing.md",
+  "verification/evidence/m2-runtime.toml",
 ]
 
 [[requirement]]

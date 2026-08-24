@@ -93,6 +93,18 @@ impl<S: RaftStorage> DurableRaft<S> {
         self.execute(effects)
     }
 
+    pub fn acknowledge_applied(
+        &mut self,
+        last_index: u64,
+    ) -> Result<Vec<Effect>, RuntimeError<S::Error>> {
+        self.ensure_active()?;
+        let effects = self
+            .core
+            .acknowledge_applied(last_index)
+            .map_err(RuntimeError::Core)?;
+        self.execute(effects)
+    }
+
     pub fn core(&self) -> &RaftCore {
         &self.core
     }
@@ -177,7 +189,7 @@ mod tests {
     };
 
     use crate::{
-        raft::{Envelope, HardState, LogEntry, LogPosition, Message, Role, Term},
+        raft::{Envelope, HardState, LogEntry, LogPosition, Role, Term},
         storage::{AppendOutcome, RaftStorage, SqliteStorage},
     };
 
@@ -190,7 +202,9 @@ mod tests {
     fn messages(effects: Vec<Effect>) -> impl Iterator<Item = Envelope> {
         effects.into_iter().filter_map(|effect| match effect {
             Effect::Send(envelope) => Some(envelope),
-            Effect::ResetElectionTimer | Effect::CommitIndexAdvanced(_) => None,
+            Effect::ResetElectionTimer
+            | Effect::CommitIndexAdvanced(_)
+            | Effect::ApplyCommitted(_) => None,
             Effect::PersistHardState(_) | Effect::PersistLog(_) => {
                 panic!("runtime leaked an internal persistence effect")
             }

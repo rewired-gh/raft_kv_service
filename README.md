@@ -2,10 +2,11 @@
 
 A production-shaped Rust microservice foundation. The current implementation
 provides HTTP lifecycle, configuration, observability, tests, containers, and
-CI. The M1 election milestone provides a deterministic election core,
-crash-aware seeded simulator, and bounded TLA+ model. M2 storage work provides
-the transactional SQLite hard-state and log contract; protocol replication and
-the client KV API are not implemented yet.
+CI. The completed M1 and M2 milestones provide a deterministic Raft election
+and static-cluster replication core, explicit persistence and ordered-
+application barriers, transactional SQLite storage, a crash/partition-aware
+simulator, versioned protocol traces, and bounded TLA+ models. The client KV
+API is introduced in M3 and is not implemented yet.
 
 The normative project goals, correctness claims, protocol scope, verification
 strategy, and milestone gates are defined in

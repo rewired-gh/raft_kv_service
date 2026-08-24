@@ -1,7 +1,7 @@
 //! Deterministic, single-threaded protocol simulator.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt::{self, Display, Formatter},
 };
@@ -17,6 +17,7 @@ pub enum TraceEvent {
     HardStatePersisted(NodeId, HardState),
     LogPersisted(NodeId, LogMutation),
     CommitIndexAdvanced(NodeId, u64),
+    EntriesApplied(NodeId, u64),
     MessageSent(Envelope),
     MessageDelivered(Envelope),
     MessageDropped(Envelope),
@@ -60,6 +61,7 @@ pub struct ClusterSimulator {
     election_timeout_min: u64,
     election_timeout_max: u64,
     election_deadlines: BTreeMap<NodeId, Option<u64>>,
+    blocked_links: BTreeSet<(NodeId, NodeId)>,
 }
 
 impl ClusterSimulator {
@@ -114,6 +116,7 @@ impl ClusterSimulator {
             election_timeout_min,
             election_timeout_max,
             election_deadlines: BTreeMap::new(),
+            blocked_links: BTreeSet::new(),
         };
         let node_ids = simulator.nodes.keys().copied().collect::<Vec<_>>();
         for node in node_ids {
@@ -246,6 +249,23 @@ impl ClusterSimulator {
         count
     }
 
+    pub fn partition(&mut self, first: NodeId, second: NodeId) -> Result<(), SimError> {
+        self.node(first)?;
+        self.node(second)?;
+        if first != second {
+            self.blocked_links.insert(ordered_link(first, second));
+            self.drop_messages_between(first, second);
+        }
+        Ok(())
+    }
+
+    pub fn heal(&mut self, first: NodeId, second: NodeId) -> Result<(), SimError> {
+        self.node(first)?;
+        self.node(second)?;
+        self.blocked_links.remove(&ordered_link(first, second));
+        Ok(())
+    }
+
     pub fn drop_all_messages(&mut self) -> usize {
         let mut dropped = Vec::new();
         self.scheduled.retain(|scheduled| match scheduled {
@@ -327,7 +347,11 @@ impl ClusterSimulator {
 
     fn deliver(&mut self, envelope: Envelope) -> Result<(), SimError> {
         let recipient = envelope.to;
-        if self.node(recipient)?.core.is_none() {
+        if self.node(recipient)?.core.is_none()
+            || self
+                .blocked_links
+                .contains(&ordered_link(envelope.from, recipient))
+        {
             self.trace.push(TraceEvent::MessageDropped(envelope));
             return Ok(());
         }
@@ -382,7 +406,14 @@ impl ClusterSimulator {
                 }
                 Effect::Send(envelope) => {
                     self.trace.push(TraceEvent::MessageSent(envelope.clone()));
-                    self.scheduled.push_back(Scheduled::Deliver(envelope));
+                    if self
+                        .blocked_links
+                        .contains(&ordered_link(envelope.from, envelope.to))
+                    {
+                        self.trace.push(TraceEvent::MessageDropped(envelope));
+                    } else {
+                        self.scheduled.push_back(Scheduled::Deliver(envelope));
+                    }
                 }
                 Effect::ResetElectionTimer => {
                     self.trace.push(TraceEvent::ElectionTimerReset(node));
@@ -391,6 +422,13 @@ impl ClusterSimulator {
                 Effect::CommitIndexAdvanced(index) => {
                     self.trace
                         .push(TraceEvent::CommitIndexAdvanced(node, index));
+                }
+                Effect::ApplyCommitted(entries) => {
+                    let last_index = entries.last().map_or(0, |entry| entry.index);
+                    self.trace
+                        .push(TraceEvent::EntriesApplied(node, last_index));
+                    let continuation = self.core_mut(node)?.acknowledge_applied(last_index)?;
+                    self.schedule_effects(node, continuation)?;
                 }
             }
         }
@@ -436,6 +474,14 @@ impl ClusterSimulator {
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^ (value >> 31)
+    }
+}
+
+fn ordered_link(first: NodeId, second: NodeId) -> (NodeId, NodeId) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
     }
 }
 
@@ -627,6 +673,54 @@ mod tests {
         assert_eq!(
             simulation.commit_index(NodeId(3)).expect("node exists"),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn majority_replaces_isolated_leaders_uncommitted_suffix() {
+        let mut simulation = three_nodes();
+        simulation.timeout(NodeId(1)).expect("timeout is accepted");
+        simulation.run_until_idle(64).expect("node one is elected");
+        simulation
+            .partition(NodeId(1), NodeId(2))
+            .expect("partition");
+        simulation
+            .partition(NodeId(1), NodeId(3))
+            .expect("partition");
+
+        simulation
+            .propose(NodeId(1), EntryPayload::Command(vec![1]))
+            .expect("isolated leader durably appends");
+        simulation.run_until_idle(16).expect("messages are dropped");
+        assert_eq!(simulation.commit_index(NodeId(1)).expect("node"), Some(1));
+
+        simulation
+            .timeout(NodeId(2))
+            .expect("majority starts election");
+        simulation
+            .run_until_idle(64)
+            .expect("new leader commits no-op");
+        assert_eq!(
+            simulation.role(NodeId(2)).expect("node"),
+            Some(Role::Leader)
+        );
+        assert_eq!(simulation.commit_index(NodeId(2)).expect("node"), Some(2));
+
+        simulation.heal(NodeId(1), NodeId(2)).expect("heal");
+        simulation.heal(NodeId(1), NodeId(3)).expect("heal");
+        simulation.heartbeat(NodeId(2)).expect("repair suffix");
+        simulation.run_until_idle(64).expect("cluster converges");
+        assert_eq!(
+            simulation.role(NodeId(1)).expect("node"),
+            Some(Role::Follower)
+        );
+        assert_eq!(simulation.commit_index(NodeId(1)).expect("node"), Some(2));
+        assert_eq!(
+            simulation.last_log_position(NodeId(1)).expect("node"),
+            crate::raft::LogPosition {
+                index: 2,
+                term: Term(2)
+            }
         );
     }
 

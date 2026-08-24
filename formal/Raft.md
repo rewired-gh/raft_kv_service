@@ -17,6 +17,9 @@ The checked composition boundary is:
 - `SendAppend`, `RejectAppend`, `HandleResponse`, and `IgnoreResponse` map to
   the corresponding `AppendEntries` transitions in the deterministic core.
 - `AdvanceCommit` maps to the leader's current-term quorum commit rule.
+- `Effect::ApplyCommitted` and its exact acknowledgement are the implementation
+  refinement of monotonically applying the model's committed prefix. The M3
+  model adds transactional KV state and durable `last_applied`.
 - `Crash` discards volatile role, replication progress, commit knowledge, and
   staged writes while preserving durable term, vote, and log.
 - `Drop` and set-valued messages model loss, arbitrary delay, reordering, and

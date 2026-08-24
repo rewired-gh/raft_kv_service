@@ -1,0 +1,16 @@
+schema_version = 1
+property_set = "m2-runtime-and-simulation"
+recorded_at = "2026-08-24T10:38:31+08:00"
+command = "RAFT_KV_TLC_WORKERS=4 make check"
+result = "pass"
+rust_tests = 36
+tlc_models = ["formal/RaftElection.cfg", "formal/Raft.cfg"]
+
+evidence = [
+  "durable one-node election and application barrier",
+  "durable three-node election, replication, commit, and recovery",
+  "persistent partition and leader-loss suffix repair",
+  "lagging follower crash, restart, and catch-up",
+  "versioned payload-redacted trace JSON round trip",
+  "M2 implementation-to-model persistence-order validation",
+]
