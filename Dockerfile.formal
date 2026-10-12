@@ -3,7 +3,7 @@
 # The formal image is intentionally linux/amd64: CI is the canonical execution
 # platform, and pinning the architecture manifest makes the root filesystem
 # immutable as well as the tag.
-FROM --platform=linux/amd64 eclipse-temurin:25.0.4_7-jre-noble@sha256:8c6736fa623090b057a5bbd36d42f90c9de4c7d2d4b6c285921a4f85ce65a445
+FROM --platform=linux/amd64 eclipse-temurin:26.0.2.1_1-jre-noble@sha256:3ed5e2e03c80f8a4901f81ef30e7becd19012e32ab6e036b255ee52fdcabac30
 
 WORKDIR /workspace
 ADD --checksum=sha256:936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88 \
